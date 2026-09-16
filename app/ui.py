@@ -1,7 +1,7 @@
 import csv
 import json
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import keyring
 from PySide6.QtCore import Qt, QTimer, QUrl
@@ -12,6 +12,30 @@ from .db import user_id
 from .engine import Engine, DEFAULTS
 
 STATUS = dict(pending='等待私信',processing='处理中',sent='已私信',failed='失败',skipped='已跳过')
+BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+
+
+def format_beijing_time(value):
+    """将带时区的评论时间转为工整的北京时间。
+
+    导入数据可能是不带时区的本地时间，这种情况只统一展示格式，
+    不做时差推断，避免将用户导入的北京时间重复加 8 小时。
+    """
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    if len(text) == 10:
+        try:
+            return datetime.strptime(text, '%Y-%m-%d').strftime('%Y-%m-%d')
+        except ValueError:
+            return text
+    try:
+        parsed = datetime.fromisoformat(text.replace('Z', '+00:00'))
+    except ValueError:
+        return text
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(BEIJING_TIMEZONE)
+    return parsed.strftime('%Y-%m-%d %H:%M:%S')
 
 
 def button(text, callback):
@@ -394,7 +418,7 @@ class Window(QMainWindow):
         selected_uid = self.customer_rows[current]['uid'] if hasattr(self,'customer_rows') and 0<=current<len(self.customer_rows) else None
         q = '%'+self.search.text()+'%'; status = self.filter.currentData()
         self.customer_rows = self.db.rows("SELECT c.*,a.name sender_name FROM customers c LEFT JOIN accounts a ON c.account_id=a.id WHERE (c.name LIKE ? OR c.text LIKE ? OR c.blogger LIKE ?) AND (?='' OR c.status=?) ORDER BY updated DESC LIMIT 1000",(q,q,q,status,status))
-        populate(self.customers,[[r['name'],STATUS.get(r['status'],r['status']),r['text'],r['comment_time'],r['video_title'],r['blogger'],r['uid'],r['sender_name'],r['message'],r['error']] for r in self.customer_rows])
+        populate(self.customers,[[r['name'],STATUS.get(r['status'],r['status']),r['text'],format_beijing_time(r['comment_time']),r['video_title'],r['blogger'],r['uid'],r['sender_name'],r['message'],r['error']] for r in self.customer_rows])
         colors = {'pending':'#80baff','processing':'#b7a2ff','sent':'#62d7b0','failed':'#f48b96','skipped':'#9ba9bd'}
         for i,r in enumerate(self.customer_rows):
             self.customers.item(i,1).setForeground(QColor(colors.get(r['status'],'#dbe5f3')))

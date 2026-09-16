@@ -4,7 +4,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 from playwright.async_api import async_playwright
 from .ai import AI, get_key
-from .browser import Browser, UncertainSend, SkippedCustomer
+from .browser import Browser, CommentPageUnavailable, NeedsAttention, UncertainSend, SkippedCustomer
 from .classifier import classify_comments
 
 DEFAULTS = dict(days=7,ai_concurrency=5,poll_seconds=300,scroll_limit=80,base_url='',model='',thinking_mode='default',thinking_effort='high',
@@ -115,6 +115,25 @@ class Engine(QThread):
             self.running_accounts.discard(ident)
         self.status.emit(ident,'已停止')
 
+    async def scan_videos(self, account, browser, ai, videos, settings):
+        """跳过偶发的单视频页面异常；连续失败则保留人工介入信号。"""
+        consecutive_failures = 0
+        for video in videos:
+            try:
+                comments = await browser.comments(video)
+            except CommentPageUnavailable as exc:
+                consecutive_failures += 1
+                video_id = str(video.get('aweme_id','未知'))
+                title = ' '.join(str(video.get('desc','')).split())[:40]
+                detail = f' · {title}' if title else ''
+                self.log.emit(f'{account["name"]}：已跳过视频 {video_id}{detail}：{exc}')
+                if consecutive_failures >= 3:
+                    raise NeedsAttention('连续 3 个视频无法定位评论区，请检查登录状态、页面限流或评论区域 CSS') from exc
+                continue
+            consecutive_failures = 0
+            await classify_comments(self.db,ai,comments,settings['ai_concurrency'],
+                lambda text:self.log.emit(account['name']+'：'+text),self.changed.emit)
+
     async def work(self, account):
         ident = account['id']
         customer = None
@@ -136,10 +155,7 @@ class Engine(QThread):
                     for blogger in bloggers:
                         self.status.emit(ident,'采集：'+blogger['name'])
                         videos = await b.videos(blogger['id'],s['days'])
-                        for video in videos:
-                            comments = await b.comments(video)
-                            await classify_comments(self.db,ai,comments,s['ai_concurrency'],
-                                lambda text:self.log.emit(account['name']+'：'+text),self.changed.emit)
+                        await self.scan_videos(account,b,ai,videos,s)
                         self.log.emit(blogger['name']+' 本轮检查视频 '+str(len(videos))+' 个')
                         for warning in b.warnings:
                             self.log.emit(warning)

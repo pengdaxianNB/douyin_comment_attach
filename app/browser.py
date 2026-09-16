@@ -11,6 +11,11 @@ class NeedsAttention(RuntimeError):
     pass
 
 
+class CommentPageUnavailable(NeedsAttention):
+    """单个作品页暂时无法定位评论区。"""
+    pass
+
+
 class UncertainSend(RuntimeError):
     pass
 
@@ -337,12 +342,12 @@ class Browser:
                             if packets:
                                 self.warnings.append('仅采集已加载评论：未找到评论区的可滚动容器，请校准 CSS')
                                 break
-                            raise NeedsAttention('未找到评论区的可滚动容器，请在设置中校准评论区域 CSS')
+                            raise CommentPageUnavailable('未找到评论区的可滚动容器')
                     else:
                         if packets:
                             self.warnings.append('仅采集已加载评论：未找到唯一评论区域，请校准 CSS')
                             break
-                        raise NeedsAttention('未找到唯一评论滚动区域，请在设置中校准评论区域 CSS')
+                        raise CommentPageUnavailable('未找到唯一且可见的评论区')
                 else:
                     await self.page.mouse.move(700,600)
                     await self.page.mouse.wheel(0,1000)
@@ -367,7 +372,10 @@ class Browser:
                 if errors:
                     raise NeedsAttention(errors[0])
                 if not packets:
-                    raise NeedsAttention('刷新重试后仍没有捕获到页面数据，请检查登录、页面结构及站点适配')
+                    error = '刷新重试后仍没有捕获到页面数据'
+                    if key == 'comments':
+                        raise CommentPageUnavailable(error)
+                    raise NeedsAttention(error+'，请检查登录、页面结构及站点适配')
             stopped_at_boundary = stopped_at_boundary or bool(stop_when and stop_when(packets))
             if stopped_at_boundary:
                 self.warnings.append('作品扫描已到设定日期边界，停止加载更早作品')
@@ -390,7 +398,15 @@ class Browser:
         return list(items.values())
 
     async def comments(self, video):
-        packets = await self.capture('https://www.douyin.com/video/'+str(video['aweme_id']),'/aweme/v1/web/comment/list/','comments',self.s['scroll_limit'])
+        video_id = str(video['aweme_id'])
+        for attempt in range(2):
+            try:
+                packets = await self.capture('https://www.douyin.com/video/'+video_id,'/aweme/v1/web/comment/list/','comments',self.s['scroll_limit'])
+                break
+            except CommentPageUnavailable:
+                if attempt:
+                    raise
+                self.log('视频 '+video_id+' 评论区未就绪，正在重新打开重试')
         items = {}
         for p in packets:
             for c in parse_comments(p,video):
