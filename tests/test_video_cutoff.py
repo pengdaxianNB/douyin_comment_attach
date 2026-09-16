@@ -1,7 +1,7 @@
 import asyncio
 from unittest.mock import AsyncMock
 from types import SimpleNamespace
-from app.browser import Browser,reached_video_cutoff
+from app.browser import Browser,is_douyin_host,reached_video_cutoff
 
 
 def packet(*videos):
@@ -19,6 +19,15 @@ def test_old_pin_and_unknown_dates():
     assert not reached_video_cutoff(packet({'create_time':None}),100)
     assert not reached_video_cutoff(packet({'create_time':90},{'create_time':200}),100)
     assert reached_video_cutoff(packet({'create_time':1,'is_top':1},{'create_time':200},{'create_time':90}),100)
+
+
+def test_douyin_api_subdomains_are_trusted_without_accepting_lookalikes():
+    assert is_douyin_host('douyin.com')
+    assert is_douyin_host('www.douyin.com')
+    assert is_douyin_host('www-hj.douyin.com')
+    assert not is_douyin_host('evildouyin.com')
+    assert not is_douyin_host('douyin.com.evil.example')
+    assert not is_douyin_host(None)
 
 
 def test_capture_stops_before_scroll(monkeypatch):
@@ -53,7 +62,7 @@ def test_comments_scroll_container_without_wheeling_page(monkeypatch):
         nonlocal callback
         callback=fn
     async def goto(*args,**kwargs):
-        callback(SimpleNamespace(url='https://www.douyin.com/aweme/v1/web/comment/list/',json=AsyncMock(return_value=payload)))
+        callback(SimpleNamespace(url='https://www-hj.douyin.com/aweme/v1/web/comment/list/',json=AsyncMock(return_value=payload)))
     page.on=on;page.goto=goto;page.locator=lambda selector:panel
     page.remove_listener=lambda *args:None
     browser=Browser(SimpleNamespace(pages=[page]),{'comment_panel':'#comments'})

@@ -19,6 +19,12 @@ class SkippedCustomer(RuntimeError):
     pass
 
 
+def is_douyin_host(hostname):
+    """Accept Douyin's first-party API subdomains without matching lookalikes."""
+    hostname = (hostname or '').lower().rstrip('.')
+    return hostname == 'douyin.com' or hostname.endswith('.douyin.com')
+
+
 def parse_comments(payload, video):
     result = []
     for c in payload.get('comments') or []:
@@ -293,7 +299,7 @@ class Browser:
         tasks = set()
         async def consume(response):
             parsed = urlparse(response.url)
-            if parsed.hostname not in ('www.douyin.com','douyin.com') or parsed.path != path:
+            if not is_douyin_host(parsed.hostname) or parsed.path != path:
                 return
             try:
                 p = await response.json()
