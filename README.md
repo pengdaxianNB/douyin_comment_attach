@@ -4,23 +4,127 @@ Python + PySide6 桌面应用，SQLite 本地数据库，Playwright 独立 Chrom
 
 **当前是可运行、可配置的开发版本，不是已完成实号验收的自动营销成品。** 界面、数据库、AI 客户筛选及私信生成、后台任务、账号隔离、导入导出已经实现。抖音页面在开发环境访问超时，评论选择器、数据响应格式和真实私信流程未获实号验证；发送送达回执也尚未适配。发送动作正常完成后应用直接标记“已私信”，该状态表示操作完成，不代表站点确认送达。不能把本版本理解为已验证的无人值守全自动流程。
 
-## 启动
+## 环境要求
 
-当前 macOS 项目已创建 `.venv` 并安装依赖。双击 `start.command`，或在本目录运行：
+在全新电脑（macOS 或 Windows）上从零开始部署，请先满足以下条件：
+
+| 项目 | 要求 |
+| --- | --- |
+| 操作系统 | macOS 12 及以上（Intel / Apple Silicon 均可），或 Windows 10 / 11 64 位 |
+| uv | 0.5 及以上；用于管理 Python 环境与依赖，可按 `pyproject.toml` 自动下载所需 Python |
+| 浏览器 | Google Chrome 正式版（应用通过 `channel='chrome'` 驱动本机 Chrome，不安装 Playwright 自带的 Chromium，也不能用 Edge / Chromium 替代） |
+| 网络 | 能访问抖音（douyin.com）以及所配置的 AI 服务地址 |
+
+> 依赖在 `pyproject.toml` 中声明（PySide6、playwright、httpx、keyring，开发依赖 pytest），用 `uv sync` 一键安装，**不需要**执行 `playwright install`。
+
+## 部署与运行
+
+### 第 1 步：获取代码
+
+把整个项目放到本地任意目录（路径中可以包含中文和空格）。两种方式任选：
+
+- **下载压缩包**：下载 zip 后解压到目标目录。
+- **git 克隆**（需先安装 git）：
 
 ```sh
-.venv/bin/python main.py
+git clone <仓库地址> douyin_comment_attach
+cd douyin_comment_attach
 ```
 
-新环境需要 Python 3.10+ 和已安装的 Google Chrome：
+### 第 2 步：安装 uv
+
+uv 会按 `pyproject.toml` 自动下载并管理 Python 版本和依赖，因此**无需手动安装 Python**。
+
+**macOS**
+
+打开“终端”（启动台 → 其他 → 终端），执行：
 
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python main.py
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Windows 使用 `.venv\Scripts\python.exe` 替换上述解释器路径。应用使用 Chrome channel，无须另外安装 Playwright Chromium。桌面 UI 不包含内嵌网页，每个账号通过“登录 / 查看浏览器”打开自己的 Chrome 窗口。支持主号和多个从号并行，登录状态保存在各自目录中，不读取日常浏览器资料。
+**Windows**
+
+打开“PowerShell”（按 Win+R，输入 `powershell` 回车），执行：
+
+```powershell
+irm https://astral.sh/uv/install.ps1 | iex
+```
+
+安装完成后**关闭并重新打开**终端 / PowerShell，验证：
+
+```sh
+uv --version
+```
+
+> 如果提示找不到 `uv`：macOS 默认装在 `~/.local/bin`，Windows 默认装在 `%USERPROFILE%\.local\bin`；安装脚本通常会自动写入 PATH，重开终端即可生效。
+>
+> **国内安装备选**：官方脚本访问慢时可任选其一——
+> - 已装 Python：`pip install uv -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple`
+> - macOS 用 Homebrew：`brew install uv`（Homebrew 可配清华 / 中科大镜像）
+
+### 第 3 步：安装 Google Chrome
+
+到 https://www.google.com/chrome/ 下载并安装正式版 Chrome。应用启动浏览器时依赖它；如果启动时提示找不到 Chrome，先完成这一步，并确认能从开始菜单 / 访达正常打开 Chrome。
+
+### 第 4 步：安装依赖（uv sync）
+
+在项目根目录打开终端，执行一条命令即可创建 `.venv`、下载所需 Python 并安装全部依赖：
+
+```sh
+cd /路径/douyin_comment_attach
+uv sync
+```
+
+`uv sync` 会根据 `pyproject.toml` 和 `uv.lock` 生成可复现的环境；第一次运行会自动下载 Python 和依赖，之后的运行会自动判断是否需要更新。
+
+> **国内加速**：项目已自带 `uv.toml`，默认使用清华 PyPI 镜像（`https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple`），直接 `uv sync` 即可快速下载依赖。若 uv 需要下载 Python 而 GitHub 访问慢，见 FAQ 的「Python 下载加速」。
+
+### 第 5 步：启动应用
+
+**macOS**
+
+- 双击项目根目录的 `start.command`（首次双击若被系统拦截，见下方 FAQ）。
+- 或在终端运行：
+
+```sh
+uv run main.py
+```
+
+**Windows**
+
+- 双击项目根目录的 `start.bat`（会保留一个命令行窗口显示运行日志，运行期间不要关闭它）。
+- 或在命令提示符运行：
+
+```bat
+uv run main.py
+```
+
+`uv run` 会先确保环境已同步，再启动应用。启动后即可按「使用顺序」开始配置。
+
+### 运行方式说明
+
+桌面 UI 不包含内嵌网页，每个账号通过“登录 / 查看浏览器”打开自己的 Chrome 窗口；支持主号和多个从号并行，登录状态保存在各自目录（`data/profiles/<账号 UUID>`）中，不读取你日常使用的浏览器资料。
+
+## 环境变量（可选）
+
+| 变量 | 作用 | 示例 |
+| --- | --- | --- |
+| `DOUYIN_AI_API_KEY` | 指定 AI API Key，优先级高于系统钥匙串 / 凭据管理器里保存的 Key | macOS：`export DOUYIN_AI_API_KEY=sk-xxx`；Windows cmd：`set DOUYIN_AI_API_KEY=sk-xxx` |
+| `DOUYIN_DATA_DIR` | 指定数据目录（数据库、登录 profile、备份） | 见「数据与状态 → 恢复备份」 |
+
+API Key 默认存系统钥匙串（macOS 钥匙串 / Windows 凭据管理器）；如果保存或读取失败，可直接用环境变量 `DOUYIN_AI_API_KEY` 传入，Key 不会写入客户数据库或导出文件。
+
+## 常见问题（FAQ）
+
+- **macOS 双击 `start.command` 提示“无法打开 / 未验证开发者”**：右键该文件 → 打开 → 打开；或到“系统设置 → 隐私与安全性”点“仍要打开”。
+- **提示找不到 Chrome / 无法启动浏览器**：确认已安装正式版 Google Chrome（不是 Chromium / Edge），并确认能正常打开 Chrome。
+- **依赖下载很慢或超时**：项目自带的 `uv.toml` 已配置清华 PyPI 镜像；若仍慢，可在全局配置 `~/.config/uv/uv.toml`（Windows 为 `%AppData%\uv\uv.toml`）里换成其他镜像。
+- **uv 需要下载 Python 但 GitHub 很慢**：若电脑已有 Python 3.10+，uv 会自动复用、不会下载；否则可执行 `UV_PYTHON_INSTALL_MIRROR=https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download uv sync`（gh-proxy 是 GitHub 加速代理，失效时可换用其他加速服务），或先通过国内镜像安装 Python 让 uv 复用。
+- **提示找不到 `uv` 命令**：确认已安装并重新打开终端；macOS 默认装在 `~/.local/bin`，Windows 装在 `%USERPROFILE%\.local\bin`，检查该目录是否在 PATH 中。
+- **是否需要 `playwright install`？** 不需要。应用使用本机 Chrome，不需要额外下载浏览器内核。
+- **首次运行弹出钥匙串 / 凭据访问请求**：允许即可；若不想用系统钥匙串，用 `DOUYIN_AI_API_KEY` 环境变量。
+- **访问抖音超时或页面空白**：先确认浏览器能打开 douyin.com 并检查网络 / 代理；本版本站点适配尚未实号验证，见「当前站点适配边界」。
 
 ## 使用顺序
 
@@ -46,7 +150,7 @@ Windows 使用 `.venv\Scripts\python.exe` 替换上述解释器路径。应用�
 - 开启中的任务不会自动重启。停止时未点击发送的客户可回到待发送；点击后的不确定结果需在聊天记录中检查后再决定是否重新排队。
 - 账号删除只删账号记录，关闭其浏览器，保留本地 profile 和客户历史。
 - 清空前必须停止任务并确认，会先备份，再清空客户及评论去重记录。以后重新监控可能再次发现这些客户。
-- 恢复备份：关闭应用，将备份复制到一个新的数据目录并命名为 `customers.sqlite3`，用 `DOUYIN_DATA_DIR=/新目录 .venv/bin/python main.py` 启动。登录目录需要另外复制 `profiles/`；不要在 SQLite 正在打开时直接覆盖数据库。
+- 恢复备份：关闭应用，将备份复制到一个新的数据目录并命名为 `customers.sqlite3`，用 `DOUYIN_DATA_DIR=/新目录 uv run main.py` 启动（Windows 在命令提示符里用 `set DOUYIN_DATA_DIR=D:\新目录&& uv run main.py`）。登录目录需要另外复制 `profiles/`；不要在 SQLite 正在打开时直接覆盖数据库。
 
 ## 导入与导出
 
@@ -79,8 +183,8 @@ Windows 使用 `.venv\Scripts\python.exe` 替换上述解释器路径。应用�
 ## 验证
 
 ```sh
-.venv/bin/python -m pip install pytest
-QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q
+uv sync
+QT_QPA_PLATFORM=offscreen uv run pytest -q
 ```
 
 测试包括唯一主号、并发客户领取、评论/客户去重、已发送状态保护、导入事务、崩溃恢复、顶层评论过滤、备份和 PySide6 界面构建。

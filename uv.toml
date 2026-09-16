@@ -1,0 +1,4 @@
+# 国内默认使用清华 PyPI 镜像；海外用户或想用官方源可删除本文件
+[[index]]
+url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+default = true
