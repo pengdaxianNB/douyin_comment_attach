@@ -10,8 +10,8 @@ Python + PySide6 桌面应用，SQLite 本地数据库，Playwright 独立 Chrom
 
 | 项目 | 要求 |
 | --- | --- |
-| 操作系统 | macOS 12 及以上（Intel / Apple Silicon 均可），或 Windows 10 / 11 64 位 |
-| uv | 0.5 及以上；用于管理 Python 环境与依赖，可按 `pyproject.toml` 自动下载所需 Python |
+| 操作系统 | macOS 13 及以上（Intel / Apple Silicon 均可），或 Windows 10 / 11 64 位 |
+| uv | 建议使用当前稳定版；用于管理 Python 环境与依赖，可按 `pyproject.toml` 自动下载所需 Python |
 | 浏览器 | Google Chrome 正式版（应用通过 `channel='chrome'` 驱动本机 Chrome，不安装 Playwright 自带的 Chromium，也不能用 Edge / Chromium 替代） |
 | 网络 | 能访问抖音（douyin.com）以及所配置的 AI 服务地址 |
 
@@ -33,7 +33,16 @@ cd douyin_comment_attach
 
 ### 第 2 步：安装 uv
 
-uv 会按 `pyproject.toml` 自动下载并管理 Python 版本和依赖，因此**无需手动安装 Python**。
+uv 会按 `pyproject.toml` 管理 Python 版本和依赖。若本机没有兼容的 Python，uv 会从境外下载 Python；在中国境内部署时，建议先确认本机有 Python 3.10 及以上（推荐 3.12），或准备可信来源的 Python 安装包。
+
+**国内网络优先**：若已安装 Python 和 pip，可以直接从清华 PyPI 镜像安装 uv（macOS 终端或 Windows PowerShell 均可）：
+
+```sh
+python -m pip install -U uv -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+uv --version
+```
+
+Windows 上若 `python` 命令不可用，可将第一行的 `python` 换成 `py`。若安装成功后仍找不到 `uv`，检查 pip 提示的脚本安装目录是否加入 PATH，再重新打开终端。以下官方安装方式适用于能够访问安装脚本和其下载地址的网络。
 
 **macOS**
 
@@ -59,13 +68,11 @@ uv --version
 
 > 如果提示找不到 `uv`：macOS 默认装在 `~/.local/bin`，Windows 默认装在 `%USERPROFILE%\.local\bin`；安装脚本通常会自动写入 PATH，重开终端即可生效。
 >
-> **国内安装备选**：官方脚本访问慢时可任选其一——
-> - 已装 Python：`pip install uv -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple`
-> - macOS 用 Homebrew：`brew install uv`（Homebrew 可配清华 / 中科大镜像）
+> macOS 已配置 Homebrew 时也可执行 `brew install uv`；Homebrew 本身及软件包下载地址仍需按当地网络情况确认。
 
 ### 第 3 步：安装 Google Chrome
 
-到 https://www.google.com/chrome/ 下载并安装正式版 Chrome。应用启动浏览器时依赖它；如果启动时提示找不到 Chrome，先完成这一步，并确认能从开始菜单 / 访达正常打开 Chrome。
+安装 Google Chrome 正式版。官方下载页是 https://www.google.com/chrome/；若在中国境内无法访问，应先在可访问的网络取得官方安装包，并按目标系统准备离线安装包。应用启动浏览器时依赖本机 Chrome；安装后确认能从开始菜单 / 访达正常打开。不要把 Edge 或普通 Chromium 当作此版本的替代品。
 
 ### 第 4 步：安装依赖（uv sync）
 
@@ -78,7 +85,7 @@ uv sync
 
 `uv sync` 会根据 `pyproject.toml` 和 `uv.lock` 生成可复现的环境；第一次运行会自动下载 Python 和依赖，之后的运行会自动判断是否需要更新。
 
-> **国内加速**：项目已自带 `uv.toml`，默认使用清华 PyPI 镜像（`https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple`），直接 `uv sync` 即可快速下载依赖。若 uv 需要下载 Python 而 GitHub 访问慢，见 FAQ 的「Python 下载加速」。
+> **国内依赖下载**：项目自带 `uv.toml`，`uv.lock` 的包下载地址也已指向清华 PyPI 镜像。这个配置只覆盖 Python 包，不覆盖 uv、Python 或 Chrome 的安装包。若 uv 需要下载 Python 而网络超时，见下方 FAQ。
 
 ### 第 5 步：启动应用
 
@@ -119,8 +126,8 @@ API Key 默认存系统钥匙串（macOS 钥匙串 / Windows 凭据管理器）�
 
 - **macOS 双击 `start.command` 提示“无法打开 / 未验证开发者”**：右键该文件 → 打开 → 打开；或到“系统设置 → 隐私与安全性”点“仍要打开”。
 - **提示找不到 Chrome / 无法启动浏览器**：确认已安装正式版 Google Chrome（不是 Chromium / Edge），并确认能正常打开 Chrome。
-- **依赖下载很慢或超时**：项目自带的 `uv.toml` 已配置清华 PyPI 镜像；若仍慢，可在全局配置 `~/.config/uv/uv.toml`（Windows 为 `%AppData%\uv\uv.toml`）里换成其他镜像。
-- **uv 需要下载 Python 但 GitHub 很慢**：若电脑已有 Python 3.10+，uv 会自动复用、不会下载；否则可执行 `UV_PYTHON_INSTALL_MIRROR=https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download uv sync`（gh-proxy 是 GitHub 加速代理，失效时可换用其他加速服务），或先通过国内镜像安装 Python 让 uv 复用。
+- **依赖下载很慢或超时**：项目级 `uv.toml` 优先于全局 uv 配置，且当前 `uv.lock` 含清华镜像的包地址。要换源，请修改项目根目录的 `uv.toml`，运行 `uv lock` 更新锁文件，再运行 `uv sync`；只改全局配置不会覆盖项目设置。
+- **uv 需要下载 Python 但 GitHub 很慢**：先安装可信来源的 Python 3.10+（推荐 3.12），确认 `python --version` 或 Windows 的 `py --version` 正常，再运行 `uv sync --no-python-downloads`。uv 的 `UV_PYTHON_INSTALL_MIRROR` 只适用于提供完整 `python-build-standalone` 发布目录结构的可信镜像，不能把任意 GitHub 网页代理直接当作稳定下载源。
 - **提示找不到 `uv` 命令**：确认已安装并重新打开终端；macOS 默认装在 `~/.local/bin`，Windows 装在 `%USERPROFILE%\.local\bin`，检查该目录是否在 PATH 中。
 - **是否需要 `playwright install`？** 不需要。应用使用本机 Chrome，不需要额外下载浏览器内核。
 - **首次运行弹出钥匙串 / 凭据访问请求**：允许即可；若不想用系统钥匙串，用 `DOUYIN_AI_API_KEY` 环境变量。
