@@ -125,6 +125,29 @@ SEND_DIAGNOSTICS = r"""editor => {
 }"""
 
 
+COMMENT_PANEL_SCROLL = r"""panel => {
+    // Douyin renders the list inside one or more wrappers. Scroll the nearest
+    // real overflow container instead of sending a wheel event to the page:
+    // once a long list reaches its end, wheel events can bubble to the video
+    // feed behind the panel and leave the tab on a blank/black feed item.
+    let scroller=panel;
+    while(scroller && scroller!==document.documentElement){
+        const style=getComputedStyle(scroller);
+        const overflow=style.overflowY;
+        if(['auto','scroll','overlay'].includes(overflow) &&
+                scroller.scrollHeight>scroller.clientHeight+1)break;
+        scroller=scroller.parentElement;
+    }
+    if(!scroller || scroller===document.documentElement){
+        return {found:false,moved:false};
+    }
+    const before=scroller.scrollTop;
+    const distance=Math.max(400,Math.floor(scroller.clientHeight*0.8));
+    scroller.scrollTop=Math.min(before+distance,scroller.scrollHeight-scroller.clientHeight);
+    return {found:true,moved:scroller.scrollTop>before};
+}"""
+
+
 async def composer_send_buttons(editor):
     # Scope to the nearest container shared by this editor and its send control.
     container = editor.locator('xpath=ancestor::*[.//*[contains(concat(" ", normalize-space(@class), " "), " e2e-send-msg-btn ")]][1]')
@@ -303,7 +326,12 @@ class Browser:
                     selector = self.s.get('comment_panel','')
                     panel = self.page.locator(selector) if selector else None
                     if panel is not None and await panel.count() == 1 and await panel.is_visible():
-                        await panel.hover()
+                        scroll = await panel.evaluate(COMMENT_PANEL_SCROLL)
+                        if not scroll.get('found'):
+                            if packets:
+                                self.warnings.append('仅采集已加载评论：未找到评论区的可滚动容器，请校准 CSS')
+                                break
+                            raise NeedsAttention('未找到评论区的可滚动容器，请在设置中校准评论区域 CSS')
                     else:
                         if packets:
                             self.warnings.append('仅采集已加载评论：未找到唯一评论区域，请校准 CSS')
@@ -311,7 +339,7 @@ class Browser:
                         raise NeedsAttention('未找到唯一评论滚动区域，请在设置中校准评论区域 CSS')
                 else:
                     await self.page.mouse.move(700,600)
-                await self.page.mouse.wheel(0,1000)
+                    await self.page.mouse.wheel(0,1000)
                 await asyncio.sleep(2)
                 stale = stale+1 if len(packets)==before else 0
                 if stale >= 4:
@@ -321,7 +349,19 @@ class Browser:
             if errors:
                 raise NeedsAttention(errors[0])
             if not packets:
-                raise NeedsAttention('没有捕获到页面数据，请检查登录、页面结构及站点适配')
+                # A long comment list can occasionally leave Douyin's SPA in
+                # an empty feed state. Re-open the intended URL once so that a
+                # transient black page does not stop the main account task.
+                self.log('没有捕获到页面数据，正在重新打开当前页面重试')
+                await self.page.goto(url,wait_until='domcontentloaded')
+                await asyncio.sleep(3)
+                await self.guard()
+                if tasks:
+                    await asyncio.gather(*list(tasks))
+                if errors:
+                    raise NeedsAttention(errors[0])
+                if not packets:
+                    raise NeedsAttention('刷新重试后仍没有捕获到页面数据，请检查登录、页面结构及站点适配')
             stopped_at_boundary = stopped_at_boundary or bool(stop_when and stop_when(packets))
             if stopped_at_boundary:
                 self.warnings.append('作品扫描已到设定日期边界，停止加载更早作品')
