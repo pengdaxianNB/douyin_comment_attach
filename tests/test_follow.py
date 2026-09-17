@@ -138,7 +138,8 @@ def test_wait_for_message_editor_prefers_douyin_composer():
     from app.browser import wait_for_message_editor
     other=Mock(is_visible=AsyncMock(return_value=True),get_attribute=AsyncMock(return_value='search-editor'))
     composer=Mock(is_visible=AsyncMock(return_value=True),
-                  get_attribute=AsyncMock(return_value='zone-container messageEditorinputArea'))
+                  get_attribute=AsyncMock(return_value='zone-container messageEditorinputArea'),
+                  evaluate=AsyncMock(return_value=True))
     page=Mock();page.locator.return_value.all=AsyncMock(return_value=[other,composer])
     assert asyncio.run(wait_for_message_editor(page,'[contenteditable=true]',AsyncMock())) is composer
 

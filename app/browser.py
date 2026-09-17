@@ -191,38 +191,53 @@ MESSAGE_PANEL_CLOSE = r"""title => {
     };
     if(!visible(title) || title.textContent.trim()!=='消息')return {panel:false,point:null};
     const tr=title.getBoundingClientRect();
-    let panel=false;
+    let panel=null;
     for(let el=title;el&&el!==document.body;el=el.parentElement){
         const r=el.getBoundingClientRect();
-        // The open message drawer has a wide header whose title is close to
-        // its left edge. This excludes the identically named top-nav item.
-        if(!(r.width>=260&&r.width<=Math.min(900,innerWidth*.8)&&r.height>=40&&r.height<=160&&
-                tr.left-r.left>=0&&tr.left-r.left<=100))continue;
-        panel=true;
-        const header=el,hr=r,candidates=[];
-        // Include SVG and CSS-only icons. Do not climb from a directly
-        // clickable SVG into a large, non-clickable wrapper.
-        for(const target of header.querySelectorAll('*')){
-            if(!visible(target))continue;
-            const r=target.getBoundingClientRect(),s=getComputedStyle(target);
-            const clickable=target.matches('button,a,[role="button"]')||typeof target.onclick==='function'||s.cursor==='pointer';
-            if(!clickable||r.width<12||r.width>72||r.height<12||r.height>72)continue;
-            if(r.left<tr.right+30||r.right>hr.right+2||r.top<hr.top-2||r.bottom>hr.bottom+2)continue;
-            const x=r.left+r.width/2,y=r.top+r.height/2;
-            if(Math.abs(y-(tr.top+tr.height/2))>24)continue;
-            const hit=document.elementFromPoint(x,y);
-            if(!hit||!(target===hit||target.contains(hit)))continue;
-            candidates.push({x,y,right:r.right});
-        }
-        if(!candidates.length)continue;
-        // The drawer also has a pop-out icon; only accept the rightmost
-        // control near the edge of its header, aligned with the title.
-        candidates.sort((a,b)=>b.right-a.right);
-        const target=candidates[0];
-        if(hr.right-target.right>48)continue;
-        return {panel:true,point:{x:target.x,y:target.y}};
+        // Header geometry alone also matches normal chats and top navigation.
+        // Require the list's search area in the SAME tall drawer container.
+        if(!(r.width>=260&&r.width<=Math.min(900,innerWidth*.8)&&r.height>=180&&
+                tr.left-r.left>=0&&tr.left-r.left<=100&&tr.top-r.top>=0&&tr.top-r.top<=100))continue;
+        const editors=[...el.querySelectorAll('[contenteditable="true"],textarea')].filter(visible);
+        if(editors.some(e=>!e.matches('[role="searchbox"],input[type="search"]')&&
+                !/搜索/.test((e.getAttribute('placeholder')||'')+(e.getAttribute('aria-label')||''))))
+            return {panel:false,point:null,reason:'conversation'};
+        const search=[...el.querySelectorAll('input,[role="searchbox"],span,div')].some(e=>
+            visible(e)&&(/搜索/.test((e.getAttribute('placeholder')||'')+(e.getAttribute('aria-label')||''))||
+                e.getAttribute('role')==='searchbox'||(e.children.length===0&&e.textContent.trim()==='搜索')));
+        if(search){panel=el;break;}
     }
-    return {panel,point:null};
+    if(!panel)return {panel:false,point:null,reason:'not-message-list'};
+    const hr=panel.getBoundingClientRect(),candidates=[];
+    // Use the full drawer width: title and close controls may be siblings
+    // in separate portal/header wrappers. SVGs need not expose a cursor.
+    for(const target of panel.querySelectorAll('*')){
+        if(!visible(target))continue;
+        const r=target.getBoundingClientRect(),s=getComputedStyle(target);
+        const clickable=target.matches('button,a,[role="button"],svg')||typeof target.onclick==='function'||s.cursor==='pointer';
+        if(!clickable||r.width<12||r.width>72||r.height<12||r.height>72)continue;
+        if(r.left<tr.right+30||r.right>hr.right+2||r.top<hr.top-2||r.bottom>hr.bottom+2)continue;
+        const x=r.left+r.width/2,y=r.top+r.height/2;
+        if(Math.abs(y-(tr.top+tr.height/2))>24)continue;
+        const hit=document.elementFromPoint(x,y);
+        if(!hit||!(target===hit||target.contains(hit)))continue;
+        candidates.push({x,y,right:r.right});
+    }
+    if(!candidates.length)return {panel:true,point:null,reason:'no-header-control'};
+    // The drawer also has a pop-out icon; only accept the rightmost
+    // control near the edge of its header, aligned with the title.
+    candidates.sort((a,b)=>b.right-a.right);
+    const target=candidates[0];
+    if(hr.right-target.right>48)return {panel:true,point:null,reason:'no-right-edge-control'};
+    return {panel:true,point:{x:target.x,y:target.y}};
+}"""
+
+
+EDITOR_UNOBSCURED = r"""el => {
+    const r=el.getBoundingClientRect();
+    if(r.width<=0||r.height<=0)return false;
+    const hit=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);
+    return !!hit&&(hit===el||el.contains(hit));
 }"""
 
 
@@ -239,7 +254,7 @@ async def unique_visible(locator):
     return visible[0] if visible else None
 
 
-async def close_open_message_panel(page, guard, log):
+async def close_open_message_panel(page, guard, log, strict=True):
     """Close Douyin's floating message drawer when it covers the profile."""
     panel_found = False
     for title in await page.get_by_text('消息',exact=True).all():
@@ -261,7 +276,7 @@ async def close_open_message_panel(page, guard, log):
                     return True
                 await asyncio.sleep(0.2)
             raise NeedsAttention('已点击消息侧栏关闭按钮，但侧栏未关闭，尚未发送私信')
-    if panel_found:
+    if panel_found and strict:
         raise NeedsAttention('消息侧栏遮挡客户主页，但未找到关闭按钮，尚未发送私信')
     return False
 
@@ -341,13 +356,17 @@ async def visible_message_editor(page, selector):
 async def wait_for_message_editor(page, selector, guard, log=None):
     for attempt in range(MESSAGE_EDITOR_ATTEMPTS):
         await guard()
-        # Close a generic message list before accepting any editor left behind
-        # it, then let the caller reopen the intended customer's conversation.
-        if log is not None and await close_open_message_panel(page,guard,log):
-            return None
         editor = await visible_message_editor(page,selector)
-        if editor is not None:
+        if editor is not None and await editor.evaluate(EDITOR_UNOBSCURED):
             return editor
+        if attempt==0 and log is not None:
+            log('正在等待私信输入框加载（最长 15 秒）')
+        # The chat is often labelled "消息" too. Accept a usable composer
+        # first; an editor covered by the generic list is not usable.
+        # Give the freshly opened conversation time to render its composer.
+        # A missing close control is not proof that opening the chat failed.
+        if attempt>=2 and log is not None and await close_open_message_panel(page,guard,log,strict=False):
+            return None
         if attempt + 1 < MESSAGE_EDITOR_ATTEMPTS:
             await asyncio.sleep(MESSAGE_EDITOR_INTERVAL)
     return None
@@ -710,6 +729,20 @@ class Browser:
         raise NeedsAttention('客户主页操作区在 15 秒内未就绪，尚未发送私信')
 
     async def send(self, customer, message, before_click):
+        try:
+            await self._send(customer,message,before_click)
+        except AccountNeedsAttention:
+            raise
+        except NeedsAttention:
+            if self.diagnostics_dir is not None:
+                try:
+                    path = await asyncio.wait_for(self.diagnose_page('chat-failure'),timeout=3)
+                    self.log('私信失败现场截图：'+path)
+                except Exception:
+                    self.log('私信失败现场截图未能保存')
+            raise
+
+    async def _send(self, customer, message, before_click):
         await self.check_reachable(customer)
         await follow_profile_button(self.page,self.guard,self.log)
         await click_profile_message_button(self.page,self.guard,self.log)
