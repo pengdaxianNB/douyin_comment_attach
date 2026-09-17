@@ -83,6 +83,7 @@ def test_profile_slow_load_is_polled_without_repeated_navigation(monkeypatch):
     from unittest.mock import Mock
     page=Mock(url='about:blank',goto=AsyncMock())
     browser=Browser(page.context,{},page=page)
+    browser.prepare_background_execution=AsyncMock()
     browser.guard=AsyncMock()
     browser.private_account_reason=AsyncMock(return_value=None)
     monkeypatch.setattr('app.browser.close_open_message_panel',AsyncMock(return_value=False))

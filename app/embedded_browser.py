@@ -54,7 +54,19 @@ class EmbeddedBrowser(QWidget):
             QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
 
         self.view = BrowserView(self)
-        self.view.setPage(QWebEnginePage(self.profile, self.view))
+        page = QWebEnginePage(self.profile, self.view)
+        self.view.setPage(page)
+        # QTabWidget hides every non-selected account view.  Qt normally
+        # propagates that state to Chromium, which may freeze timers/rendering
+        # until the operator selects that account tab.  Automation must keep
+        # running independently of which tab the operator is viewing.
+        page.lifecycleStateChanged.connect(self.keep_page_active)
+        page.recommendedStateChanged.connect(self.keep_page_active)
+        page.visibleChanged.connect(self.keep_page_active)
+        self.activity_timer = QTimer(self)
+        self.activity_timer.timeout.connect(self.keep_page_active)
+        self.activity_timer.start(1000)
+        self.keep_page_active()
         # Qt exposes the underlying CDP target id. Registering that immutable id
         # avoids relying on the page title/URL, both of which change as users
         # and automation navigate between pages.
@@ -99,10 +111,20 @@ class EmbeddedBrowser(QWidget):
     def navigate(self, url):
         self.view.setUrl(QUrl.fromUserInput(str(url)))
 
+    def keep_page_active(self, *_):
+        if self.closed:
+            return
+        page = self.view.page()
+        if page.lifecycleState()!=QWebEnginePage.LifecycleState.Active:
+            page.setLifecycleState(QWebEnginePage.LifecycleState.Active)
+        if not page.isVisible():
+            page.setVisible(True)
+
     def shutdown(self):
         if self.closed:
             return
         self.closed = True
+        self.activity_timer.stop()
         unregister_page(self.marker)
         self.view.stop()
         old_page = self.view.page()

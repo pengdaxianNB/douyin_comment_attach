@@ -482,6 +482,28 @@ class Browser:
         self.s = settings
         self.page = page if page is not None else (context.pages[0] if context.pages else None)
         self.warnings = []
+        self.background_prepared = False
+
+    async def prepare_background_execution(self):
+        """Keep a CDP target responsive while its Qt account tab is hidden."""
+        session = await self.context.new_cdp_session(self.page)
+        errors = []
+        try:
+            for method,params in (
+                    ('Page.setWebLifecycleState',{'state':'active'}),
+                    ('Emulation.setFocusEmulationEnabled',{'enabled':True})):
+                try:
+                    await session.send(method,params)
+                except Exception as exc:
+                    errors.append(type(exc).__name__)
+        finally:
+            await session.detach()
+        if not self.background_prepared:
+            if errors:
+                self.log('后台页面保活部分不受当前内核支持，已启用兼容模式')
+            else:
+                self.log('后台页面已保持活跃，无需切换到当前账号标签')
+            self.background_prepared = True
 
     async def diagnose_sender(self):
         if self.diagnostics_dir is None:
@@ -537,6 +559,7 @@ class Browser:
         if self.page is None:
             self.page = await self.context.new_page()
         await self.page.goto('https://www.douyin.com/',wait_until='domcontentloaded')
+        await self.prepare_background_execution()
 
     async def guard(self):
         for text in ('请完成下列验证','请完成安全验证','操作过于频繁','访问过于频繁','扫码登录'):
@@ -704,6 +727,7 @@ class Browser:
         return None
 
     async def check_reachable(self, customer):
+        await self.prepare_background_execution()
         # AI generation and sending share the already loaded customer profile.
         # Compare path/host, allowing query strings and trailing slashes.
         current = urlparse(self.page.url) if isinstance(self.page.url,str) else None

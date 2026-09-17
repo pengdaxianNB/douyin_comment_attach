@@ -15,8 +15,17 @@ def configure_embedded_browser():
             port = sock.getsockname()[1]
         os.environ['QTWEBENGINE_REMOTE_DEBUGGING'] = '127.0.0.1:'+str(port)
     flags = os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS','')
-    if '--remote-allow-origins=' not in flags:
-        os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (flags+' --remote-allow-origins=*').strip()
+    required = (
+        '--remote-allow-origins=*',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+    )
+    for option in required:
+        key = option.split('=',1)[0]
+        if key not in flags:
+            flags = (flags+' '+option).strip()
+    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = flags
 
 
 def main():

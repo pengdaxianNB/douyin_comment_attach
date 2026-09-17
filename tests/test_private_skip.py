@@ -23,6 +23,7 @@ def page_with_marker(marker=None):
 def test_private_is_skipped_before_follow(monkeypatch):
     page=page_with_marker('私密账号')
     browser=Browser(SimpleNamespace(pages=[page]),{})
+    browser.prepare_background_execution=AsyncMock()
     browser.guard=AsyncMock()
     follow=AsyncMock()
     monkeypatch.setattr('app.browser.follow_profile_button',follow)
@@ -55,6 +56,7 @@ def test_skipped_customer_not_reclaimed(tmp_path):
 def test_reachability_check_before_ai(monkeypatch):
     page=page_with_marker('私密账号')
     browser=Browser(SimpleNamespace(pages=[page]),{})
+    browser.prepare_background_execution=AsyncMock()
     browser.guard=AsyncMock()
     monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
     try:
