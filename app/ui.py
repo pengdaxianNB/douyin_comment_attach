@@ -302,7 +302,7 @@ class Window(QMainWindow):
             form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
             forms[name] = form; l.addWidget(group)
         self.fields = {}
-        labels = dict(thinking_mode='DeepSeek 思考模式',thinking_effort='DeepSeek 思考强度',ai_concurrency='评论 AI 并发数（1–20）',days='近期视频：最近 N 天',poll_seconds='监控轮询间隔（秒）',scroll_limit='每页最大滚动次数',base_url='AI 接口根地址（含 /v1）',model='模型名称',filter_prompt='目标客户筛选提示词',message_prompt='个性化私信提示词',comment_panel='评论滚动区域 CSS（需实页校准）',message_editor='私信输入框 CSS（需实页校准）')
+        labels = dict(thinking_mode='DeepSeek 思考模式',thinking_effort='DeepSeek 思考强度',ai_concurrency='评论 AI 并发数（1–20）',days='近期视频：最近 N 天',comment_days='近期评论：最近 N 天',poll_seconds='监控轮询间隔（秒）',scroll_limit='每页最大滚动次数',base_url='AI 接口根地址（含 /v1）',model='模型名称',filter_prompt='目标客户筛选提示词',message_prompt='个性化私信提示词',comment_panel='评论滚动区域 CSS（需实页校准）',message_editor='私信输入框 CSS（需实页校准）')
         for k,v in DEFAULTS.items():
             val = self.db.setting(k,v)
             if k in ('thinking_mode','thinking_effort'):

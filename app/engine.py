@@ -1,6 +1,7 @@
 import asyncio
 import os
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 from playwright.async_api import async_playwright
@@ -10,10 +11,33 @@ from .browser import Browser, CommentPageUnavailable, NeedsAttention, UncertainS
 from .classifier import classify_comments
 from .embedded_browser import MARKER_PREFIX, page_id
 
-DEFAULTS = dict(days=7,ai_concurrency=5,poll_seconds=300,scroll_limit=80,base_url='',model='',thinking_mode='default',thinking_effort='high',
+DEFAULTS = dict(days=7,comment_days=7,ai_concurrency=5,poll_seconds=300,scroll_limit=80,base_url='',model='',thinking_mode='default',thinking_effort='high',
     filter_prompt='识别评论中是否明确表达了对我提供的产品或服务的购买或咨询需求。产品和目标客户：请填写。不要把普通互动识别为需求。',
     message_prompt='根据客户评论写一条自然、简短的咨询回复。我的产品或服务：请填写。尊重对方，不夸大，不使用虚假承诺。',
     comment_panel='[data-e2e="comment-list"]',message_editor='[contenteditable="true"]')
+
+
+def recent_comments(comments, days, now=None):
+    """Keep comments inside the rolling UTC time window, including its boundary."""
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
+    cutoff = current - timedelta(days=max(1,int(days)))
+    result = []
+    for comment in comments:
+        try:
+            created = datetime.fromisoformat(str(comment.get('comment_time','')).replace('Z','+00:00'))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            else:
+                created = created.astimezone(timezone.utc)
+        except (TypeError,ValueError):
+            continue
+        if cutoff <= created <= current:
+            result.append(comment)
+    return result
 
 
 class Engine(QThread):
@@ -166,6 +190,7 @@ class Engine(QThread):
         """跳过暂时未就绪的单视频，不让慢加载终止整个监控任务。"""
         consecutive_failures = 0
         failed_videos = 0
+        expired_comments = 0
         for video in videos:
             try:
                 comments = await browser.comments(video)
@@ -181,8 +206,13 @@ class Engine(QThread):
                     await asyncio.sleep(10)
                 continue
             consecutive_failures = 0
-            await classify_comments(self.db,ai,comments,settings['ai_concurrency'],
+            eligible = recent_comments(comments,settings.get('comment_days',DEFAULTS['comment_days']))
+            expired_comments += len(comments)-len(eligible)
+            await classify_comments(self.db,ai,eligible,settings['ai_concurrency'],
                 lambda text:self.log.emit(account['name']+'：'+text),self.changed.emit)
+        if expired_comments:
+            days = settings.get('comment_days',DEFAULTS['comment_days'])
+            self.log.emit(f'{account["name"]}：本轮已过滤 {expired_comments} 条超过最近 {days} 天的评论，未提交 AI 分析')
         if failed_videos:
             self.log.emit(f'{account["name"]}：本轮有 {failed_videos} 个视频评论区未就绪，已跳过并保持任务运行，下轮自动重试')
 

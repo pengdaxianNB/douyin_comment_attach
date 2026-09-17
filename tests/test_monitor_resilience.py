@@ -1,11 +1,25 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from app.browser import Browser, CommentPageUnavailable, unique_visible
-from app.engine import Engine
+from app.engine import Engine, recent_comments
+
+
+def test_recent_comments_uses_rolling_day_window_and_rejects_unknown_times():
+    now = datetime(2026,9,17,8,tzinfo=timezone.utc)
+    comments = [
+        {'id':'boundary','comment_time':(now-timedelta(days=3)).isoformat()},
+        {'id':'recent','comment_time':(now-timedelta(hours=2)).isoformat()},
+        {'id':'old','comment_time':(now-timedelta(days=3,seconds=1)).isoformat()},
+        {'id':'future','comment_time':(now+timedelta(seconds=1)).isoformat()},
+        {'id':'unknown','comment_time':''},
+    ]
+
+    assert [item['id'] for item in recent_comments(comments,3,now)] == ['boundary','recent']
 
 
 def test_wait_for_comment_ready_allows_slow_panel(monkeypatch):
@@ -66,7 +80,7 @@ def test_scan_skips_one_bad_video_and_continues(tmp_path):
     engine = Engine(SimpleNamespace(),tmp_path)
     logs = []
     engine.log.connect(logs.append)
-    comment = {'id':'c1'}
+    comment = {'id':'c1','comment_time':datetime.now(timezone.utc).isoformat()}
     browser = SimpleNamespace(comments=AsyncMock(side_effect=[
         CommentPageUnavailable('页面未就绪'),[comment],
     ]))
@@ -82,6 +96,24 @@ def test_scan_skips_one_bad_video_and_continues(tmp_path):
     classify.assert_awaited_once()
     assert classify.await_args.args[2] == [comment]
     assert any('已跳过视频 bad' in line for line in logs)
+
+
+def test_scan_filters_old_comments_before_ai(tmp_path):
+    engine = Engine(SimpleNamespace(),tmp_path)
+    logs = []
+    engine.log.connect(logs.append)
+    now = datetime.now(timezone.utc)
+    recent = {'id':'new','comment_time':(now-timedelta(days=1)).isoformat()}
+    old = {'id':'old','comment_time':(now-timedelta(days=8)).isoformat()}
+    browser = SimpleNamespace(comments=AsyncMock(return_value=[recent,old]))
+
+    with patch('app.engine.classify_comments',new=AsyncMock()) as classify:
+        asyncio.run(engine.scan_videos({'name':'主号'},browser,SimpleNamespace(),
+                                       [{'aweme_id':'video'}],
+                                       {'ai_concurrency':5,'comment_days':3}))
+
+    assert classify.await_args.args[2] == [recent]
+    assert any('过滤 1 条' in line and '未提交 AI' in line for line in logs)
 
 
 def test_scan_keeps_running_after_three_consecutive_comment_page_failures(tmp_path):
