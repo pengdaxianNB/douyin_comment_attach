@@ -159,6 +159,24 @@ COMMENT_PANEL_SCROLL = r"""panel => {
 }"""
 
 
+COMMENT_READY_CHECKS = 20
+COMMENT_READY_INTERVAL = 0.5
+COMMENT_CAPTURE_ATTEMPTS = 3
+
+
+async def unique_visible(locator):
+    """Return the only visible match, tolerating hidden duplicate SPA nodes."""
+    count = await locator.count()
+    visible = []
+    for index in range(count):
+        item = locator if count == 1 else locator.nth(index)
+        if await item.is_visible():
+            visible.append(item)
+            if len(visible) > 1:
+                return None
+    return visible[0] if visible else None
+
+
 async def composer_send_buttons(editor):
     # Scope to the nearest container shared by this editor and its send control.
     container = editor.locator('xpath=ancestor::*[.//*[contains(concat(" ", normalize-space(@class), " "), " e2e-send-msg-btn ")]][1]')
@@ -297,6 +315,23 @@ class Browser:
             if await self.page.get_by_text(text,exact=True).count() and await self.page.get_by_text(text,exact=True).first.is_visible():
                 raise NeedsAttention('页面需要人工处理：'+text)
 
+    async def wait_for_comment_ready(self, packets, tasks):
+        """Give a slow page time to expose either its API data or comment panel."""
+        selector = self.s.get('comment_panel','')
+        panel_locator = self.page.locator(selector) if selector else None
+        for check in range(COMMENT_READY_CHECKS):
+            await self.guard()
+            if tasks:
+                await asyncio.gather(*list(tasks))
+            if packets:
+                return await unique_visible(panel_locator) if panel_locator is not None else None
+            panel = await unique_visible(panel_locator) if panel_locator is not None else None
+            if panel is not None:
+                return panel
+            if check + 1 < COMMENT_READY_CHECKS:
+                await asyncio.sleep(COMMENT_READY_INTERVAL)
+        return None
+
     async def capture(self, url, path, key, limit, stop_when=None):
         packets = []
         stopped_at_boundary = False
@@ -321,7 +356,13 @@ class Browser:
         self.page.on('response',receive)
         try:
             await self.page.goto(url,wait_until='domcontentloaded')
-            await asyncio.sleep(3)
+            if key == 'comments':
+                # DOMContentLoaded fires well before the comment drawer/API is
+                # ready on a busy machine. Poll both signals instead of relying
+                # on one short fixed delay.
+                await self.wait_for_comment_ready(packets,tasks)
+            else:
+                await asyncio.sleep(3)
             stale = 0
             for _ in range(limit):
                 await self.guard()
@@ -335,8 +376,9 @@ class Browser:
                     break
                 if key == 'comments':
                     selector = self.s.get('comment_panel','')
-                    panel = self.page.locator(selector) if selector else None
-                    if panel is not None and await panel.count() == 1 and await panel.is_visible():
+                    panel_locator = self.page.locator(selector) if selector else None
+                    panel = await unique_visible(panel_locator) if panel_locator is not None else None
+                    if panel is not None:
                         scroll = await panel.evaluate(COMMENT_PANEL_SCROLL)
                         if not scroll.get('found'):
                             if packets:
@@ -399,14 +441,17 @@ class Browser:
 
     async def comments(self, video):
         video_id = str(video['aweme_id'])
-        for attempt in range(2):
+        for attempt in range(COMMENT_CAPTURE_ATTEMPTS):
             try:
                 packets = await self.capture('https://www.douyin.com/video/'+video_id,'/aweme/v1/web/comment/list/','comments',self.s['scroll_limit'])
                 break
             except CommentPageUnavailable:
-                if attempt:
+                if attempt + 1 >= COMMENT_CAPTURE_ATTEMPTS:
                     raise
-                self.log('视频 '+video_id+' 评论区未就绪，正在重新打开重试')
+                delay = 2 * (attempt + 1)
+                self.log(f'视频 {video_id} 评论区未就绪，{delay} 秒后重新打开'
+                         f'（第 {attempt + 2}/{COMMENT_CAPTURE_ATTEMPTS} 次）')
+                await asyncio.sleep(delay)
         items = {}
         for p in packets:
             for c in parse_comments(p,video):

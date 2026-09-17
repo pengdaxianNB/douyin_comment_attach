@@ -163,23 +163,28 @@ class Engine(QThread):
         self.status.emit(ident,'已停止')
 
     async def scan_videos(self, account, browser, ai, videos, settings):
-        """跳过偶发的单视频页面异常；连续失败则保留人工介入信号。"""
+        """跳过暂时未就绪的单视频，不让慢加载终止整个监控任务。"""
         consecutive_failures = 0
+        failed_videos = 0
         for video in videos:
             try:
                 comments = await browser.comments(video)
             except CommentPageUnavailable as exc:
                 consecutive_failures += 1
+                failed_videos += 1
                 video_id = str(video.get('aweme_id','未知'))
                 title = ' '.join(str(video.get('desc','')).split())[:40]
                 detail = f' · {title}' if title else ''
                 self.log.emit(f'{account["name"]}：已跳过视频 {video_id}{detail}：{exc}')
-                if consecutive_failures >= 3:
-                    raise NeedsAttention('连续 3 个视频无法定位评论区，请检查登录状态、页面限流或评论区域 CSS') from exc
+                if consecutive_failures == 3:
+                    self.log.emit(f'{account["name"]}：连续 3 个视频加载失败，暂停 10 秒后继续；本轮跳过的视频下轮会自动重试')
+                    await asyncio.sleep(10)
                 continue
             consecutive_failures = 0
             await classify_comments(self.db,ai,comments,settings['ai_concurrency'],
                 lambda text:self.log.emit(account['name']+'：'+text),self.changed.emit)
+        if failed_videos:
+            self.log.emit(f'{account["name"]}：本轮有 {failed_videos} 个视频评论区未就绪，已跳过并保持任务运行，下轮自动重试')
 
     async def work(self, account):
         ident = account['id']
