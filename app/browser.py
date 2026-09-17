@@ -163,6 +163,8 @@ COMMENT_READY_CHECKS = 20
 COMMENT_READY_INTERVAL = 0.5
 COMMENT_CAPTURE_ATTEMPTS = 3
 PROFILE_CLICK_TIMEOUT = 4000
+MESSAGE_EDITOR_ATTEMPTS = 30
+MESSAGE_EDITOR_INTERVAL = 0.5
 
 
 MESSAGE_PANEL_CLOSE = r"""title => {
@@ -255,6 +257,74 @@ async def profile_follow_matches(page, require_enabled=False):
             continue
         matches.append((item,text))
     return matches
+
+
+async def profile_message_buttons(page):
+    """Return visible profile message buttons, never their nested text spans."""
+    controls = page.get_by_role('button',name='私信',exact=True)
+    matches = [item for item in await controls.all()
+               if await item.is_visible() and await item.is_enabled()]
+    if matches:
+        return matches
+    # Older page variants do not expose an accessible button name. Lift the
+    # exact text match to its button so Playwright does not click a moving span.
+    controls = page.locator('button').filter(
+        has=page.get_by_text('私信',exact=True))
+    return [item for item in await controls.all()
+            if await item.is_visible() and await item.is_enabled()]
+
+
+async def click_profile_message_button(page, guard, log):
+    buttons = await profile_message_buttons(page)
+    if len(buttons)!=1:
+        raise NeedsAttention('客户主页未找到唯一的私信按钮')
+    await guard()
+    log('正在打开当前客户私信窗口')
+    try:
+        await buttons[0].click(timeout=PROFILE_CLICK_TIMEOUT)
+    except Exception as exc:
+        if not click_blocked_before_dispatch(exc):
+            raise NeedsAttention('客户主页私信按钮点击失败') from exc
+        buttons = await profile_message_buttons(page)
+        if len(buttons)!=1:
+            raise NeedsAttention('私信按钮状态已变化，无法安全重试') from exc
+        await guard()
+        log('私信按钮常规点击受阻，正在重试')
+        try:
+            await buttons[0].evaluate('el => el.click()')
+        except Exception as retry_error:
+            raise NeedsAttention('私信按钮重试失败') from retry_error
+
+
+async def visible_message_editor(page, selector):
+    visible = [item for item in await page.locator(selector).all()
+               if await item.is_visible()]
+    if len(visible)==1:
+        return visible[0]
+    # Prefer the known Douyin composer if another contenteditable (for
+    # example a search widget) is also visible.
+    preferred = []
+    for item in visible:
+        classes = (await item.get_attribute('class')) or ''
+        if 'messageEditorinputArea' in classes.split():
+            preferred.append(item)
+    return preferred[0] if len(preferred)==1 else None
+
+
+async def wait_for_message_editor(page, selector, guard, log=None):
+    for attempt in range(MESSAGE_EDITOR_ATTEMPTS):
+        await guard()
+        editor = await visible_message_editor(page,selector)
+        if editor is not None:
+            return editor
+        # A known Douyin failure mode opens the generic message list instead
+        # of the selected customer's conversation. Close it immediately so the
+        # caller can click the profile message button again.
+        if log is not None and await close_open_message_panel(page,guard,log):
+            return None
+        if attempt + 1 < MESSAGE_EDITOR_ATTEMPTS:
+            await asyncio.sleep(MESSAGE_EDITOR_INTERVAL)
+    return None
 
 
 def click_blocked_before_dispatch(exc):
@@ -378,6 +448,14 @@ class Browser:
         self.diagnostics_dir.mkdir(parents=True,exist_ok=True)
         path = self.diagnostics_dir / (datetime.now().strftime('send-%Y%m%d-%H%M%S-%f')+'.json')
         path.write_text(json.dumps(info,ensure_ascii=False,indent=2),encoding='utf-8')
+        return str(path)
+
+    async def diagnose_page(self, prefix):
+        if self.diagnostics_dir is None:
+            raise NeedsAttention('未配置诊断目录')
+        self.diagnostics_dir.mkdir(parents=True,exist_ok=True)
+        path = self.diagnostics_dir / (prefix+'-'+datetime.now().strftime('%Y%m%d-%H%M%S-%f')+'.png')
+        await self.page.screenshot(path=str(path))
         return str(path)
 
     async def follow_before_send(self, editor):
@@ -596,21 +674,29 @@ class Browser:
         if reason:
             raise SkippedCustomer(reason)
         await follow_profile_button(self.page,self.guard,self.log)
-        trigger = self.page.get_by_text('私信',exact=True)
-        visible = [item for item in await trigger.all() if await item.is_visible()]
-        if len(visible)!=1:
-            reason = await self.private_account_reason()
-            if reason:
-                raise SkippedCustomer(reason)
-            raise NeedsAttention('客户主页未找到唯一的私信按钮')
-        await visible[0].click()
+        await click_profile_message_button(self.page,self.guard,self.log)
         reason = await self.private_account_reason()
         if reason:
             raise SkippedCustomer(reason)
-        editor = self.page.locator(self.s['message_editor'])
-        await editor.wait_for(state='visible',timeout=10000)
-        if await editor.count()!=1:
-            raise NeedsAttention('私信输入框不唯一，请校准 CSS')
+        editor = await wait_for_message_editor(
+            self.page,self.s['message_editor'],self.guard,self.log)
+        if editor is None:
+            # Occasionally Douyin opens only the generic message list or drops
+            # the first profile-button click. Close that drawer and retry once.
+            await close_open_message_panel(self.page,self.guard,self.log)
+            reason = await self.private_account_reason()
+            if reason:
+                raise SkippedCustomer(reason)
+            self.log('私信输入框未出现，正在重新打开私信窗口')
+            await click_profile_message_button(self.page,self.guard,self.log)
+            editor = await wait_for_message_editor(
+                self.page,self.s['message_editor'],self.guard,self.log)
+        if editor is None:
+            try:
+                diagnostic = '；页面截图已保存：'+await self.diagnose_page('open-chat')
+            except Exception:
+                diagnostic = '；页面截图保存失败'
+            raise NeedsAttention('私信窗口已尝试打开两次，但输入框仍未出现'+diagnostic)
         await editor.fill(message)
         await self.guard()
         # Prefer the chat dialog containing this editor over unrelated page controls.

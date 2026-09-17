@@ -109,18 +109,55 @@ def test_profile_click_actionability_timeout_uses_safe_retry():
     assert '主页关注成功' in logs[-1]
 
 
+def test_message_button_uses_button_and_safe_retry():
+    from app.browser import click_profile_message_button
+    button=Mock(is_visible=AsyncMock(return_value=True),is_enabled=AsyncMock(return_value=True),
+                click=AsyncMock(side_effect=TimeoutError('waiting for element to be visible, enabled and stable')),
+                evaluate=AsyncMock())
+    role=Mock(all=AsyncMock(return_value=[button]))
+    page=Mock();page.get_by_role.return_value=role
+    logs=[]
+    asyncio.run(click_profile_message_button(page,AsyncMock(),logs.append))
+    button.click.assert_awaited_once_with(timeout=4000)
+    button.evaluate.assert_awaited_once()
+    page.locator.assert_not_called()
+    assert any('正在重试' in line for line in logs)
+
+
+def test_wait_for_message_editor_prefers_douyin_composer():
+    from app.browser import wait_for_message_editor
+    other=Mock(is_visible=AsyncMock(return_value=True),get_attribute=AsyncMock(return_value='search-editor'))
+    composer=Mock(is_visible=AsyncMock(return_value=True),
+                  get_attribute=AsyncMock(return_value='zone-container messageEditorinputArea'))
+    page=Mock();page.locator.return_value.all=AsyncMock(return_value=[other,composer])
+    assert asyncio.run(wait_for_message_editor(page,'[contenteditable=true]',AsyncMock())) is composer
+
+
+def test_wait_for_editor_closes_wrong_message_list_immediately():
+    from app.browser import wait_for_message_editor
+    title=Mock(is_visible=AsyncMock(side_effect=[True,False]),
+               evaluate=AsyncMock(return_value={'panel':True,'clicked':True}))
+    page=Mock();page.locator.return_value.all=AsyncMock(return_value=[])
+    page.get_by_text.return_value.all=AsyncMock(return_value=[title])
+    logs=[]
+    result=asyncio.run(wait_for_message_editor(
+        page,'[contenteditable=true]',AsyncMock(),logs.append))
+    assert result is None
+    assert '已点击关闭按钮' in logs[-1]
+
+
 def test_follow_finishes_before_opening_chat(monkeypatch):
     from app.browser import Browser
     from types import SimpleNamespace
     events=[]
     async def follow(*args):events.append('follow_confirmed')
-    async def click():events.append('open_chat')
+    async def open_chat(*args):events.append('open_chat')
     monkeypatch.setattr('app.browser.follow_profile_button',follow)
+    monkeypatch.setattr('app.browser.click_profile_message_button',open_chat)
+    monkeypatch.setattr('app.browser.wait_for_message_editor',AsyncMock(side_effect=RuntimeError('stop at editor')))
     monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
-    trigger=Mock(is_visible=AsyncMock(return_value=True),click=AsyncMock(side_effect=click))
     page=Mock(goto=AsyncMock())
-    page.get_by_text.return_value.all=AsyncMock(return_value=[trigger])
-    page.locator.return_value.wait_for=AsyncMock(side_effect=RuntimeError('stop at editor'))
+    page.get_by_text.return_value.all=AsyncMock(return_value=[])
     browser=Browser(SimpleNamespace(pages=[page]),{'message_editor':'[contenteditable=true]'})
     browser.guard=AsyncMock()
     browser.private_account_reason=AsyncMock(return_value=None)
