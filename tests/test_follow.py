@@ -83,19 +83,14 @@ def test_open_message_panel_is_closed_before_follow():
     from app.browser import follow_profile_button
     events=[]
     title=Mock(is_visible=AsyncMock(side_effect=[True,False]),
-               evaluate=AsyncMock(side_effect=lambda script: events.append('close') or {'panel':True,'clicked':True}))
+               evaluate=AsyncMock(return_value={'panel':True,'point':{'x':900,'y':100}}))
     item=Mock(is_visible=AsyncMock(return_value=True),is_enabled=AsyncMock(return_value=True),
               inner_text=AsyncMock(return_value='已关注'),click=AsyncMock())
     page=Mock();page.get_by_text.return_value.all=AsyncMock(return_value=[title])
+    page.mouse.click=AsyncMock(side_effect=lambda *args: events.append('close'))
     page.locator.return_value.all=AsyncMock(side_effect=lambda: events.append('locate') or [item])
     asyncio.run(follow_profile_button(page,AsyncMock(),lambda _:None))
     assert events==['close','locate']
-
-
-def test_message_panel_close_does_not_assume_svg_has_click():
-    assert 'candidates[0].target.click()' not in MESSAGE_PANEL_CLOSE
-    assert "typeof target.click==='function'" in MESSAGE_PANEL_CLOSE
-    assert 'dispatchEvent(new MouseEvent' in MESSAGE_PANEL_CLOSE
 
 
 def test_message_panel_script_error_is_a_customer_interaction_failure():
@@ -126,14 +121,15 @@ def test_profile_click_actionability_timeout_uses_safe_retry():
 def test_message_button_uses_button_and_safe_retry():
     from app.browser import click_profile_message_button
     button=Mock(is_visible=AsyncMock(return_value=True),is_enabled=AsyncMock(return_value=True),
-                click=AsyncMock(side_effect=TimeoutError('waiting for element to be visible, enabled and stable')),
+                click=AsyncMock(side_effect=[TimeoutError('waiting for element to be visible, enabled and stable'),None]),
                 evaluate=AsyncMock())
     role=Mock(all=AsyncMock(return_value=[button]))
     page=Mock();page.get_by_role.return_value=role
+    page.get_by_text.return_value.all=AsyncMock(return_value=[])
     logs=[]
     asyncio.run(click_profile_message_button(page,AsyncMock(),logs.append))
-    button.click.assert_awaited_once_with(timeout=4000)
-    button.evaluate.assert_awaited_once()
+    assert button.click.await_count==2
+    button.evaluate.assert_not_awaited()
     page.locator.assert_not_called()
     assert any('正在重试' in line for line in logs)
 
@@ -150,9 +146,10 @@ def test_wait_for_message_editor_prefers_douyin_composer():
 def test_wait_for_editor_closes_wrong_message_list_immediately():
     from app.browser import wait_for_message_editor
     title=Mock(is_visible=AsyncMock(side_effect=[True,False]),
-               evaluate=AsyncMock(return_value={'panel':True,'clicked':True}))
+               evaluate=AsyncMock(return_value={'panel':True,'point':{'x':900,'y':100}}))
     page=Mock();page.locator.return_value.all=AsyncMock(return_value=[])
     page.get_by_text.return_value.all=AsyncMock(return_value=[title])
+    page.mouse.click=AsyncMock()
     logs=[]
     result=asyncio.run(wait_for_message_editor(
         page,'[contenteditable=true]',AsyncMock(),logs.append))
@@ -173,6 +170,7 @@ def test_follow_finishes_before_opening_chat(monkeypatch):
     page=Mock(goto=AsyncMock())
     page.get_by_text.return_value.all=AsyncMock(return_value=[])
     browser=Browser(SimpleNamespace(pages=[page]),{'message_editor':'[contenteditable=true]'})
+    browser.check_reachable=AsyncMock()
     browser.guard=AsyncMock()
     browser.private_account_reason=AsyncMock(return_value=None)
     with pytest.raises(RuntimeError,match='stop at editor'):
@@ -187,6 +185,7 @@ def test_failed_follow_does_not_open_chat(monkeypatch):
     monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
     page=Mock(goto=AsyncMock())
     browser=Browser(SimpleNamespace(pages=[page]),{})
+    browser.check_reachable=AsyncMock()
     browser.guard=AsyncMock()
     browser.private_account_reason=AsyncMock(return_value=None)
     with pytest.raises(NeedsAttention):

@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+from playwright.async_api import Error as PlaywrightError
 
 
 class NeedsAttention(RuntimeError):
@@ -180,6 +181,7 @@ COMMENT_CAPTURE_ATTEMPTS = 3
 PROFILE_CLICK_TIMEOUT = 4000
 MESSAGE_EDITOR_ATTEMPTS = 30
 MESSAGE_EDITOR_INTERVAL = 0.5
+PROFILE_READY_ATTEMPTS = 30
 
 
 MESSAGE_PANEL_CLOSE = r"""title => {
@@ -187,44 +189,40 @@ MESSAGE_PANEL_CLOSE = r"""title => {
         const r=el.getBoundingClientRect(),s=getComputedStyle(el);
         return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0;
     };
-    if(!visible(title) || title.textContent.trim()!=='消息')return {panel:false,clicked:false};
+    if(!visible(title) || title.textContent.trim()!=='消息')return {panel:false,point:null};
     const tr=title.getBoundingClientRect();
-    let header=null;
+    let panel=false;
     for(let el=title;el&&el!==document.body;el=el.parentElement){
         const r=el.getBoundingClientRect();
         // The open message drawer has a wide header whose title is close to
         // its left edge. This excludes the identically named top-nav item.
-        if(r.width>=260&&r.width<=Math.min(900,innerWidth*.8)&&r.height>=40&&r.height<=160&&
-                tr.left-r.left>=0&&tr.left-r.left<=100){header=el;break;}
-    }
-    if(!header)return {panel:false,clicked:false};
-    const hr=header.getBoundingClientRect(),seen=new Set(),candidates=[];
-    for(const node of header.querySelectorAll('button,a,[role="button"],svg')){
-        let target=node;
-        while(target.parentElement&&target.parentElement!==header){
-            const s=getComputedStyle(target);
-            // SVGElement does not consistently implement click().  Keep
-            // walking to the owning HTML control instead of selecting the
-            // rightmost SVG icon and later calling a missing method on it.
-            if(typeof target.click==='function'&&
-                    (target.matches('button,a,[role="button"]')||typeof target.onclick==='function'||s.cursor==='pointer'))break;
-            target=target.parentElement;
+        if(!(r.width>=260&&r.width<=Math.min(900,innerWidth*.8)&&r.height>=40&&r.height<=160&&
+                tr.left-r.left>=0&&tr.left-r.left<=100))continue;
+        panel=true;
+        const header=el,hr=r,candidates=[];
+        // Include SVG and CSS-only icons. Do not climb from a directly
+        // clickable SVG into a large, non-clickable wrapper.
+        for(const target of header.querySelectorAll('*')){
+            if(!visible(target))continue;
+            const r=target.getBoundingClientRect(),s=getComputedStyle(target);
+            const clickable=target.matches('button,a,[role="button"]')||typeof target.onclick==='function'||s.cursor==='pointer';
+            if(!clickable||r.width<12||r.width>72||r.height<12||r.height>72)continue;
+            if(r.left<tr.right+30||r.right>hr.right+2||r.top<hr.top-2||r.bottom>hr.bottom+2)continue;
+            const x=r.left+r.width/2,y=r.top+r.height/2;
+            if(Math.abs(y-(tr.top+tr.height/2))>24)continue;
+            const hit=document.elementFromPoint(x,y);
+            if(!hit||!(target===hit||target.contains(hit)))continue;
+            candidates.push({x,y,right:r.right});
         }
-        if(seen.has(target)||!visible(target))continue;
-        seen.add(target);
-        const r=target.getBoundingClientRect(),s=getComputedStyle(target);
-        const clickable=target.matches('button,a,[role="button"]')||typeof target.onclick==='function'||s.cursor==='pointer';
-        if(!clickable||r.width<12||r.width>72||r.height<12||r.height>72)continue;
-        if(r.left<title.getBoundingClientRect().right+30||r.right>hr.right+2||r.top<hr.top-2||r.bottom>hr.bottom+2)continue;
-        candidates.push({target,x:r.right});
+        if(!candidates.length)continue;
+        // The drawer also has a pop-out icon; only accept the rightmost
+        // control near the edge of its header, aligned with the title.
+        candidates.sort((a,b)=>b.right-a.right);
+        const target=candidates[0];
+        if(hr.right-target.right>48)continue;
+        return {panel:true,point:{x:target.x,y:target.y}};
     }
-    if(!candidates.length)return {panel:true,clicked:false};
-    // The drawer header also has a pop-out icon; close is the rightmost icon.
-    candidates.sort((a,b)=>b.x-a.x);
-    const target=candidates[0].target;
-    if(typeof target.click==='function')target.click();
-    else target.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));
-    return {panel:true,clicked:true};
+    return {panel,point:null};
 }"""
 
 
@@ -252,7 +250,10 @@ async def close_open_message_panel(page, guard, log):
         except Exception as exc:
             raise NeedsAttention('消息侧栏关闭失败，尚未发送私信') from exc
         panel_found = panel_found or result.get('panel',False)
-        if result.get('clicked'):
+        if result.get('point'):
+            await guard()
+            point = result['point']
+            await page.mouse.click(point['x'],point['y'])
             log('检测到消息侧栏，已点击关闭按钮')
             for _ in range(10):
                 await guard()
@@ -299,6 +300,7 @@ async def profile_message_buttons(page):
 
 
 async def click_profile_message_button(page, guard, log):
+    await close_open_message_panel(page,guard,log)
     buttons = await profile_message_buttons(page)
     if len(buttons)!=1:
         raise NeedsAttention('客户主页未找到唯一的私信按钮')
@@ -309,13 +311,14 @@ async def click_profile_message_button(page, guard, log):
     except Exception as exc:
         if not click_blocked_before_dispatch(exc):
             raise NeedsAttention('客户主页私信按钮点击失败') from exc
+        await close_open_message_panel(page,guard,log)
         buttons = await profile_message_buttons(page)
         if len(buttons)!=1:
             raise NeedsAttention('私信按钮状态已变化，无法安全重试') from exc
         await guard()
         log('私信按钮常规点击受阻，正在重试')
         try:
-            await buttons[0].evaluate('el => el.click()')
+            await buttons[0].click(timeout=PROFILE_CLICK_TIMEOUT)
         except Exception as retry_error:
             raise NeedsAttention('私信按钮重试失败') from retry_error
 
@@ -338,14 +341,13 @@ async def visible_message_editor(page, selector):
 async def wait_for_message_editor(page, selector, guard, log=None):
     for attempt in range(MESSAGE_EDITOR_ATTEMPTS):
         await guard()
+        # Close a generic message list before accepting any editor left behind
+        # it, then let the caller reopen the intended customer's conversation.
+        if log is not None and await close_open_message_panel(page,guard,log):
+            return None
         editor = await visible_message_editor(page,selector)
         if editor is not None:
             return editor
-        # A known Douyin failure mode opens the generic message list instead
-        # of the selected customer's conversation. Close it immediately so the
-        # caller can click the profile message button again.
-        if log is not None and await close_open_message_panel(page,guard,log):
-            return None
         if attempt + 1 < MESSAGE_EDITOR_ATTEMPTS:
             await asyncio.sleep(MESSAGE_EDITOR_INTERVAL)
     return None
@@ -683,20 +685,32 @@ class Browser:
         return None
 
     async def check_reachable(self, customer):
-        await self.page.goto(customer['url'],wait_until='domcontentloaded')
-        await asyncio.sleep(2)
-        await self.guard()
-        reason = await self.private_account_reason()
-        if reason:
-            customer_skip(reason)
+        # AI generation and sending share the already loaded customer profile.
+        # Compare path/host, allowing query strings and trailing slashes.
+        current = urlparse(self.page.url) if isinstance(self.page.url,str) else None
+        target = urlparse(customer['url'])
+        if not current or (current.hostname,current.path.rstrip('/')) != (target.hostname,target.path.rstrip('/')):
+            self.log('正在进入客户主页')
+            try:
+                await self.page.goto(customer['url'],wait_until='domcontentloaded',timeout=20000)
+            except PlaywrightError as exc:
+                await self.guard()
+                raise NeedsAttention('客户主页加载失败，尚未发送私信：'+str(exc)) from exc
+        for attempt in range(PROFILE_READY_ATTEMPTS):
+            await self.guard()
+            reason = await self.private_account_reason()
+            if reason:
+                customer_skip(reason)
+            await close_open_message_panel(self.page,self.guard,self.log)
+            if len(await profile_follow_matches(self.page))==1:
+                return
+            if attempt==0:
+                self.log('正在等待客户主页操作区加载')
+            await asyncio.sleep(0.5)
+        raise NeedsAttention('客户主页操作区在 15 秒内未就绪，尚未发送私信')
 
     async def send(self, customer, message, before_click):
-        await self.page.goto(customer['url'],wait_until='domcontentloaded')
-        await asyncio.sleep(2)
-        await self.guard()
-        reason = await self.private_account_reason()
-        if reason:
-            customer_skip(reason)
+        await self.check_reachable(customer)
         await follow_profile_button(self.page,self.guard,self.log)
         await click_profile_message_button(self.page,self.guard,self.log)
         reason = await self.private_account_reason()
@@ -721,7 +735,7 @@ class Browser:
             except Exception:
                 diagnostic = '；页面截图保存失败'
             raise NeedsAttention('私信窗口已尝试打开两次，但输入框仍未出现'+diagnostic)
-        await editor.fill(message)
+        await editor.fill(message,timeout=PROFILE_CLICK_TIMEOUT)
         await self.guard()
         # Prefer the chat dialog containing this editor over unrelated page controls.
         dialogs = self.page.get_by_role('dialog').filter(has=editor)
@@ -769,8 +783,10 @@ class Browser:
         # Persist before an external side effect; a crash cannot make this pending again.
         before_click()
         try:
-            await buttons[0].click()
+            await buttons[0].click(timeout=PROFILE_CLICK_TIMEOUT)
             await asyncio.sleep(3)
             await self.guard()
+        except AccountNeedsAttention:
+            raise
         except Exception as exc:
             raise UncertainSend('发送后结果不明确，禁止自动重试') from exc

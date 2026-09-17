@@ -4,7 +4,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from PySide6.QtCore import QThread, Signal
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Error as PlaywrightError
 from playwright._impl._async_base import mapping as async_api_mapping
 from .ai import AI, get_key
 from .browser import Browser, AccountNeedsAttention, CommentPageUnavailable, NeedsAttention, UncertainSend, SkippedCustomer, PrivateAccount
@@ -256,14 +256,16 @@ class Engine(QThread):
                     message = ''
                     skip_cooldown = False
                     try:
-                        await b.check_reachable(customer)
+                        await asyncio.wait_for(b.check_reachable(customer),timeout=45)
+                        self.status.emit(ident,'生成文案：'+customer['name'])
                         message = await ai.message(customer)
                         self.db.finish(customer['uid'],ident,'processing',message)
                         def before_click():
                             nonlocal clicked
                             self.db.finish(customer['uid'],ident,'failed',message,'准备提交发送，结果不明时请勿重复联系')
                             clicked = True
-                        await b.send(customer,message,before_click)
+                        self.status.emit(ident,'打开会话并发送：'+customer['name'])
+                        await asyncio.wait_for(b.send(customer,message,before_click),timeout=90)
                         self.db.finish(customer['uid'],ident,'sent',message)
                     except SkippedCustomer as exc:
                         self.db.finish(customer['uid'],ident,'skipped',message,str(exc))
@@ -282,13 +284,21 @@ class Engine(QThread):
                         self.db.finish(customer['uid'],ident,'failed',message,str(exc))
                         self.log.emit(account['name']+'：客户 '+customer['name']+
                                       ' 处理失败，从号将继续运行：'+str(exc))
+                    except (PlaywrightError, asyncio.TimeoutError) as exc:
+                        # A stalled locator must not end the whole sender job.
+                        # Never requeue a customer once submission has started.
+                        detail = ('发送结果不明，禁止自动重发' if clicked else
+                                  '页面操作超时或失败，尚未提交发送')+'：'+(str(exc) or '超过处理时限')
+                        self.db.finish(customer['uid'],ident,'failed',message,detail)
+                        await b.guard()
+                        self.log.emit(account['name']+'：'+detail+'；从号继续处理下一位客户')
                     self.changed.emit()
                     customer = None
                     if skip_cooldown:
                         self.status.emit(ident,'私密账号已跳过，继续处理')
                         continue
                     interval = self.db.rows('SELECT interval FROM accounts WHERE id=?',(ident,))[0]['interval']
-                    self.status.emit(ident,'间隔等待')
+                    self.status.emit(ident,f'间隔等待 {interval} 秒')
                     await asyncio.sleep(interval)
         except asyncio.CancelledError:
             if customer:

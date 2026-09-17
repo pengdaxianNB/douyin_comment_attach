@@ -7,7 +7,8 @@ import pytest
 
 from app.db import DB
 from app.engine import Engine
-from app.browser import NeedsAttention
+from app.browser import NeedsAttention, AccountNeedsAttention
+from playwright.async_api import Error as PlaywrightError
 
 
 def test_completed_send_is_marked_sent():
@@ -42,7 +43,10 @@ def test_completed_send_is_marked_sent():
         assert row['sent_at']
 
 
-def test_customer_page_error_does_not_stop_sender():
+@pytest.mark.parametrize('error', [NeedsAttention('消息侧栏关闭失败'),
+    PlaywrightError('Element was detached'), asyncio.TimeoutError(),
+    AccountNeedsAttention('页面需要人工处理：操作过于频繁')])
+def test_customer_page_error_does_not_stop_sender(error):
     first_uid = 'MS4wLjABAAAAfirst_customer_1234567'
     second_uid = 'MS4wLjABAAAAsecond_customer_123456'
     with TemporaryDirectory() as folder:
@@ -57,7 +61,7 @@ def test_customer_page_error_does_not_stop_sender():
         engine = Engine(db, folder)
         engine.jobs = {}
         browser = AsyncMock()
-        browser.send.side_effect = [NeedsAttention('消息侧栏关闭失败'), None]
+        browser.send.side_effect = [error, None]
         engine.open = AsyncMock(return_value=browser)
         logs = []
         engine.log.connect(logs.append)
@@ -66,13 +70,20 @@ def test_customer_page_error_does_not_stop_sender():
              patch('app.engine.AI') as ai, \
              patch('app.engine.asyncio.sleep', side_effect=[None, asyncio.CancelledError]):
             ai.return_value.message = AsyncMock(return_value='你好')
-            with pytest.raises(asyncio.CancelledError):
+            if isinstance(error,AccountNeedsAttention):
                 asyncio.run(engine.work(dict(id=account_id, role='sender', name='从号')))
+            else:
+                with pytest.raises(asyncio.CancelledError):
+                    asyncio.run(engine.work(dict(id=account_id, role='sender', name='从号')))
 
         rows = {row['uid']: row for row in db.rows(
             'SELECT uid,status,error FROM customers')}
         assert rows[first_uid]['status'] == 'failed'
-        assert '消息侧栏关闭失败' in rows[first_uid]['error']
-        assert rows[second_uid]['status'] == 'sent'
-        assert browser.send.await_count == 2
-        assert any('从号将继续运行' in line for line in logs)
+        assert rows[first_uid]['error']
+        if isinstance(error,AccountNeedsAttention):
+            assert rows[second_uid]['status']=='pending'
+            assert browser.send.await_count==1
+        else:
+            assert rows[second_uid]['status'] == 'sent'
+            assert browser.send.await_count == 2
+            assert any('从号将继续运行' in line or '从号继续处理' in line for line in logs)
