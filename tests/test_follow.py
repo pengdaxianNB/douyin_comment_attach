@@ -58,13 +58,14 @@ def test_unrelated_follow_state_is_not_accepted(monkeypatch):
 def test_profile_fallback_checks_state_after_click():
     from app.browser import follow_profile_button
     state={'text':'关注'}
-    async def click(): state['text']='已关注'
+    async def click(**kwargs): state['text']='已关注'
     item=Mock(is_visible=AsyncMock(return_value=True),is_enabled=AsyncMock(return_value=True),
               inner_text=AsyncMock(side_effect=lambda:state['text']),click=AsyncMock(side_effect=click))
-    page=Mock();page.locator.return_value.filter.return_value.all=AsyncMock(return_value=[item])
+    page=Mock();page.locator.return_value.all=AsyncMock(return_value=[item])
+    page.get_by_text.return_value.all=AsyncMock(return_value=[])
     logs=[]
     asyncio.run(follow_profile_button(page,AsyncMock(),logs.append))
-    item.click.assert_awaited_once()
+    item.click.assert_awaited_once_with(timeout=4000)
     assert '主页关注成功' in logs[-1]
 
 
@@ -72,9 +73,40 @@ def test_profile_fallback_does_not_unfollow():
     from app.browser import follow_profile_button
     item=Mock(is_visible=AsyncMock(return_value=True),is_enabled=AsyncMock(return_value=True),
               inner_text=AsyncMock(return_value='已关注'),click=AsyncMock())
-    page=Mock();page.locator.return_value.filter.return_value.all=AsyncMock(return_value=[item])
+    page=Mock();page.locator.return_value.all=AsyncMock(return_value=[item])
+    page.get_by_text.return_value.all=AsyncMock(return_value=[])
     asyncio.run(follow_profile_button(page,AsyncMock(),lambda _:None))
     item.click.assert_not_awaited()
+
+
+def test_open_message_panel_is_closed_before_follow():
+    from app.browser import follow_profile_button
+    events=[]
+    title=Mock(is_visible=AsyncMock(side_effect=[True,False]),
+               evaluate=AsyncMock(side_effect=lambda script: events.append('close') or {'panel':True,'clicked':True}))
+    item=Mock(is_visible=AsyncMock(return_value=True),is_enabled=AsyncMock(return_value=True),
+              inner_text=AsyncMock(return_value='已关注'),click=AsyncMock())
+    page=Mock();page.get_by_text.return_value.all=AsyncMock(return_value=[title])
+    page.locator.return_value.all=AsyncMock(side_effect=lambda: events.append('locate') or [item])
+    asyncio.run(follow_profile_button(page,AsyncMock(),lambda _:None))
+    assert events==['close','locate']
+
+
+def test_profile_click_actionability_timeout_uses_safe_retry():
+    from app.browser import follow_profile_button
+    state={'text':'关注'}
+    async def retry(script): state['text']='已关注'
+    item=Mock(is_visible=AsyncMock(return_value=True),is_enabled=AsyncMock(return_value=True),
+              inner_text=AsyncMock(side_effect=lambda:state['text']),
+              click=AsyncMock(side_effect=TimeoutError('waiting for element to be visible, enabled and stable')),
+              evaluate=AsyncMock(side_effect=retry))
+    page=Mock();page.locator.return_value.all=AsyncMock(return_value=[item])
+    page.get_by_text.return_value.all=AsyncMock(return_value=[])
+    logs=[]
+    asyncio.run(follow_profile_button(page,AsyncMock(),logs.append))
+    item.evaluate.assert_awaited_once()
+    assert any('正在重试' in line for line in logs)
+    assert '主页关注成功' in logs[-1]
 
 
 def test_follow_finishes_before_opening_chat(monkeypatch):

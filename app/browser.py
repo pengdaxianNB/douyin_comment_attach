@@ -162,6 +162,47 @@ COMMENT_PANEL_SCROLL = r"""panel => {
 COMMENT_READY_CHECKS = 20
 COMMENT_READY_INTERVAL = 0.5
 COMMENT_CAPTURE_ATTEMPTS = 3
+PROFILE_CLICK_TIMEOUT = 4000
+
+
+MESSAGE_PANEL_CLOSE = r"""title => {
+    const visible = el => {
+        const r=el.getBoundingClientRect(),s=getComputedStyle(el);
+        return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity)>0;
+    };
+    if(!visible(title) || title.textContent.trim()!=='消息')return {panel:false,clicked:false};
+    const tr=title.getBoundingClientRect();
+    let header=null;
+    for(let el=title;el&&el!==document.body;el=el.parentElement){
+        const r=el.getBoundingClientRect();
+        // The open message drawer has a wide header whose title is close to
+        // its left edge. This excludes the identically named top-nav item.
+        if(r.width>=260&&r.width<=Math.min(900,innerWidth*.8)&&r.height>=40&&r.height<=160&&
+                tr.left-r.left>=0&&tr.left-r.left<=100){header=el;break;}
+    }
+    if(!header)return {panel:false,clicked:false};
+    const hr=header.getBoundingClientRect(),seen=new Set(),candidates=[];
+    for(const node of header.querySelectorAll('button,a,[role="button"],svg')){
+        let target=node;
+        while(target.parentElement&&target.parentElement!==header){
+            const s=getComputedStyle(target);
+            if(target.matches('button,a,[role="button"]')||typeof target.onclick==='function'||s.cursor==='pointer')break;
+            target=target.parentElement;
+        }
+        if(seen.has(target)||!visible(target))continue;
+        seen.add(target);
+        const r=target.getBoundingClientRect(),s=getComputedStyle(target);
+        const clickable=target.matches('button,a,[role="button"]')||typeof target.onclick==='function'||s.cursor==='pointer';
+        if(!clickable||r.width<12||r.width>72||r.height<12||r.height>72)continue;
+        if(r.left<title.getBoundingClientRect().right+30||r.right>hr.right+2||r.top<hr.top-2||r.bottom>hr.bottom+2)continue;
+        candidates.push({target,x:r.right});
+    }
+    if(!candidates.length)return {panel:true,clicked:false};
+    // The drawer header also has a pop-out icon; close is the rightmost icon.
+    candidates.sort((a,b)=>b.x-a.x);
+    candidates[0].target.click();
+    return {panel:true,clicked:true};
+}"""
 
 
 async def unique_visible(locator):
@@ -175,6 +216,54 @@ async def unique_visible(locator):
             if len(visible) > 1:
                 return None
     return visible[0] if visible else None
+
+
+async def close_open_message_panel(page, guard, log):
+    """Close Douyin's floating message drawer when it covers the profile."""
+    panel_found = False
+    for title in await page.get_by_text('消息',exact=True).all():
+        if not await title.is_visible():
+            continue
+        result = await title.evaluate(MESSAGE_PANEL_CLOSE)
+        panel_found = panel_found or result.get('panel',False)
+        if result.get('clicked'):
+            log('检测到消息侧栏，已点击关闭按钮')
+            for _ in range(10):
+                await guard()
+                if not await title.is_visible():
+                    return True
+                await asyncio.sleep(0.2)
+            raise NeedsAttention('已点击消息侧栏关闭按钮，但侧栏未关闭，尚未发送私信')
+    if panel_found:
+        raise NeedsAttention('消息侧栏遮挡客户主页，但未找到关闭按钮，尚未发送私信')
+    return False
+
+
+async def profile_follow_matches(page, require_enabled=False):
+    # Prefer the stable e2e hook observed on the profile action. The fallback
+    # preserves compatibility with older Douyin markup.
+    controls = page.locator(
+        'button[data-e2e="user-info-follow-btn"], button:has(.semi-button-content)')
+    matches = []
+    for item in await controls.all():
+        if not await item.is_visible():
+            continue
+        text = (await item.inner_text()).strip()
+        if text not in ('关注','已关注','互相关注','相互关注'):
+            continue
+        if require_enabled and not await item.is_enabled():
+            continue
+        matches.append((item,text))
+    return matches
+
+
+def click_blocked_before_dispatch(exc):
+    """Recognize Playwright failures where no click was delivered."""
+    detail = str(exc).lower()
+    return ('waiting for element to be visible, enabled and stable' in detail
+            or 'element is not stable' in detail
+            or 'intercepts pointer events' in detail
+            or 'element is outside of the viewport' in detail)
 
 
 async def composer_send_buttons(editor):
@@ -228,14 +317,8 @@ async def follow_in_panel(panel, guard, log, accept=None):
 
 
 async def follow_profile_button(page, guard, log):
-    # Observed profile control has a semi-button-content label; sidebar links do not.
-    controls = page.locator('button').filter(has=page.locator('.semi-button-content'))
-    matches = []
-    for item in await controls.all():
-        if await item.is_visible() and await item.is_enabled():
-            text = (await item.inner_text()).strip()
-            if text in ('关注','已关注','互相关注','相互关注'):
-                matches.append((item,text))
+    await close_open_message_panel(page,guard,log)
+    matches = await profile_follow_matches(page,require_enabled=True)
     if len(matches)!=1:
         raise NeedsAttention('主页关注按钮不唯一或不可见，尚未发送私信')
     item,text = matches[0]
@@ -244,10 +327,32 @@ async def follow_profile_button(page, guard, log):
         return
     await guard()
     log('发送前关注检查：正在点击当前客户主页关注按钮')
-    await item.click()
+    try:
+        await item.click(timeout=PROFILE_CLICK_TIMEOUT)
+    except Exception as exc:
+        # A normal Playwright click can wait forever for a profile whose layout
+        # is animating. Only retry when its call log proves the click was never
+        # dispatched; this avoids accidentally toggling an already-followed user.
+        current = await profile_follow_matches(page)
+        if len(current)==1 and current[0][1] in ('已关注','互相关注','相互关注'):
+            log('主页关注成功，继续发送私信')
+            return
+        if not click_blocked_before_dispatch(exc):
+            raise NeedsAttention('主页关注按钮点击失败，尚未发送私信') from exc
+        await close_open_message_panel(page,guard,log)
+        current = await profile_follow_matches(page,require_enabled=True)
+        if len(current)!=1 or current[0][1]!='关注':
+            raise NeedsAttention('主页关注按钮状态已变化，无法安全重试，尚未发送私信') from exc
+        await guard()
+        log('主页关注按钮常规点击受阻，正在重试')
+        try:
+            await current[0][0].evaluate('el => el.click()')
+        except Exception as retry_error:
+            raise NeedsAttention('主页关注按钮重试失败，尚未发送私信') from retry_error
     for _ in range(20):
         await guard()
-        if await item.is_visible() and (await item.inner_text()).strip() in ('已关注','互相关注','相互关注'):
+        current = await profile_follow_matches(page)
+        if len(current)==1 and current[0][1] in ('已关注','互相关注','相互关注'):
             log('主页关注成功，继续发送私信')
             return
         await asyncio.sleep(0.5)
