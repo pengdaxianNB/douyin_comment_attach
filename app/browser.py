@@ -237,12 +237,12 @@ async def follow_profile_button(page, guard, log):
 
 
 class Browser:
-    def __init__(self, context, settings, diagnostics_dir=None, log=None):
+    def __init__(self, context, settings, diagnostics_dir=None, log=None, page=None):
         self.log = log or (lambda text: None)
         self.diagnostics_dir = Path(diagnostics_dir) if diagnostics_dir else None
         self.context = context
         self.s = settings
-        self.page = context.pages[0] if context.pages else None
+        self.page = page if page is not None else (context.pages[0] if context.pages else None)
         self.warnings = []
 
     async def diagnose_sender(self):

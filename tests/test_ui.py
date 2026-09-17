@@ -22,7 +22,8 @@ def test_window():
         db=DB(Path(folder)/'test.sqlite3')
         w=Window(db,folder,start_engine=False)
         w.show(); app.processEvents()
-        assert w.tabs.count()==6
+        assert w.tabs.count()==7
+        assert any(w.tabs.tabText(i)=='内嵌浏览器' for i in range(w.tabs.count()))
         assert w.fields['base_url'].text()==''
         assert w.customers.rowCount()==0
         db.import_customers([{'uid':'MS4wLjABAAAAexample_123456','name':'示例客户','text':'我想咨询一下价格',

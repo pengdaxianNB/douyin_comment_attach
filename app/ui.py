@@ -4,12 +4,13 @@ import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import keyring
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices,QColor
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QTabWidget,QTableWidget,QTableWidgetItem,QHeaderView,QLineEdit,QPlainTextEdit,QSpinBox,QFormLayout,QMessageBox,QFileDialog,QInputDialog,QComboBox,QGroupBox,QAbstractItemView,QScrollArea,QDialog)
 from .ai import SERVICE
 from .db import user_id
 from .engine import Engine, DEFAULTS
+from .embedded_browser import EmbeddedBrowser
 
 STATUS = dict(pending='等待私信',processing='处理中',sent='已私信',failed='失败',skipped='已跳过')
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
@@ -137,12 +138,13 @@ class Window(QMainWindow):
             value = QLabel('0'); value.setObjectName('statValue'); value.setProperty('status',key); card_layout.addWidget(value)
             self.metric_values[key] = value; metrics_row.addWidget(card,1)
         self.tabs = QTabWidget(); self.tabs.tabBar().setExpanding(False); self.tabs.tabBar().setCursor(Qt.CursorShape.PointingHandCursor); self.tabs.tabBar().setDrawBase(False); self.tabs.setDocumentMode(False); layout.addWidget(self.tabs,1)
-        self.build_customers(); self.build_accounts(); self.build_bloggers(); self.build_settings()
+        self.browser_widgets = {}
+        self.build_customers(); self.build_accounts(); self.build_bloggers(); self.build_browser_workspace(); self.build_settings()
         self.logs = QPlainTextEdit(); self.logs.setReadOnly(True); self.logs.setMaximumBlockCount(1000)
         self.tabs.addTab(self.logs,'运行日志')
         self.build_database()
         self.tabs.currentChanged.connect(lambda: self.refresh_database() if self.tabs.currentWidget() is self.database_page else None)
-        self.statusBar().showMessage('站点适配待实号验证 · 登录和验证码请在账号浏览器中处理')
+        self.statusBar().showMessage('站点适配待实号验证 · 登录和验证码请在内嵌浏览器中处理')
         self.refresh_accounts(); self.refresh_bloggers(); self.refresh_customers()
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_customers); self.timer.start(4000)
         if start_engine:
@@ -177,7 +179,7 @@ class Window(QMainWindow):
 
     def build_accounts(self):
         l = self.page('主号 / 从号')
-        l.addWidget(QLabel('仅允许一个主号；每个账号使用独立 Chrome 登录目录。选择账号后可打开对应浏览器查看状态。'))
+        l.addWidget(QLabel('仅允许一个主号；每个账号使用独立内嵌浏览器和登录目录，可在“内嵌浏览器”页随时切换查看。'))
         controls = QHBoxLayout(); l.addLayout(controls)
         self.role_switches = {}
         for role,title,description in [('main','主号 · 评论监控','仅控制主号采集和 AI 筛选'),('sender','从号 · 私信任务','控制全部已添加从号，按各自间隔运行')]:
@@ -189,8 +191,63 @@ class Window(QMainWindow):
             self.role_switches[role] = switch
         self.accounts = table(['备注名','角色','发送间隔（秒）','当前状态']); self.accounts.setColumnWidth(0,240); self.accounts.setColumnWidth(1,130); self.accounts.setColumnWidth(2,190); l.addWidget(self.accounts)
         bar = QHBoxLayout(); l.addLayout(bar)
-        for label,fn in [('新增主号',lambda:self.add_account('main')),('新增从号',lambda:self.add_account('sender')),('修改备注 / 间隔',self.edit_account),('登录 / 查看浏览器',lambda:self.account_command('login')),('启动选中账号',lambda:self.account_command('start')),('停止选中账号',lambda:self.account_command('stop')),('采集发送诊断',lambda:self.account_command('diagnose')),('删除账号',self.delete_account)]: bar.addWidget(button(label,fn))
+        for label,fn in [('新增主号',lambda:self.add_account('main')),('新增从号',lambda:self.add_account('sender')),('修改备注 / 间隔',self.edit_account),('登录 / 查看内嵌浏览器',lambda:self.account_command('login')),('启动选中账号',lambda:self.account_command('start')),('停止选中账号',lambda:self.account_command('stop')),('采集发送诊断',lambda:self.account_command('diagnose')),('删除账号',self.delete_account)]: bar.addWidget(button(label,fn))
         l.addWidget(QLabel('停止按钮在当前异步操作取消后生效；删除账号会保留登录目录。连续发送前请先核验一条真实私信。'))
+
+    def build_browser_workspace(self):
+        page = QWidget(); page.setObjectName('page')
+        layout = QVBoxLayout(page); layout.setContentsMargins(14,14,14,14); layout.setSpacing(10)
+        hint = QLabel('每个账号的页面会保持在独立标签中；任务运行时也可切换查看，请勿在自动操作时手动跳转该页。')
+        hint.setObjectName('muted'); hint.setWordWrap(True); layout.addWidget(hint)
+        self.browser_tabs = QTabWidget(); self.browser_tabs.setObjectName('browserTabs')
+        # macOS paints a light native strip behind document-mode tabs even when
+        # the rest of the application uses a dark stylesheet. Use the regular
+        # tab bar and suppress its native base so the workspace stays uniform.
+        self.browser_tabs.setDocumentMode(False)
+        self.browser_tabs.tabBar().setDrawBase(False)
+        self.browser_tabs.tabBar().setExpanding(False)
+        layout.addWidget(self.browser_tabs,1)
+        empty = QLabel('尚未打开账号页面。请在“主号 / 从号”中选中账号，点击“登录 / 查看内嵌浏览器”。')
+        empty.setAlignment(Qt.AlignmentFlag.AlignCenter); empty.setObjectName('muted')
+        self.browser_empty = empty; self.browser_tabs.addTab(empty,'使用提示')
+        self.tabs.addTab(page,'内嵌浏览器')
+        self.browser_page = page
+
+    def ensure_browser(self, account, focus=True):
+        ident = account['id']
+        widget = self.browser_widgets.get(ident)
+        if widget is None:
+            if self.browser_empty is not None:
+                index = self.browser_tabs.indexOf(self.browser_empty)
+                if index >= 0: self.browser_tabs.removeTab(index)
+                self.browser_empty = None
+            widget = EmbeddedBrowser(self.data/'embedded_profiles'/ident,ident,self)
+            self.browser_widgets[ident] = widget
+            self.browser_tabs.addTab(widget,account['name'])
+        else:
+            index = self.browser_tabs.indexOf(widget)
+            if index >= 0: self.browser_tabs.setTabText(index,account['name'])
+        if focus:
+            self.tabs.setCurrentWidget(self.browser_page)
+            self.browser_tabs.setCurrentWidget(widget)
+        return widget
+
+    def close_browser(self, ident):
+        widget = self.browser_widgets.pop(ident,None)
+        if widget is not None:
+            index = self.browser_tabs.indexOf(widget)
+            if index >= 0: self.browser_tabs.removeTab(index)
+            widget.shutdown()
+            widget.deleteLater()
+
+    def open_preview(self, url):
+        with self.engine.lock:
+            running = set(self.engine.running_accounts)
+        account = next((r for r in self.account_rows if r['id'] not in running),None)
+        if account is None:
+            raise ValueError('请先添加一个账号，或停止一个账号任务后再打开客户主页')
+        widget = self.ensure_browser(account,True)
+        widget.navigate(url)
 
     def sync_role_switches(self):
         with self.engine.lock:
@@ -210,6 +267,7 @@ class Window(QMainWindow):
             if enabled and (not self.db.setting('base_url','') or not self.db.setting('model','')):
                 raise ValueError('请先保存 AI 设置')
             for account in accounts:
+                if enabled: self.ensure_browser(account,False)
                 self.engine.command('start' if enabled else 'stop',account)
             self.add_log(('主号监控' if role=='main' else '全部从号私信')+('：已请求开启' if enabled else '：已请求停止'))
         self.report(action)
@@ -403,6 +461,10 @@ class Window(QMainWindow):
         selected = self.accounts.currentRow()
         populate(self.accounts,[[r['name'],'主号' if r['role']=='main' else '从号',r['interval'],self.states.get(r['id'],'未启动')] for r in self.account_rows])
         if 0<=selected<len(self.account_rows): self.accounts.selectRow(selected)
+        names = {r['id']:r['name'] for r in self.account_rows}
+        for ident,widget in self.browser_widgets.items():
+            index = self.browser_tabs.indexOf(widget)
+            if index >= 0 and ident in names: self.browser_tabs.setTabText(index,names[ident])
         self.sync_role_switches()
 
     def refresh_bloggers(self):
@@ -446,6 +508,8 @@ class Window(QMainWindow):
             if op=='start':
                 if not self.db.setting('base_url','') or not self.db.setting('model',''): raise ValueError('请先保存 AI 设置')
                 self.states[r['id']]='正在启动'
+            if op in ('login','start'):
+                self.ensure_browser(r,op=='login')
             self.engine.command(op,r)
         self.report(action)
 
@@ -455,6 +519,7 @@ class Window(QMainWindow):
             if self.engine.busy(): raise ValueError('请先停止所有账号任务')
             if QMessageBox.question(self,'删除账号','删除账号记录？登录目录保留在本地，客户和发送历史保留。')!=QMessageBox.StandardButton.Yes: return
             self.engine.command('close',r)
+            self.close_browser(r['id'])
             self.db.execute('DELETE FROM accounts WHERE id=?',(r['id'],)); self.refresh_accounts()
         self.report(action)
 
@@ -495,7 +560,7 @@ class Window(QMainWindow):
         self.report(action)
 
     def open_customer(self,*args):
-        self.report(lambda:QDesktopServices.openUrl(QUrl(self.selected(self.customers,self.customer_rows)['url'])))
+        self.report(lambda:self.open_preview(self.selected(self.customers,self.customer_rows)['url']))
 
     def mark(self,status):
         def action():
@@ -547,9 +612,12 @@ class Window(QMainWindow):
             self.engine.command('shutdown')
             self.setEnabled(False)
             self.engine.finished.connect(self.close)
-            self.statusBar().showMessage('正在停止任务并关闭账号浏览器…')
+            self.statusBar().showMessage('正在停止任务并关闭内嵌浏览器…')
             event.ignore()
-        else:event.accept()
+        else:
+            for widget in self.browser_widgets.values():
+                widget.shutdown()
+            event.accept()
 
 
 STYLE = '''
@@ -609,6 +677,9 @@ QLabel#statValue[status="skipped"] {color:#9ba9bd;}
 QLabel#sectionTitle {font-size:17px;font-weight:600;color:#eef4fc;}
 
 QTabWidget::tab-bar {alignment:left;}
+QTabWidget#browserTabs {background:#182233;border:0;}
+QTabWidget#browserTabs::pane {background:#182233;border:1px solid #2c394d;top:-1px;}
+QTabWidget#browserTabs QTabBar {background:#182233;border:0;}
 QPushButton {padding:10px 16px;}
 QPushButton[variant="primary"] {background:#397ddd;color:#ffffff;border:1px solid #4c8be7;}
 QPushButton[variant="primary"]:hover {background:#4a8be8;}

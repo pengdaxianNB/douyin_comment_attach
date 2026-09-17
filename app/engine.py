@@ -1,11 +1,14 @@
 import asyncio
+import os
 import threading
 from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 from playwright.async_api import async_playwright
+from playwright._impl._async_base import mapping as async_api_mapping
 from .ai import AI, get_key
 from .browser import Browser, CommentPageUnavailable, NeedsAttention, UncertainSend, SkippedCustomer
 from .classifier import classify_comments
+from .embedded_browser import MARKER_PREFIX, page_id
 
 DEFAULTS = dict(days=7,ai_concurrency=5,poll_seconds=300,scroll_limit=80,base_url='',model='',thinking_mode='default',thinking_effort='high',
     filter_prompt='识别评论中是否明确表达了对我提供的产品或服务的购买或咨询需求。产品和目标客户：请填写。不要把普通互动识别为需求。',
@@ -47,6 +50,7 @@ class Engine(QThread):
         self.loop = asyncio.get_running_loop()
         self.commands = asyncio.Queue()
         self.contexts,self.jobs = {},{}
+        self.cdp_browser = None
         async with async_playwright() as pw:
             self.pw = pw
             self.ready.set()
@@ -60,8 +64,7 @@ class Engine(QThread):
                         await self.stop_job(ident)
                     elif op == 'close':
                         await self.stop_job(ident)
-                        if ident in self.contexts:
-                            await self.contexts.pop(ident).context.close()
+                        self.contexts.pop(ident,None)
                         self.status.emit(ident,'已关闭')
                     elif op == 'diagnose':
                         if ident in self.jobs:
@@ -73,7 +76,7 @@ class Engine(QThread):
                     elif op == 'login':
                         b = await self.open(account)
                         await b.page.bring_to_front()
-                        self.status.emit(ident,'浏览器已打开 · 请本人登录')
+                        self.status.emit(ident,'内嵌浏览器已打开 · 请本人登录')
                     elif op == 'start' and ident not in self.jobs:
                         with self.lock:
                             self.running_accounts.add(ident)
@@ -85,8 +88,7 @@ class Engine(QThread):
                     self.log.emit('账号操作失败：'+str(exc))
             for ident in list(self.jobs):
                 await self.stop_job(ident)
-            for b in self.contexts.values():
-                await b.context.close()
+            self.contexts.clear()
         self.loop = None
 
     def settings(self):
@@ -95,16 +97,61 @@ class Engine(QThread):
     async def open(self, account):
         ident = account['id']
         if ident not in self.contexts:
-            context = await self.pw.chromium.launch_persistent_context(str(self.data/'profiles'/ident),channel='chrome',headless=False,viewport={'width':1280,'height':900},locale='zh-CN',chromium_sandbox=True)
-            b = Browser(context,self.settings(),self.data/'diagnostics'/ident,log=lambda text:self.log.emit(account['name']+'：'+text))
+            page = await self.embedded_page(ident)
+            b = Browser(page.context,self.settings(),self.data/'diagnostics'/ident,
+                log=lambda text:self.log.emit(account['name']+'：'+text),page=page)
             self.contexts[ident] = b
             try:
                 await b.init()
             except BaseException:
                 self.contexts.pop(ident,None)
-                await context.close()
                 raise
         return self.contexts[ident]
+
+    def cdp_endpoint(self):
+        value = os.environ.get('QTWEBENGINE_REMOTE_DEBUGGING','').strip()
+        if not value:
+            raise ValueError('内嵌浏览器调试通道未配置，请重启应用')
+        if '://' not in value:
+            value = 'http://'+value
+        return value
+
+    async def connect_embedded_browser(self):
+        if self.cdp_browser and self.cdp_browser.is_connected():
+            return self.cdp_browser
+        last_error = None
+        for _ in range(40):
+            try:
+                # QtWebEngine intentionally omits browser-context download
+                # management. Playwright's internal noDefaults option skips that
+                # one unsupported command while retaining its normal Page API.
+                impl = await self.pw.chromium._impl_obj.connect_over_cdp(
+                    self.cdp_endpoint(),timeout=2000,noDefaults=True)
+                self.cdp_browser = async_api_mapping.from_impl(impl)
+                return self.cdp_browser
+            except Exception as exc:
+                last_error = exc
+                await asyncio.sleep(0.25)
+        raise ValueError('无法连接应用内嵌浏览器：'+str(last_error))
+
+    async def embedded_page(self, ident):
+        browser = await self.connect_embedded_browser()
+        expected = MARKER_PREFIX+ident
+        for _ in range(60):
+            expected_target = page_id(ident)
+            for context in browser.contexts:
+                for page in context.pages:
+                    try:
+                        session = await context.new_cdp_session(page)
+                        info = await session.send('Target.getTargetInfo')
+                        await session.detach()
+                        target = (info.get('targetInfo') or {}).get('targetId')
+                        if (expected_target and target == expected_target) or await page.title() == expected:
+                            return page
+                    except Exception:
+                        pass
+            await asyncio.sleep(0.25)
+        raise ValueError('未找到该账号的内嵌页面，请重新点击“登录 / 查看内嵌浏览器”')
 
     async def stop_job(self, ident):
         task = self.jobs.pop(ident,None)

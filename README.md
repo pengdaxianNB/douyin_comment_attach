@@ -1,6 +1,6 @@
 # 熊猫领航 · 评论客户工作台
 
-Python + PySide6 桌面应用，SQLite 本地数据库，Playwright 独立 Chrome 账号窗口。
+Python + PySide6 桌面应用，SQLite 本地数据库，QtWebEngine 内嵌多账号浏览器，Playwright 在后台直接驱动这些内嵌页面。
 
 **当前是可运行、可配置的开发版本，不是已完成实号验收的自动营销成品。** 界面、数据库、AI 客户筛选及私信生成、后台任务、账号隔离、导入导出已经实现。抖音页面在开发环境访问超时，评论选择器、数据响应格式和真实私信流程未获实号验证；发送送达回执也尚未适配。发送动作正常完成后应用直接标记“已私信”，该状态表示操作完成，不代表站点确认送达。不能把本版本理解为已验证的无人值守全自动流程。
 
@@ -12,10 +12,10 @@ Python + PySide6 桌面应用，SQLite 本地数据库，Playwright 独立 Chrom
 | --- | --- |
 | 操作系统 | macOS 13 及以上（Intel / Apple Silicon 均可），或 Windows 10 / 11 64 位 |
 | uv | 建议使用当前稳定版；用于管理 Python 环境与依赖，可按 `pyproject.toml` 自动下载所需 Python |
-| 浏览器 | Google Chrome 正式版（应用通过 `channel='chrome'` 驱动本机 Chrome，不安装 Playwright 自带的 Chromium，也不能用 Edge / Chromium 替代） |
+| 浏览器 | 由 PySide6 附带的 QtWebEngine 内嵌提供，无需另外安装 Chrome / Edge，也不调用系统默认浏览器 |
 | 网络 | 能访问抖音（douyin.com）以及所配置的 AI 服务地址 |
 
-> 依赖在 `pyproject.toml` 中声明（PySide6、playwright、httpx、keyring，开发依赖 pytest），用 `uv sync` 一键安装，**不需要**执行 `playwright install`。
+> 依赖在 `pyproject.toml` 中声明（PySide6 / QtWebEngine、playwright、httpx、keyring，开发依赖 pytest），用 `uv sync` 一键安装，**不需要**执行 `playwright install`，也不需要安装外部浏览器。
 
 ## 部署与运行
 
@@ -70,9 +70,9 @@ uv --version
 >
 > macOS 已配置 Homebrew 时也可执行 `brew install uv`；Homebrew 本身及软件包下载地址仍需按当地网络情况确认。
 
-### 第 3 步：安装 Google Chrome
+### 第 3 步：浏览器准备
 
-安装 Google Chrome 正式版。官方下载页是 https://www.google.com/chrome/；若在中国境内无法访问，应先在可访问的网络取得官方安装包，并按目标系统准备离线安装包。应用启动浏览器时依赖本机 Chrome；安装后确认能从开始菜单 / 访达正常打开。不要把 Edge 或普通 Chromium 当作此版本的替代品。
+无需操作。内嵌浏览器内核由 PySide6 依赖一起安装，不会读取日常 Chrome / Edge 的用户资料。
 
 ### 第 4 步：安装依赖（uv sync）
 
@@ -85,7 +85,7 @@ uv sync
 
 `uv sync` 会根据 `pyproject.toml` 和 `uv.lock` 生成可复现的环境；第一次运行会自动下载 Python 和依赖，之后的运行会自动判断是否需要更新。
 
-> **国内依赖下载**：项目自带 `uv.toml`，`uv.lock` 的包下载地址也已指向清华 PyPI 镜像。这个配置只覆盖 Python 包，不覆盖 uv、Python 或 Chrome 的安装包。若 uv 需要下载 Python 而网络超时，见下方 FAQ。
+> **国内依赖下载**：项目自带 `uv.toml`，`uv.lock` 的包下载地址也已指向清华 PyPI 镜像。这个配置覆盖 PySide6 / QtWebEngine 等 Python 包，不覆盖 uv 或 Python 本身的安装包。若 uv 需要下载 Python 而网络超时，见下方 FAQ。
 
 ### 第 5 步：启动应用
 
@@ -111,7 +111,9 @@ uv run main.py
 
 ### 运行方式说明
 
-桌面 UI 不包含内嵌网页，每个账号通过“登录 / 查看浏览器”打开自己的 Chrome 窗口；支持主号和多个从号并行，登录状态保存在各自目录（`data/profiles/<账号 UUID>`）中，不读取你日常使用的浏览器资料。
+每个账号通过“登录 / 查看内嵌浏览器”创建自己的页面，所有页面集中在“内嵌浏览器”工作区，可以像标签页一样随时切换查看。支持主号和多个从号并行，登录状态保存在 `data/embedded_profiles/<账号 UUID>`，不读取日常浏览器资料。任务运行时可查看页面，但不要手动跳转或点击正在自动操作的账号页。
+
+> 从旧版独立 Chrome 窗口升级后，需要在新的内嵌页中为每个账号重新登录一次。旧 `data/profiles/` 不会被删除，但新版不再使用它。
 
 ## 环境变量（可选）
 
@@ -125,11 +127,11 @@ API Key 默认存系统钥匙串（macOS 钥匙串 / Windows 凭据管理器）�
 ## 常见问题（FAQ）
 
 - **macOS 双击 `start.command` 提示“无法打开 / 未验证开发者”**：右键该文件 → 打开 → 打开；或到“系统设置 → 隐私与安全性”点“仍要打开”。
-- **提示找不到 Chrome / 无法启动浏览器**：确认已安装正式版 Google Chrome（不是 Chromium / Edge），并确认能正常打开 Chrome。
+- **内嵌浏览器一直显示“正在连接”**：先关闭并重启整个应用；不要在同一数据目录启动多个实例。如果系统安全软件拦截本机 `127.0.0.1` 端口，需允许本应用的本机进程间连接。
 - **依赖下载很慢或超时**：项目级 `uv.toml` 优先于全局 uv 配置，且当前 `uv.lock` 含清华镜像的包地址。要换源，请修改项目根目录的 `uv.toml`，运行 `uv lock` 更新锁文件，再运行 `uv sync`；只改全局配置不会覆盖项目设置。
 - **uv 需要下载 Python 但 GitHub 很慢**：先安装可信来源的 Python 3.10+（推荐 3.12），确认 `python --version` 或 Windows 的 `py --version` 正常，再运行 `uv sync --no-python-downloads`。uv 的 `UV_PYTHON_INSTALL_MIRROR` 只适用于提供完整 `python-build-standalone` 发布目录结构的可信镜像，不能把任意 GitHub 网页代理直接当作稳定下载源。
 - **提示找不到 `uv` 命令**：确认已安装并重新打开终端；macOS 默认装在 `~/.local/bin`，Windows 装在 `%USERPROFILE%\.local\bin`，检查该目录是否在 PATH 中。
-- **是否需要 `playwright install`？** 不需要。应用使用本机 Chrome，不需要额外下载浏览器内核。
+- **是否需要 `playwright install`？** 不需要。应用使用 PySide6 自带的 QtWebEngine，不需要 Playwright 额外下载 Chromium。
 - **首次运行弹出钥匙串 / 凭据访问请求**：允许即可；若不想用系统钥匙串，用 `DOUYIN_AI_API_KEY` 环境变量。
 - **访问抖音超时或页面空白**：先确认浏览器能打开 douyin.com 并检查网络 / 代理；本版本站点适配尚未实号验证，见「当前站点适配边界」。
 
@@ -137,7 +139,7 @@ API Key 默认存系统钥匙串（macOS 钥匙串 / Windows 凭据管理器）�
 
 1. “AI 与任务设置”填写服务根地址（例如服务商提供的 `https://域名/v1`）、模型名和 API Key。使用兼容 Chat Completions 的 JSON 接口。配置默认可留空，也可随时修改保存。
 2. 填写产品和目标客户筛选提示词，以及个性化私信提示词。评论是 AI 的输入数据，不作为指令执行。API Key 存系统钥匙串，也支持环境变量 `DOUYIN_AI_API_KEY`；环境变量优先。Key 不写入客户数据库或导出文件。
-3. “主号 / 从号”添加一个主号，点“登录 / 查看浏览器”，本人完成抖音登录。应用不自动判断“浏览器已打开”等于“登录成功”。添加多个从号同理。
+3. “主号 / 从号”添加一个主号，点“登录 / 查看内嵌浏览器”，应用会切换到对应账号标签，由本人完成抖音登录。应用不自动判断“页面已打开”等于“登录成功”。添加多个从号同理。
 4. “监控博主”录入博主完整主页链接和备注。设置最近 N 天、轮询间隔与每页滚动上限。
 5. 选择主号，开启持续任务。浏览器访问博主作品和视频，监听网页正常加载的数据，不伪造请求签名、不调用回复接口。每个新顶层评论经 AI 判别后入库。新增目标客户在界面刷新。
 6. 选择从号，设置该号发送间隔，开启持续任务。各从号以 SQLite 原子事务独占领取客户，生成私信并打开目标主页私信框。遇到验证、登录、异常响应或找不到唯一按钮会停止该号并显示错误。
@@ -148,7 +150,7 @@ API Key 默认存系统钥匙串（macOS 钥匙串 / Windows 凭据管理器）�
 ## 数据与状态
 
 - `data/customers.sqlite3`：账号备注、博主、所有已判别顶层评论、去重客户、配置和操作事件。
-- `data/profiles/<账号 UUID>`：每个账号的 Chrome 登录状态。
+- `data/embedded_profiles/<账号 UUID>`：每个账号的 QtWebEngine 登录状态。
 - `data/backups/`：清空前自动生成的完整数据库备份。
 - 评论按 `cid` 去重；客户按完整 `sec_uid` 去重。它是主页 `/user/` 后的 MS4… 字符串，不是数字抖音号。
 - 同一客户的新评论可更新等待队列里的素材，但不会把已发送或失败客户重新排队。历史评论保存在 comments 表。
@@ -157,7 +159,7 @@ API Key 默认存系统钥匙串（macOS 钥匙串 / Windows 凭据管理器）�
 - 开启中的任务不会自动重启。停止时未点击发送的客户可回到待发送；点击后的不确定结果需在聊天记录中检查后再决定是否重新排队。
 - 账号删除只删账号记录，关闭其浏览器，保留本地 profile 和客户历史。
 - 清空前必须停止任务并确认，会先备份，再清空客户及评论去重记录。以后重新监控可能再次发现这些客户。
-- 恢复备份：关闭应用，将备份复制到一个新的数据目录并命名为 `customers.sqlite3`，用 `DOUYIN_DATA_DIR=/新目录 uv run main.py` 启动（Windows 在命令提示符里用 `set DOUYIN_DATA_DIR=D:\新目录&& uv run main.py`）。登录目录需要另外复制 `profiles/`；不要在 SQLite 正在打开时直接覆盖数据库。
+- 恢复备份：关闭应用，将备份复制到一个新的数据目录并命名为 `customers.sqlite3`，用 `DOUYIN_DATA_DIR=/新目录 uv run main.py` 启动（Windows 在命令提示符里用 `set DOUYIN_DATA_DIR=D:\新目录&& uv run main.py`）。登录目录需要另外复制 `embedded_profiles/`；不要在 SQLite 正在打开时直接覆盖数据库。
 
 ## 导入与导出
 
@@ -196,4 +198,6 @@ QT_QPA_PLATFORM=offscreen uv run pytest -q
 
 测试包括唯一主号、并发客户领取、评论/客户去重、已发送状态保护、导入事务、崩溃恢复、顶层评论过滤、备份和 PySide6 界面构建。
 
-技术资料：[Playwright BrowserType](https://playwright.dev/python/docs/api/class-browsertype)、[Qt for Python](https://doc.qt.io/qtforpython-6/)。
+内嵌页由 QtWebEngine 显示，应用在随机的本机回环端口上启用 Chromium DevTools 协议，Playwright 后台线程仅通过该本机端口操作页面；不启动外部 Chrome 进程或窗口。
+
+技术资料：[Playwright BrowserType](https://playwright.dev/python/docs/api/class-browsertype)、[Qt WebEngine](https://doc.qt.io/qtforpython-6/PySide6/QtWebEngineWidgets/index.html)。
