@@ -1,8 +1,12 @@
 import asyncio
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import AsyncMock,Mock
-from app.browser import Browser,SkippedCustomer
+from unittest.mock import AsyncMock,Mock,patch
+import pytest
+from app.browser import Browser,SkippedCustomer,PrivateAccount
 from app.db import DB
+from app.engine import Engine
 
 UID='MS4wLjABAAAABRJKRY1YxfLwD6uDMCQo8O9la_PxcmCqMppnILWojlA'
 
@@ -59,3 +63,34 @@ def test_reachability_check_before_ai(monkeypatch):
         pass
     else: raise AssertionError('should skip before AI')
     page.goto.assert_awaited_once()
+
+
+def test_private_account_immediately_processes_next_customer():
+    second_uid='MS4wLjABAAAAsecond_customer_123456'
+    with TemporaryDirectory() as folder:
+        db=DB(Path(folder)/'db.sqlite3')
+        account_id=db.account('sender','从号')
+        db.save_settings({'base_url':'https://example.com/v1','model':'test'})
+        for index,(uid,name) in enumerate(((UID,'私密客户'),(second_uid,'普通客户')),1):
+            db.ingest(dict(id=str(index),uid=uid,name=name,text='咨询',comment_time='',
+                           video_id='v1',video_title='',blogger=''),True,'')
+        db.execute('UPDATE customers SET updated=1 WHERE uid=?',(UID,))
+        db.execute('UPDATE customers SET updated=2 WHERE uid=?',(second_uid,))
+
+        engine=Engine(db,folder)
+        engine.jobs={}
+        browser=AsyncMock()
+        browser.check_reachable.side_effect=[PrivateAccount('私密账号，无法私信'),None]
+        engine.open=AsyncMock(return_value=browser)
+
+        with patch('app.engine.get_key',return_value='key'), \
+             patch('app.engine.AI') as ai, \
+             patch('app.engine.asyncio.sleep',side_effect=asyncio.CancelledError):
+            ai.return_value.message=AsyncMock(return_value='你好')
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(engine.work(dict(id=account_id,role='sender',name='从号')))
+
+        rows={row['uid']:row['status'] for row in db.rows('SELECT uid,status FROM customers')}
+        assert rows=={UID:'skipped',second_uid:'sent'}
+        assert browser.check_reachable.await_count==2
+        browser.send.assert_awaited_once()

@@ -7,7 +7,7 @@ from PySide6.QtCore import QThread, Signal
 from playwright.async_api import async_playwright
 from playwright._impl._async_base import mapping as async_api_mapping
 from .ai import AI, get_key
-from .browser import Browser, CommentPageUnavailable, NeedsAttention, UncertainSend, SkippedCustomer
+from .browser import Browser, AccountNeedsAttention, CommentPageUnavailable, NeedsAttention, UncertainSend, SkippedCustomer, PrivateAccount
 from .classifier import classify_comments
 from .embedded_browser import MARKER_PREFIX, page_id
 
@@ -253,6 +253,8 @@ class Engine(QThread):
                     self.changed.emit()
                     self.status.emit(ident,'处理：'+customer['name'])
                     clicked = False
+                    message = ''
+                    skip_cooldown = False
                     try:
                         await b.check_reachable(customer)
                         message = await ai.message(customer)
@@ -266,11 +268,25 @@ class Engine(QThread):
                     except SkippedCustomer as exc:
                         self.db.finish(customer['uid'],ident,'skipped',message,str(exc))
                         self.log.emit(account['name']+'：客户 '+customer['name']+' 已跳过：'+str(exc))
+                        skip_cooldown = isinstance(exc,PrivateAccount)
                     except UncertainSend as exc:
                         self.db.finish(customer['uid'],ident,'failed',message,str(exc))
                         self.log.emit(account['name']+'：'+str(exc))
+                    except AccountNeedsAttention:
+                        # Verification/login/rate-limit prompts affect the whole
+                        # account and still require an operator before continuing.
+                        raise
+                    except NeedsAttention as exc:
+                        # Profile/chat DOM failures happen before the send click.
+                        # Fail only this customer instead of stopping the sender.
+                        self.db.finish(customer['uid'],ident,'failed',message,str(exc))
+                        self.log.emit(account['name']+'：客户 '+customer['name']+
+                                      ' 处理失败，从号将继续运行：'+str(exc))
                     self.changed.emit()
                     customer = None
+                    if skip_cooldown:
+                        self.status.emit(ident,'私密账号已跳过，继续处理')
+                        continue
                     interval = self.db.rows('SELECT interval FROM accounts WHERE id=?',(ident,))[0]['interval']
                     self.status.emit(ident,'间隔等待')
                     await asyncio.sleep(interval)

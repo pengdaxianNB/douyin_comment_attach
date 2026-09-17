@@ -11,6 +11,11 @@ class NeedsAttention(RuntimeError):
     pass
 
 
+class AccountNeedsAttention(NeedsAttention):
+    """账号级异常，需要停止当前账号等待人工处理。"""
+    pass
+
+
 class CommentPageUnavailable(NeedsAttention):
     """单个作品页暂时无法定位评论区。"""
     pass
@@ -22,6 +27,16 @@ class UncertainSend(RuntimeError):
 
 class SkippedCustomer(RuntimeError):
     pass
+
+
+class PrivateAccount(SkippedCustomer):
+    """客户主页明确标记为私密账号。"""
+    pass
+
+
+def customer_skip(reason):
+    error = PrivateAccount if reason.startswith('私密账号') else SkippedCustomer
+    raise error(reason)
 
 
 def is_douyin_host(hostname):
@@ -188,7 +203,11 @@ MESSAGE_PANEL_CLOSE = r"""title => {
         let target=node;
         while(target.parentElement&&target.parentElement!==header){
             const s=getComputedStyle(target);
-            if(target.matches('button,a,[role="button"]')||typeof target.onclick==='function'||s.cursor==='pointer')break;
+            // SVGElement does not consistently implement click().  Keep
+            // walking to the owning HTML control instead of selecting the
+            // rightmost SVG icon and later calling a missing method on it.
+            if(typeof target.click==='function'&&
+                    (target.matches('button,a,[role="button"]')||typeof target.onclick==='function'||s.cursor==='pointer'))break;
             target=target.parentElement;
         }
         if(seen.has(target)||!visible(target))continue;
@@ -202,7 +221,9 @@ MESSAGE_PANEL_CLOSE = r"""title => {
     if(!candidates.length)return {panel:true,clicked:false};
     // The drawer header also has a pop-out icon; close is the rightmost icon.
     candidates.sort((a,b)=>b.x-a.x);
-    candidates[0].target.click();
+    const target=candidates[0].target;
+    if(typeof target.click==='function')target.click();
+    else target.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));
     return {panel:true,clicked:true};
 }"""
 
@@ -226,7 +247,10 @@ async def close_open_message_panel(page, guard, log):
     for title in await page.get_by_text('消息',exact=True).all():
         if not await title.is_visible():
             continue
-        result = await title.evaluate(MESSAGE_PANEL_CLOSE)
+        try:
+            result = await title.evaluate(MESSAGE_PANEL_CLOSE)
+        except Exception as exc:
+            raise NeedsAttention('消息侧栏关闭失败，尚未发送私信') from exc
         panel_found = panel_found or result.get('panel',False)
         if result.get('clicked'):
             log('检测到消息侧栏，已点击关闭按钮')
@@ -496,7 +520,7 @@ class Browser:
     async def guard(self):
         for text in ('请完成下列验证','请完成安全验证','操作过于频繁','访问过于频繁','扫码登录'):
             if await self.page.get_by_text(text,exact=True).count() and await self.page.get_by_text(text,exact=True).first.is_visible():
-                raise NeedsAttention('页面需要人工处理：'+text)
+                raise AccountNeedsAttention('页面需要人工处理：'+text)
 
     async def wait_for_comment_ready(self, packets, tasks):
         """Give a slow page time to expose either its API data or comment panel."""
@@ -664,7 +688,7 @@ class Browser:
         await self.guard()
         reason = await self.private_account_reason()
         if reason:
-            raise SkippedCustomer(reason)
+            customer_skip(reason)
 
     async def send(self, customer, message, before_click):
         await self.page.goto(customer['url'],wait_until='domcontentloaded')
@@ -672,12 +696,12 @@ class Browser:
         await self.guard()
         reason = await self.private_account_reason()
         if reason:
-            raise SkippedCustomer(reason)
+            customer_skip(reason)
         await follow_profile_button(self.page,self.guard,self.log)
         await click_profile_message_button(self.page,self.guard,self.log)
         reason = await self.private_account_reason()
         if reason:
-            raise SkippedCustomer(reason)
+            customer_skip(reason)
         editor = await wait_for_message_editor(
             self.page,self.s['message_editor'],self.guard,self.log)
         if editor is None:
@@ -686,7 +710,7 @@ class Browser:
             await close_open_message_panel(self.page,self.guard,self.log)
             reason = await self.private_account_reason()
             if reason:
-                raise SkippedCustomer(reason)
+                customer_skip(reason)
             self.log('私信输入框未出现，正在重新打开私信窗口')
             await click_profile_message_button(self.page,self.guard,self.log)
             editor = await wait_for_message_editor(

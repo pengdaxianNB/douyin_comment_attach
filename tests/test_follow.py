@@ -1,7 +1,7 @@
 import asyncio
 from unittest.mock import AsyncMock,Mock
 import pytest
-from app.browser import follow_in_panel,NeedsAttention
+from app.browser import close_open_message_panel,follow_in_panel,MESSAGE_PANEL_CLOSE,NeedsAttention
 
 
 def scenario(initial=False,success=True):
@@ -90,6 +90,20 @@ def test_open_message_panel_is_closed_before_follow():
     page.locator.return_value.all=AsyncMock(side_effect=lambda: events.append('locate') or [item])
     asyncio.run(follow_profile_button(page,AsyncMock(),lambda _:None))
     assert events==['close','locate']
+
+
+def test_message_panel_close_does_not_assume_svg_has_click():
+    assert 'candidates[0].target.click()' not in MESSAGE_PANEL_CLOSE
+    assert "typeof target.click==='function'" in MESSAGE_PANEL_CLOSE
+    assert 'dispatchEvent(new MouseEvent' in MESSAGE_PANEL_CLOSE
+
+
+def test_message_panel_script_error_is_a_customer_interaction_failure():
+    title=Mock(is_visible=AsyncMock(return_value=True),
+               evaluate=AsyncMock(side_effect=TypeError('target.click is not a function')))
+    page=Mock();page.get_by_text.return_value.all=AsyncMock(return_value=[title])
+    with pytest.raises(NeedsAttention,match='消息侧栏关闭失败'):
+        asyncio.run(close_open_message_panel(page,AsyncMock(),lambda _:None))
 
 
 def test_profile_click_actionability_timeout_uses_safe_retry():
