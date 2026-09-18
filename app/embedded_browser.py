@@ -3,7 +3,7 @@ from pathlib import Path
 import threading
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
-from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QHBoxLayout, QLineEdit, QPushButton, QStackedLayout,
     QStackedWidget, QTabWidget, QVBoxLayout, QWidget)
@@ -65,6 +65,11 @@ class EmbeddedBrowser(QWidget):
         self.profile.setCachePath(str(profile_dir/'cache'))
         self.profile.setPersistentCookiesPolicy(
             QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+        # Do not hand custom app links such as bitbrowser:// to Windows. When no
+        # matching desktop application is installed, Windows otherwise opens a
+        # disruptive "find an app in Microsoft Store" dialog.
+        self.profile.settings().setUnknownUrlSchemePolicy(
+            QWebEngineSettings.UnknownUrlSchemePolicy.DisallowUnknownUrlSchemes)
 
         self.view = BrowserView(self)
         page = QWebEnginePage(self.profile, self.view)

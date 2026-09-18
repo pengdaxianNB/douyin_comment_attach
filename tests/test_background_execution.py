@@ -6,7 +6,7 @@ os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 os.environ.setdefault('QTWEBENGINE_CHROMIUM_FLAGS','--disable-gpu')
 
 from PySide6.QtTest import QTest
-from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWebEngineCore import QWebEnginePage,QWebEngineSettings
 from PySide6.QtWidgets import QApplication,QTabWidget,QVBoxLayout,QWidget
 
 from app.browser import Browser
@@ -55,3 +55,11 @@ def test_unselected_account_stays_mounted_behind_other_app_tabs(tmp_path):
     assert first.view.page().isVisible()
     assert first.view.page().lifecycleState()==QWebEnginePage.LifecycleState.Active
     first.shutdown();second.shutdown();outer.close();app.processEvents()
+
+
+def test_embedded_browser_blocks_unknown_external_url_schemes(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    browser=EmbeddedBrowser(tmp_path/'profile','account')
+    assert browser.profile.settings().unknownUrlSchemePolicy()==(
+        QWebEngineSettings.UnknownUrlSchemePolicy.DisallowUnknownUrlSchemes)
+    browser.shutdown();app.processEvents()
