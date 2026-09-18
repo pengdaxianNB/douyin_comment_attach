@@ -28,13 +28,16 @@ class DB:
             c.executescript('''
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,role TEXT NOT NULL CHECK(role IN ('main','sender')),name TEXT NOT NULL,interval INTEGER NOT NULL DEFAULT 120);
+            CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,role TEXT NOT NULL CHECK(role IN ('main','sender')),name TEXT NOT NULL,interval INTEGER NOT NULL DEFAULT 120,daily_limit INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS one_main ON accounts(role) WHERE role='main';
             CREATE TABLE IF NOT EXISTS bloggers(id TEXT PRIMARY KEY,name TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS comments(id TEXT PRIMARY KEY,uid TEXT NOT NULL,name TEXT,text TEXT,comment_time TEXT,video_id TEXT,video_title TEXT,blogger TEXT,target INTEGER,reason TEXT);
             CREATE TABLE IF NOT EXISTS customers(uid TEXT PRIMARY KEY,name TEXT,text TEXT,comment_time TEXT,video_title TEXT,blogger TEXT,url TEXT,status TEXT NOT NULL DEFAULT 'pending',message TEXT DEFAULT '',account_id TEXT,error TEXT DEFAULT '',sent_at TEXT DEFAULT '',updated REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,at TEXT DEFAULT CURRENT_TIMESTAMP,account_id TEXT,uid TEXT,kind TEXT,detail TEXT);
             ''')
+            account_columns = {row['name'] for row in c.execute('PRAGMA table_info(accounts)')}
+            if 'daily_limit' not in account_columns:
+                c.execute('ALTER TABLE accounts ADD COLUMN daily_limit INTEGER NOT NULL DEFAULT 0')
             c.execute("UPDATE customers SET status='failed',error=CASE WHEN error='' THEN '历史待核验记录，发送结果不明，请勿重复联系' ELSE error END WHERE status='uncertain'")
 
     @contextmanager
@@ -63,10 +66,22 @@ class DB:
         with self.connect() as c:
             c.executemany('INSERT OR REPLACE INTO settings VALUES (?,?)', [(k,json.dumps(v,ensure_ascii=False)) for k,v in values.items()])
 
-    def account(self, role, name):
+    def account(self, role, name, daily_limit=0):
         ident = uuid.uuid4().hex
-        self.execute('INSERT INTO accounts(id,role,name) VALUES (?,?,?)', (ident,role,name))
+        self.execute('INSERT INTO accounts(id,role,name,daily_limit) VALUES (?,?,?,?)',
+                     (ident,role,name,max(0,int(daily_limit))))
         return ident
+
+    def sender_quota(self, account):
+        """返回从号北京时间今日已私信人数和每日上限。"""
+        rows = self.rows('''
+            SELECT COALESCE((SELECT daily_limit FROM accounts WHERE id=? AND role='sender'),0) daily_limit,
+                   count(DISTINCT uid) used
+              FROM events
+             WHERE account_id=? AND kind IN ('send_attempt','sent')
+               AND date(at,'+8 hours')=date('now','+8 hours')
+        ''',(account,account))
+        return {'used':int(rows[0]['used'] or 0),'limit':int(rows[0]['daily_limit'] or 0)}
 
     def ingest(self, comment, target, reason):
         uid = user_id(comment['uid'])
@@ -80,6 +95,13 @@ class DB:
     def claim(self, account):
         with self.connect() as c:
             c.execute('BEGIN IMMEDIATE')
+            sender = c.execute("SELECT daily_limit FROM accounts WHERE id=? AND role='sender'",(account,)).fetchone()
+            if sender is not None and int(sender['daily_limit'] or 0)>0:
+                used = c.execute('''SELECT count(DISTINCT uid) FROM events
+                    WHERE account_id=? AND kind IN ('send_attempt','sent')
+                      AND date(at,'+8 hours')=date('now','+8 hours')''',(account,)).fetchone()[0]
+                if used>=int(sender['daily_limit']):
+                    return None
             r = c.execute("SELECT * FROM customers WHERE status='pending' ORDER BY updated LIMIT 1").fetchone()
             if r is None:
                 return None
@@ -90,6 +112,15 @@ class DB:
         with self.connect() as c:
             c.execute("UPDATE customers SET status=?,message=?,error=?,sent_at=CASE WHEN ?='sent' THEN datetime('now') ELSE sent_at END,updated=? WHERE uid=? AND account_id=?", (status,message,error,status,time.time(),uid,account))
             c.execute('INSERT INTO events(account_id,uid,kind,detail) VALUES (?,?,?,?)',(account,uid,status,error or message))
+
+    def start_send(self, uid, account, message):
+        """在点击发送前原子记录一次可能消耗当日额度的提交。"""
+        detail = '准备提交发送，结果不明时请勿重复联系'
+        with self.connect() as c:
+            c.execute("UPDATE customers SET status='failed',message=?,error=?,updated=? WHERE uid=? AND account_id=?",
+                      (message,detail,time.time(),uid,account))
+            c.execute("INSERT INTO events(account_id,uid,kind,detail) VALUES (?,?,'send_attempt',?)",
+                      (account,uid,detail))
 
     def recover(self):
         self.execute("UPDATE customers SET status='failed',error='应用退出前任务未完成，发送结果不明，请勿重复联系' WHERE status='processing'")

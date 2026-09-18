@@ -119,6 +119,7 @@ class Window(QMainWindow):
         self.engine.log.connect(self.add_log)
         self.engine.status.connect(self.account_status)
         self.engine.changed.connect(self.refresh_customers)
+        self.engine.changed.connect(self.refresh_accounts)
         self.engine.changed.connect(self.sync_role_switches)
         self.engine.browser_reset.connect(self.reset_browser_page)
         root = QWidget(); self.setCentralWidget(root)
@@ -147,7 +148,7 @@ class Window(QMainWindow):
         self.tabs.currentChanged.connect(lambda: self.refresh_database() if self.tabs.currentWidget() is self.database_page else None)
         self.statusBar().showMessage('站点适配待实号验证 · 登录和验证码请在内嵌浏览器中处理')
         self.refresh_accounts(); self.refresh_bloggers(); self.refresh_customers()
-        self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_customers); self.timer.start(4000)
+        self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_customers); self.timer.timeout.connect(self.refresh_accounts); self.timer.start(4000)
         if start_engine:
             self.engine.start()
 
@@ -190,9 +191,9 @@ class Window(QMainWindow):
             switch.clicked.connect(lambda checked,role=role:self.toggle_role(role,checked))
             box.addWidget(switch); controls.addWidget(group)
             self.role_switches[role] = switch
-        self.accounts = table(['备注名','角色','发送间隔（秒）','当前状态']); self.accounts.setColumnWidth(0,240); self.accounts.setColumnWidth(1,130); self.accounts.setColumnWidth(2,190); l.addWidget(self.accounts)
+        self.accounts = table(['备注名','角色','发送间隔（秒）','今日已私信 / 上限','当前状态']); self.accounts.setColumnWidth(0,220); self.accounts.setColumnWidth(1,110); self.accounts.setColumnWidth(2,170); self.accounts.setColumnWidth(3,180); l.addWidget(self.accounts)
         bar = QHBoxLayout(); l.addLayout(bar)
-        for label,fn in [('新增主号',lambda:self.add_account('main')),('新增从号',lambda:self.add_account('sender')),('修改备注 / 间隔',self.edit_account),('登录 / 查看内嵌浏览器',lambda:self.account_command('login')),('重启选中浏览器',self.restart_account_browser),('启动选中账号',lambda:self.account_command('start')),('停止选中账号',lambda:self.account_command('stop')),('采集发送诊断',lambda:self.account_command('diagnose')),('删除账号',self.delete_account)]: bar.addWidget(button(label,fn))
+        for label,fn in [('新增主号',lambda:self.add_account('main')),('新增从号',lambda:self.add_account('sender')),('修改备注 / 间隔 / 上限',self.edit_account),('登录 / 查看内嵌浏览器',lambda:self.account_command('login')),('重启选中浏览器',self.restart_account_browser),('启动选中账号',lambda:self.account_command('start')),('停止选中账号',lambda:self.account_command('stop')),('采集发送诊断',lambda:self.account_command('diagnose')),('删除账号',self.delete_account)]: bar.addWidget(button(label,fn))
         l.addWidget(QLabel('停止按钮在当前异步操作取消后生效；删除账号会保留登录目录。连续发送前请先核验一条真实私信。'))
 
     def build_browser_workspace(self):
@@ -483,7 +484,12 @@ class Window(QMainWindow):
     def refresh_accounts(self):
         self.account_rows = self.db.rows('SELECT * FROM accounts ORDER BY role,id')
         selected = self.accounts.currentRow()
-        populate(self.accounts,[[r['name'],'主号' if r['role']=='main' else '从号',r['interval'],self.states.get(r['id'],'未启动')] for r in self.account_rows])
+        def quota_text(account):
+            if account['role']!='sender': return '—'
+            quota = self.db.sender_quota(account['id'])
+            limit = quota['limit'] if quota['limit'] else '不限'
+            return f'{quota["used"]} / {limit}'
+        populate(self.accounts,[[r['name'],'主号' if r['role']=='main' else '从号',r['interval'],quota_text(r),self.states.get(r['id'],'未启动')] for r in self.account_rows])
         if 0<=selected<len(self.account_rows): self.accounts.selectRow(selected)
         names = {r['id']:r['name'] for r in self.account_rows}
         for ident,widget in self.browser_widgets.items():
@@ -513,7 +519,12 @@ class Window(QMainWindow):
     def add_account(self,role):
         def action():
             name,ok=QInputDialog.getText(self,'新增账号','账号备注：')
-            if ok and name.strip(): self.db.account(role,name.strip()); self.refresh_accounts()
+            if not ok or not name.strip(): return
+            daily_limit = 0
+            if role=='sender':
+                daily_limit,ok=QInputDialog.getInt(self,'每日私信上限','每天最多私信人数（0 表示不限）：',0,0,100000)
+                if not ok:return
+            self.db.account(role,name.strip(),daily_limit); self.refresh_accounts()
         self.report(action)
 
     def edit_account(self):
@@ -522,7 +533,12 @@ class Window(QMainWindow):
             name,ok=QInputDialog.getText(self,'修改账号','备注：',text=r['name'])
             if not ok or not name.strip(): return
             interval,ok=QInputDialog.getInt(self,'发送间隔','秒：',r['interval'],1,86400)
-            if ok: self.db.execute('UPDATE accounts SET name=?,interval=? WHERE id=?',(name.strip(),interval,r['id'])); self.refresh_accounts()
+            if not ok:return
+            daily_limit = r.get('daily_limit',0)
+            if r['role']=='sender':
+                daily_limit,ok=QInputDialog.getInt(self,'每日私信上限','每天最多私信人数（0 表示不限）：',daily_limit,0,100000)
+                if not ok:return
+            self.db.execute('UPDATE accounts SET name=?,interval=?,daily_limit=? WHERE id=?',(name.strip(),interval,daily_limit,r['id'])); self.refresh_accounts()
         self.report(action)
 
     def account_command(self,op):

@@ -70,6 +70,35 @@ def test_requeued_failure_reuses_existing_message_without_ai_request():
         assert row == {'status':'sent','message':'保留的私信文案'}
 
 
+def test_sender_at_daily_limit_does_not_claim_or_request_ai():
+    pending_uid = 'MS4wLjABAAAApending_customer_1234567'
+    sent_uid = 'MS4wLjABAAAAtoday_sent_customer_12345'
+    with TemporaryDirectory() as folder:
+        db = DB(Path(folder) / 'test.sqlite3')
+        account_id = db.account('sender','从号',daily_limit=1)
+        db.save_settings({'base_url':'https://example.com/v1','model':'test'})
+        db.import_customers([dict(uid=pending_uid,name='待发客户')])
+        db.execute("INSERT INTO events(account_id,uid,kind) VALUES (?,?,'sent')",(account_id,sent_uid))
+        engine=Engine(db,folder)
+        engine.jobs={}
+        browser=AsyncMock()
+        engine.open=AsyncMock(return_value=browser)
+        statuses=[]
+        engine.status.connect(lambda ident,text:statuses.append(text))
+
+        with patch('app.engine.get_key',return_value='key'), \
+             patch('app.engine.AI') as ai, \
+             patch('app.engine.asyncio.sleep',side_effect=asyncio.CancelledError):
+            ai.return_value.message=AsyncMock(return_value='不应生成')
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(engine.work(dict(id=account_id,role='sender',name='从号')))
+
+        ai.return_value.message.assert_not_awaited()
+        browser.check_reachable.assert_not_awaited()
+        assert db.rows('SELECT status FROM customers WHERE uid=?',(pending_uid,))[0]['status']=='pending'
+        assert any('今日已达上限 1/1' in text for text in statuses)
+
+
 @pytest.mark.parametrize('error', [NeedsAttention('消息侧栏关闭失败'),
     PlaywrightError('Element was detached'), asyncio.TimeoutError(),
     AccountNeedsAttention('页面需要人工处理：操作过于频繁')])

@@ -267,7 +267,11 @@ class Engine(QThread):
                 else:
                     customer = self.db.claim(ident)
                     if not customer:
-                        self.status.emit(ident,'等待客户')
+                        quota = self.db.sender_quota(ident)
+                        if quota['limit'] and quota['used']>=quota['limit']:
+                            self.status.emit(ident,f'今日已达上限 {quota["used"]}/{quota["limit"]} · 0 点自动恢复')
+                        else:
+                            self.status.emit(ident,'等待客户')
                         await asyncio.sleep(5)
                         continue
                     self.changed.emit()
@@ -285,7 +289,7 @@ class Engine(QThread):
                         self.db.finish(customer['uid'],ident,'processing',message)
                         def before_click():
                             nonlocal clicked
-                            self.db.finish(customer['uid'],ident,'failed',message,'准备提交发送，结果不明时请勿重复联系')
+                            self.db.start_send(customer['uid'],ident,message)
                             clicked = True
                         self.status.emit(ident,'打开会话并发送：'+customer['name'])
                         await asyncio.wait_for(b.send(customer,message,before_click),timeout=90)

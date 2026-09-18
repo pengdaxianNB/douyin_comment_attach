@@ -74,3 +74,18 @@ def test_stopped_account_browser_can_be_manually_restarted(tmp_path):
     assert commands==[('close',account_id),('login',account_id)]
     assert '浏览器已重启' in w.statusBar().currentMessage()
     w.close();app.processEvents()
+
+
+def test_account_table_shows_today_sent_count_and_limit(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    account_id=db.account('sender','从号',daily_limit=10)
+    db.execute("INSERT INTO events(account_id,uid,kind) VALUES (?,?,'sent')",
+               (account_id,'MS4wLjABAAAAtoday_customer_1234567'))
+    w=Window(db,tmp_path,start_engine=False)
+
+    assert w.accounts.item(0,3).text()=='1 / 10'
+    db.execute("UPDATE events SET at=datetime('now','-1 day') WHERE account_id=?",(account_id,))
+    w.refresh_accounts()
+    assert w.accounts.item(0,3).text()=='0 / 10'
+    w.close();app.processEvents()

@@ -18,6 +18,14 @@ class CoreTests(unittest.TestCase):
         self.db.account('main','主号')
         with self.assertRaises(sqlite3.IntegrityError):self.db.account('main','另一个')
         self.db.account('sender','从号一'); self.db.account('sender','从号二')
+    def test_legacy_accounts_gain_unlimited_daily_limit(self):
+        import sqlite3
+        path=Path(self.tmp.name)/'legacy.sqlite3'
+        with sqlite3.connect(path) as connection:
+            connection.execute("CREATE TABLE accounts(id TEXT PRIMARY KEY,role TEXT,name TEXT,interval INTEGER)")
+            connection.execute("INSERT INTO accounts VALUES ('sender','sender','旧从号',120)")
+        migrated=DB(path)
+        self.assertEqual(migrated.rows("SELECT daily_limit FROM accounts WHERE id='sender'"),[{'daily_limit':0}])
     def test_dedupe_and_preserve_sent(self):
         self.assertTrue(self.db.ingest(self.comment(),True,'需求明确'))
         self.assertFalse(self.db.ingest(self.comment(),True,'重复'))
@@ -30,6 +38,26 @@ class CoreTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as pool:
             results=list(pool.map(self.db.claim,[str(n) for n in range(8)]))
         self.assertEqual(sum(r is not None for r in results),1)
+    def test_sender_daily_limit_resets_on_beijing_date(self):
+        sender=self.db.account('sender','从号',daily_limit=1)
+        second=UID+'second'
+        self.db.import_customers([dict(uid=UID),dict(uid=second)])
+        first=self.db.claim(sender)
+        self.db.finish(first['uid'],sender,'sent','你好')
+        self.db.execute("INSERT INTO events(account_id,uid,kind) VALUES (?,?, 'sent')",(sender,first['uid']))
+        self.assertEqual(self.db.sender_quota(sender),{'used':1,'limit':1})
+        self.assertIsNone(self.db.claim(sender))
+        self.db.execute("UPDATE events SET at=datetime('now','-1 day') WHERE account_id=?",(sender,))
+        self.assertEqual(self.db.sender_quota(sender),{'used':0,'limit':1})
+        remaining = second if first['uid']==UID else UID
+        self.assertEqual(self.db.claim(sender)['uid'],remaining)
+    def test_uncertain_send_attempt_counts_toward_daily_limit(self):
+        sender=self.db.account('sender','从号',daily_limit=1)
+        self.db.import_customers([dict(uid=UID)])
+        self.db.claim(sender)
+        self.db.start_send(UID,sender,'你好')
+        self.assertEqual(self.db.sender_quota(sender),{'used':1,'limit':1})
+        self.assertEqual(self.db.rows('SELECT status FROM customers'),[{'status':'failed'}])
     def test_recovery(self):
         self.db.ingest(self.comment(),True,''); self.db.claim('a'); self.db.recover()
         self.assertEqual(self.db.rows('SELECT status FROM customers')[0]['status'],'failed')
