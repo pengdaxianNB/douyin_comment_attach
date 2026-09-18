@@ -10,7 +10,7 @@ from PySide6.QtWebEngineCore import QWebEnginePage,QWebEngineSettings
 from PySide6.QtWidgets import QApplication,QTabWidget,QVBoxLayout,QWidget
 
 from app.browser import Browser
-from app.embedded_browser import EmbeddedBrowser,keep_tab_pages_mounted
+from app.embedded_browser import EmbeddedBrowser,keep_tab_pages_mounted,page_id
 from main import configure_embedded_browser
 
 
@@ -62,4 +62,20 @@ def test_embedded_browser_blocks_unknown_external_url_schemes(tmp_path):
     browser=EmbeddedBrowser(tmp_path/'profile','account')
     assert browser.profile.settings().unknownUrlSchemePolicy()==(
         QWebEngineSettings.UnknownUrlSchemePolicy.DisallowUnknownUrlSchemes)
+    browser.shutdown();app.processEvents()
+
+
+def test_embedded_browser_can_rebuild_one_page_and_keep_profile(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    browser=EmbeddedBrowser(tmp_path/'profile','account')
+    profile=browser.profile
+    old_page=browser.view.page()
+    old_target=page_id('account')
+
+    browser.reset_page()
+
+    assert browser.profile is profile
+    assert browser.view.page() is not old_page
+    assert page_id('account')==browser.view.page().devToolsId()
+    assert page_id('account')!=old_target
     browser.shutdown();app.processEvents()

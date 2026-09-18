@@ -91,7 +91,9 @@ def test_customer_page_error_does_not_stop_sender(error):
         browser.send.side_effect = [error, None]
         engine.open = AsyncMock(return_value=browser)
         logs = []
+        resets = []
         engine.log.connect(logs.append)
+        engine.browser_reset.connect(resets.append)
 
         with patch('app.engine.get_key', return_value='key'), \
              patch('app.engine.AI') as ai, \
@@ -113,4 +115,10 @@ def test_customer_page_error_does_not_stop_sender(error):
         else:
             assert rows[second_uid]['status'] == 'sent'
             assert browser.send.await_count == 2
-            assert any('从号将继续运行' in line or '从号继续处理' in line for line in logs)
+            if isinstance(error,(PlaywrightError,asyncio.TimeoutError)):
+                assert resets==[account_id]
+                assert engine.open.await_count==2
+                assert any('浏览器已重建' in line for line in logs)
+            else:
+                assert resets==[]
+                assert any('从号将继续运行' in line for line in logs)

@@ -7,6 +7,7 @@ from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngin
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QHBoxLayout, QLineEdit, QPushButton, QStackedLayout,
     QStackedWidget, QTabWidget, QVBoxLayout, QWidget)
+from shiboken6 import delete as delete_qt_object, isValid
 
 
 MARKER_PREFIX = 'panda-embedded-account:'
@@ -50,6 +51,7 @@ class BrowserView(QWebEngineView):
 
 class EmbeddedBrowser(QWidget):
     title_changed = Signal(str)
+    restart_requested = Signal(str)
 
     def __init__(self, profile_dir, marker, parent=None):
         super().__init__(parent)
@@ -72,23 +74,9 @@ class EmbeddedBrowser(QWidget):
             QWebEngineSettings.UnknownUrlSchemePolicy.DisallowUnknownUrlSchemes)
 
         self.view = BrowserView(self)
-        page = QWebEnginePage(self.profile, self.view)
-        self.view.setPage(page)
-        # QTabWidget hides every non-selected account view.  Qt normally
-        # propagates that state to Chromium, which may freeze timers/rendering
-        # until the operator selects that account tab.  Automation must keep
-        # running independently of which tab the operator is viewing.
-        page.lifecycleStateChanged.connect(self.keep_page_active)
-        page.recommendedStateChanged.connect(self.keep_page_active)
-        page.visibleChanged.connect(self.keep_page_active)
         self.activity_timer = QTimer(self)
         self.activity_timer.timeout.connect(self.keep_page_active)
         self.activity_timer.start(1000)
-        self.keep_page_active()
-        # Qt exposes the underlying CDP target id. Registering that immutable id
-        # avoids relying on the page title/URL, both of which change as users
-        # and automation navigate between pages.
-        register_page(marker,self.view.page().devToolsId())
         self.address = QLineEdit()
         self.address.setPlaceholderText('输入网址后回车')
         self.address.returnPressed.connect(self.navigate_address)
@@ -101,7 +89,9 @@ class EmbeddedBrowser(QWidget):
         root.addLayout(toolbar)
         for label, callback, tip in (
                 ('←', self.view.back, '后退'), ('→', self.view.forward, '前进'),
-                ('↻', self.view.reload, '刷新'), ('首页', self.home, '打开抖音首页')):
+                ('↻', self.view.reload, '刷新'), ('首页', self.home, '打开抖音首页'),
+                ('重启浏览器', lambda:self.restart_requested.emit(self.marker),
+                 '页面无响应时重建当前账号的浏览器')):
             control = QPushButton(label)
             control.setToolTip(tip)
             control.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -112,13 +102,42 @@ class EmbeddedBrowser(QWidget):
 
         self.view.urlChanged.connect(lambda url: self.address.setText(url.toString()))
         self.view.titleChanged.connect(self.title_changed)
+        self.reset_page()
+
+    def reset_page(self):
+        """重建当前 WebEngine 页面，保留 profile 中的登录数据。"""
+        if self.closed:
+            return
+        old_page = self.view.page()
+        unregister_page(self.marker)
+        page = QWebEnginePage(self.profile, self.view)
+        self.view.setPage(page)
+        # QTabWidget hides every non-selected account view.  Qt normally
+        # propagates that state to Chromium, which may freeze timers/rendering
+        # until the operator selects that account tab.  Automation must keep
+        # running independently of which tab the operator is viewing.
+        page.lifecycleStateChanged.connect(self.keep_page_active)
+        page.recommendedStateChanged.connect(self.keep_page_active)
+        page.visibleChanged.connect(self.keep_page_active)
+        self.keep_page_active()
+        # Qt exposes the underlying CDP target id. Registering that immutable id
+        # avoids relying on the page title/URL, both of which change as users
+        # and automation navigate between pages.
+        register_page(self.marker,page.devToolsId())
         # Playwright discovers the right Qt page by this private, unique title.
         # It navigates to Douyin only after the page has been attached.
         self.view.setHtml(
-            '<!doctype html><meta charset="utf-8"><title>'+MARKER_PREFIX+marker+'</title>'
+            '<!doctype html><meta charset="utf-8"><title>'+MARKER_PREFIX+self.marker+'</title>'
             '<style>body{background:#111827;color:#dbe5f3;font:16px sans-serif;display:grid;'
             'place-items:center;height:90vh}p{opacity:.75}</style>'
             '<p>内嵌浏览器已准备，正在连接账号页面…</p>', QUrl('about:blank'))
+        if old_page is not None and old_page is not page:
+            # QWebEngineView may immediately destroy its original implicit page
+            # when setPage() replaces it, while explicitly installed pages stay
+            # alive. Destroy the latter immediately so its hung renderer and
+            # profile reference cannot survive the reset.
+            if isValid(old_page):
+                delete_qt_object(old_page)
 
     def home(self):
         self.view.setUrl(QUrl('https://www.douyin.com/'))
@@ -147,5 +166,6 @@ class EmbeddedBrowser(QWidget):
         self.view.stop()
         old_page = self.view.page()
         self.view.setPage(QWebEnginePage(QWebEngineProfile.defaultProfile(),self.view))
-        old_page.deleteLater()
+        if isValid(old_page):
+            delete_qt_object(old_page)
         QTimer.singleShot(0,self.profile.deleteLater)

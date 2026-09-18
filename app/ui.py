@@ -120,6 +120,7 @@ class Window(QMainWindow):
         self.engine.status.connect(self.account_status)
         self.engine.changed.connect(self.refresh_customers)
         self.engine.changed.connect(self.sync_role_switches)
+        self.engine.browser_reset.connect(self.reset_browser_page)
         root = QWidget(); self.setCentralWidget(root)
         layout = QVBoxLayout(root); layout.setContentsMargins(26,22,26,20); layout.setSpacing(16)
         heading = QHBoxLayout(); layout.addLayout(heading)
@@ -191,7 +192,7 @@ class Window(QMainWindow):
             self.role_switches[role] = switch
         self.accounts = table(['备注名','角色','发送间隔（秒）','当前状态']); self.accounts.setColumnWidth(0,240); self.accounts.setColumnWidth(1,130); self.accounts.setColumnWidth(2,190); l.addWidget(self.accounts)
         bar = QHBoxLayout(); l.addLayout(bar)
-        for label,fn in [('新增主号',lambda:self.add_account('main')),('新增从号',lambda:self.add_account('sender')),('修改备注 / 间隔',self.edit_account),('登录 / 查看内嵌浏览器',lambda:self.account_command('login')),('启动选中账号',lambda:self.account_command('start')),('停止选中账号',lambda:self.account_command('stop')),('采集发送诊断',lambda:self.account_command('diagnose')),('删除账号',self.delete_account)]: bar.addWidget(button(label,fn))
+        for label,fn in [('新增主号',lambda:self.add_account('main')),('新增从号',lambda:self.add_account('sender')),('修改备注 / 间隔',self.edit_account),('登录 / 查看内嵌浏览器',lambda:self.account_command('login')),('重启选中浏览器',self.restart_account_browser),('启动选中账号',lambda:self.account_command('start')),('停止选中账号',lambda:self.account_command('stop')),('采集发送诊断',lambda:self.account_command('diagnose')),('删除账号',self.delete_account)]: bar.addWidget(button(label,fn))
         l.addWidget(QLabel('停止按钮在当前异步操作取消后生效；删除账号会保留登录目录。连续发送前请先核验一条真实私信。'))
 
     def build_browser_workspace(self):
@@ -222,6 +223,7 @@ class Window(QMainWindow):
                 if index >= 0: self.browser_tabs.removeTab(index)
                 self.browser_empty = None
             widget = EmbeddedBrowser(self.data/'embedded_profiles'/ident,ident,self)
+            widget.restart_requested.connect(self.restart_account_browser)
             self.browser_widgets[ident] = widget
             self.browser_tabs.addTab(widget,account['name'])
         else:
@@ -239,6 +241,28 @@ class Window(QMainWindow):
             if index >= 0: self.browser_tabs.removeTab(index)
             widget.shutdown()
             widget.deleteLater()
+
+    def reset_browser_page(self, ident):
+        widget = self.browser_widgets.get(ident)
+        if widget is not None:
+            widget.reset_page()
+
+    def restart_account_browser(self, ident=None):
+        def action():
+            account = (next((r for r in self.account_rows if r['id']==ident),None)
+                       if ident else self.selected(self.accounts,self.account_rows))
+            if account is None: raise ValueError('账号不存在')
+            with self.engine.lock:
+                running = account['id'] in self.engine.running_accounts
+            if running: raise ValueError('请先停止该账号任务，再重启浏览器')
+            if not self.engine.ready.is_set(): raise ValueError('后台正在初始化，请稍后重试')
+            widget = self.ensure_browser(account,True)
+            self.engine.command('close',account)
+            widget.reset_page()
+            self.engine.command('login',account)
+            self.add_log(account['name']+'：已手动重建浏览器，登录数据保留')
+            self.statusBar().showMessage(account['name']+'：浏览器已重启',8000)
+        self.report(action)
 
     def open_preview(self, url):
         with self.engine.lock:

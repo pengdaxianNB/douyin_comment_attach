@@ -54,3 +54,23 @@ def test_requeue_all_failed_from_customer_toolbar(tmp_path,monkeypatch):
     assert questions and '全部 1 位失败客户' in questions[0] and '避免重复私信' in questions[0]
     assert '已将 1 位失败客户重新排队' in w.statusBar().currentMessage()
     w.close(); app.processEvents()
+
+
+def test_stopped_account_browser_can_be_manually_restarted(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    account_id=db.account('sender','从号')
+    w=Window(db,tmp_path,start_engine=False)
+    w.engine.ready.set()
+    account=w.account_rows[0]
+    widget=w.ensure_browser(account,False)
+    old_page=widget.view.page()
+    commands=[]
+    w.engine.command=lambda op,account=None:commands.append((op,account['id']))
+
+    w.restart_account_browser(account_id)
+
+    assert widget.view.page() is not old_page
+    assert commands==[('close',account_id),('login',account_id)]
+    assert '浏览器已重启' in w.statusBar().currentMessage()
+    w.close();app.processEvents()

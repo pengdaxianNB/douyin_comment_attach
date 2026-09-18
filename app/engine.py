@@ -9,7 +9,7 @@ from playwright._impl._async_base import mapping as async_api_mapping
 from .ai import AI, get_key
 from .browser import Browser, AccountNeedsAttention, CommentPageUnavailable, NeedsAttention, UncertainSend, SkippedCustomer, PrivateAccount
 from .classifier import classify_comments
-from .embedded_browser import MARKER_PREFIX, page_id
+from .embedded_browser import MARKER_PREFIX, page_id, unregister_page
 
 DEFAULTS = dict(days=7,comment_days=7,ai_concurrency=5,poll_seconds=300,scroll_limit=80,base_url='',model='',thinking_mode='default',thinking_effort='high',
     filter_prompt='识别评论中是否明确表达了对我提供的产品或服务的购买或咨询需求。产品和目标客户：请填写。不要把普通互动识别为需求。',
@@ -44,6 +44,7 @@ class Engine(QThread):
     log = Signal(str)
     status = Signal(str,str)
     changed = Signal()
+    browser_reset = Signal(str)
 
     def __init__(self, db, data):
         super().__init__()
@@ -131,6 +132,25 @@ class Engine(QThread):
                 self.contexts.pop(ident,None)
                 raise
         return self.contexts[ident]
+
+    async def rebuild_browser(self, account):
+        """让 GUI 重建单个账号页面，然后重新绑定 Playwright。"""
+        ident = account['id']
+        contexts = getattr(self,'contexts',None)
+        if contexts is not None:
+            contexts.pop(ident,None)
+        # Prevent embedded_page() from immediately rediscovering the stale
+        # target before the queued GUI reset signal is handled.
+        unregister_page(ident)
+        self.status.emit(ident,'浏览器无响应，正在自动重建')
+        self.log.emit(account['name']+'：检测到页面超时或内核异常，正在重建该账号浏览器')
+        self.browser_reset.emit(ident)
+        try:
+            browser = await self.open(account)
+        except Exception as exc:
+            raise AccountNeedsAttention('浏览器自动重建失败，请停止该账号后点击“重启浏览器”：'+str(exc)) from exc
+        self.log.emit(account['name']+'：浏览器已重建，将继续处理队列')
+        return browser
 
     def cdp_endpoint(self):
         value = os.environ.get('QTWEBENGINE_REMOTE_DEBUGGING','').strip()
@@ -293,8 +313,8 @@ class Engine(QThread):
                         detail = ('发送结果不明，禁止自动重发' if clicked else
                                   '页面操作超时或失败，尚未提交发送')+'：'+(str(exc) or '超过处理时限')
                         self.db.finish(customer['uid'],ident,'failed',message,detail)
-                        await b.guard()
-                        self.log.emit(account['name']+'：'+detail+'；从号继续处理下一位客户')
+                        self.log.emit(account['name']+'：'+detail)
+                        b = await self.rebuild_browser(account)
                     self.changed.emit()
                     customer = None
                     if skip_cooldown:
