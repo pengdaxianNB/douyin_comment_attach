@@ -173,7 +173,7 @@ class Window(QMainWindow):
         self.customers.itemDoubleClicked.connect(self.open_customer)
         l.addWidget(self.customers)
         bar = QHBoxLayout(); l.addLayout(bar)
-        for label,fn in [('打开客户主页',self.open_customer),('标记已私信',lambda:self.mark('sent')),('重新排队',lambda:self.mark('pending')),('人工标记跳过',lambda:self.mark('skipped'))]: bar.addWidget(button(label,fn))
+        for label,fn in [('打开客户主页',self.open_customer),('标记已私信',lambda:self.mark('sent')),('重新排队',lambda:self.mark('pending')),('全部失败重新排队',self.requeue_failed),('人工标记跳过',lambda:self.mark('skipped'))]: bar.addWidget(button(label,fn))
         bar.addStretch()
         hint = QLabel('双击查看客户主页  ·  发送异常不会自动重发  ·  列表显示最近 1,000 条，导出包含全部数据'); hint.setObjectName('muted'); hint.setWordWrap(True); l.addWidget(hint)
 
@@ -570,6 +570,22 @@ class Window(QMainWindow):
             if QMessageBox.question(self,'确认状态','确认将该客户标记为'+STATUS[status]+'？')!=QMessageBox.StandardButton.Yes:return
             self.db.execute("UPDATE customers SET status=?,error='',sent_at=CASE WHEN ?='sent' THEN datetime('now') ELSE '' END WHERE uid=?",(status,status,r['uid']))
             self.db.execute('INSERT INTO events(uid,kind,detail) VALUES (?,?,?)',(r['uid'],status,'人工核验调整状态')); self.refresh_customers()
+        self.report(action)
+
+    def requeue_failed(self):
+        def action():
+            if self.engine.busy(): raise ValueError('批量重新排队前请先停止任务')
+            count = self.db.rows("SELECT count(*) n FROM customers WHERE status='failed'")[0]['n']
+            if not count:
+                self.statusBar().showMessage('当前没有失败客户',5000)
+                return
+            warning = (f'确认将全部 {count} 位失败客户重新排队？\n\n'
+                       '其中可能包含发送结果不明的客户。请先在对应从号的聊天记录中核对，避免重复私信。')
+            if QMessageBox.question(self,'批量重新排队',warning)!=QMessageBox.StandardButton.Yes:return
+            queued = self.db.requeue_failed()
+            self.refresh_customers()
+            self.add_log(f'人工批量重新排队：{queued} 位失败客户')
+            self.statusBar().showMessage(f'已将 {queued} 位失败客户重新排队',8000)
         self.report(action)
 
     def import_data(self):

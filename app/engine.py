@@ -253,12 +253,15 @@ class Engine(QThread):
                     self.changed.emit()
                     self.status.emit(ident,'处理：'+customer['name'])
                     clicked = False
-                    message = ''
+                    message = str(customer.get('message','') or '')
                     skip_cooldown = False
                     try:
                         await asyncio.wait_for(b.check_reachable(customer),timeout=45)
-                        self.status.emit(ident,'生成文案：'+customer['name'])
-                        message = await ai.message(customer)
+                        if message.strip():
+                            self.status.emit(ident,'复用已有文案：'+customer['name'])
+                        else:
+                            self.status.emit(ident,'生成文案：'+customer['name'])
+                            message = await ai.message(customer)
                         self.db.finish(customer['uid'],ident,'processing',message)
                         def before_click():
                             nonlocal clicked

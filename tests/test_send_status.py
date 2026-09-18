@@ -43,6 +43,33 @@ def test_completed_send_is_marked_sent():
         assert row['sent_at']
 
 
+def test_requeued_failure_reuses_existing_message_without_ai_request():
+    uid = 'MS4wLjABAAAArequeued_customer_123456'
+    with TemporaryDirectory() as folder:
+        db = DB(Path(folder) / 'test.sqlite3')
+        account_id = db.account('sender', '从号')
+        db.save_settings({'base_url': 'https://example.com/v1', 'model': 'test'})
+        db.import_customers([dict(uid=uid, name='客户', status='failed', message='保留的私信文案')])
+        assert db.requeue_failed() == 1
+        engine = Engine(db, folder)
+        engine.jobs = {}
+        browser = AsyncMock()
+        engine.open = AsyncMock(return_value=browser)
+
+        with patch('app.engine.get_key', return_value='key'), \
+             patch('app.engine.AI') as ai, \
+             patch('app.engine.asyncio.sleep', side_effect=asyncio.CancelledError):
+            ai.return_value.message = AsyncMock(return_value='不应生成的新文案')
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(engine.work(dict(id=account_id, role='sender', name='从号')))
+
+        ai.return_value.message.assert_not_awaited()
+        browser.send.assert_awaited_once()
+        assert browser.send.await_args.args[1] == '保留的私信文案'
+        row = db.rows('SELECT status,message FROM customers WHERE uid=?', (uid,))[0]
+        assert row == {'status':'sent','message':'保留的私信文案'}
+
+
 @pytest.mark.parametrize('error', [NeedsAttention('消息侧栏关闭失败'),
     PlaywrightError('Element was detached'), asyncio.TimeoutError(),
     AccountNeedsAttention('页面需要人工处理：操作过于频繁')])

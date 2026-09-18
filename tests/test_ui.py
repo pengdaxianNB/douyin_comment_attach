@@ -2,7 +2,7 @@ import os
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 import tempfile
 from pathlib import Path
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication,QMessageBox
 from app.db import DB
 from app.ui import Window,STYLE,format_beijing_time
 
@@ -35,3 +35,22 @@ def test_window():
         w.filter.setCurrentIndex(3)
         assert w.customers.rowCount()==0
         w.close(); app.processEvents()
+
+
+def test_requeue_all_failed_from_customer_toolbar(tmp_path,monkeypatch):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    failed='MS4wLjABAAAAfailed_customer_123456'
+    sent='MS4wLjABAAAAsent_customer_1234567'
+    db.import_customers([dict(uid=failed,name='失败客户',status='failed'),dict(uid=sent,name='已私信客户',status='sent')])
+    db.execute("UPDATE customers SET error='网络异常' WHERE uid=?",(failed,))
+    w=Window(db,tmp_path,start_engine=False)
+    questions=[]
+    monkeypatch.setattr(QMessageBox,'question',lambda *args:(questions.append(args[2]) or QMessageBox.StandardButton.Yes))
+    w.requeue_failed()
+    rows={r['uid']:r for r in db.rows('SELECT uid,status,error FROM customers')}
+    assert rows[failed]['status']=='pending' and rows[failed]['error']==''
+    assert rows[sent]['status']=='sent'
+    assert questions and '全部 1 位失败客户' in questions[0] and '避免重复私信' in questions[0]
+    assert '已将 1 位失败客户重新排队' in w.statusBar().currentMessage()
+    w.close(); app.processEvents()

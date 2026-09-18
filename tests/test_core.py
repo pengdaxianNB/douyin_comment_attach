@@ -34,6 +34,23 @@ class CoreTests(unittest.TestCase):
         self.db.ingest(self.comment(),True,''); self.db.claim('a'); self.db.recover()
         self.assertEqual(self.db.rows('SELECT status FROM customers')[0]['status'],'failed')
         self.assertIsNone(self.db.claim('b'))
+    def test_requeue_failed_only(self):
+        second = UID+'second'
+        third = UID+'third'
+        self.db.import_customers([
+            dict(uid=UID,status='failed',message='已生成文案'),
+            dict(uid=second,status='failed',message='另一条文案'),
+            dict(uid=third,status='sent'),
+        ])
+        self.db.execute("UPDATE customers SET error='发送失败',sent_at='2026-09-01' WHERE status='failed'")
+        self.assertEqual(self.db.requeue_failed(),2)
+        rows={r['uid']:r for r in self.db.rows('SELECT uid,status,message,error,sent_at FROM customers')}
+        self.assertEqual(rows[UID],dict(uid=UID,status='pending',message='已生成文案',error='',sent_at=''))
+        self.assertEqual(rows[second]['status'],'pending')
+        self.assertEqual(rows[third]['status'],'sent')
+        events=self.db.rows("SELECT uid,kind,detail FROM events WHERE detail='人工批量将失败客户重新排队'")
+        self.assertEqual({r['uid'] for r in events},{UID,second})
+        self.assertEqual(self.db.requeue_failed(),0)
     def test_legacy_uncertain_is_migrated_without_requeue(self):
         self.db.import_customers([dict(uid=UID,status='failed')])
         self.db.execute("UPDATE customers SET status='uncertain' WHERE uid=?",(UID,))

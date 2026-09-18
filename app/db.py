@@ -94,6 +94,21 @@ class DB:
     def recover(self):
         self.execute("UPDATE customers SET status='failed',error='应用退出前任务未完成，发送结果不明，请勿重复联系' WHERE status='processing'")
 
+    def requeue_failed(self):
+        """将当前所有失败客户原子性地放回等待队列。"""
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            failed = c.execute("SELECT uid FROM customers WHERE status='failed'").fetchall()
+            if not failed:
+                return 0
+            now = time.time()
+            c.execute("UPDATE customers SET status='pending',error='',sent_at='',updated=? WHERE status='failed'", (now,))
+            c.executemany(
+                'INSERT INTO events(uid,kind,detail) VALUES (?,?,?)',
+                [(row['uid'],'pending','人工批量将失败客户重新排队') for row in failed],
+            )
+            return len(failed)
+
     def import_customers(self, rows):
         checked = []
         for r in rows:
