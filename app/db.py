@@ -117,8 +117,14 @@ class DB:
         """在点击发送前原子记录一次可能消耗当日额度的提交。"""
         detail = '准备提交发送，结果不明时请勿重复联系'
         with self.connect() as c:
-            c.execute("UPDATE customers SET status='failed',message=?,error=?,updated=? WHERE uid=? AND account_id=?",
-                      (message,detail,time.time(),uid,account))
+            # The durable send_attempt event prevents a possibly submitted
+            # message from being omitted from the daily quota.  The customer
+            # itself is still actively being handled, so keep it in
+            # processing until the send call reports its final outcome.
+            # recover() turns any processing row left by an application crash
+            # into a failure before work can resume.
+            c.execute("UPDATE customers SET status='processing',message=?,error='',updated=? WHERE uid=? AND account_id=?",
+                      (message,time.time(),uid,account))
             c.execute("INSERT INTO events(account_id,uid,kind,detail) VALUES (?,?,'send_attempt',?)",
                       (account,uid,detail))
 

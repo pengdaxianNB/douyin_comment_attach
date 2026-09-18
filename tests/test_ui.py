@@ -56,6 +56,22 @@ def test_requeue_all_failed_from_customer_toolbar(tmp_path,monkeypatch):
     w.close(); app.processEvents()
 
 
+def test_send_attempt_remains_in_processing_metric(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    uid='MS4wLjABAAAAprocessing_customer_12345'
+    account_id=db.account('sender','从号')
+    db.import_customers([dict(uid=uid,name='处理中客户')])
+    db.claim(account_id)
+    db.start_send(uid,account_id,'你好')
+    w=Window(db,tmp_path,start_engine=False)
+
+    assert w.metric_values['processing'].text()=='1'
+    assert w.metric_values['failed'].text()=='0'
+
+    w.close(); app.processEvents()
+
+
 def test_stopped_account_browser_can_be_manually_restarted(tmp_path):
     app=QApplication.instance() or QApplication([])
     db=DB(tmp_path/'test.sqlite3')

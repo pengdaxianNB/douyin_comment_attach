@@ -25,7 +25,7 @@ def test_completed_send_is_marked_sent():
 
         async def send(customer, message, before_click):
             before_click()
-            assert db.rows('SELECT status FROM customers WHERE uid=?', (uid,))[0]['status'] == 'failed'
+            assert db.rows('SELECT status FROM customers WHERE uid=?', (uid,))[0]['status'] == 'processing'
 
         browser.send.side_effect = send
         engine.open = AsyncMock(return_value=browser)

@@ -57,7 +57,7 @@ class CoreTests(unittest.TestCase):
         self.db.claim(sender)
         self.db.start_send(UID,sender,'你好')
         self.assertEqual(self.db.sender_quota(sender),{'used':1,'limit':1})
-        self.assertEqual(self.db.rows('SELECT status FROM customers'),[{'status':'failed'}])
+        self.assertEqual(self.db.rows('SELECT status FROM customers'),[{'status':'processing'}])
     def test_recovery(self):
         self.db.ingest(self.comment(),True,''); self.db.claim('a'); self.db.recover()
         self.assertEqual(self.db.rows('SELECT status FROM customers')[0]['status'],'failed')
