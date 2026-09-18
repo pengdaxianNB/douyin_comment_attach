@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBo
 from .ai import SERVICE
 from .db import user_id
 from .engine import Engine, DEFAULTS
-from .embedded_browser import EmbeddedBrowser
+from .embedded_browser import EmbeddedBrowser,keep_tab_pages_mounted
 
 STATUS = dict(pending='等待私信',processing='处理中',sent='已私信',failed='失败',skipped='已跳过')
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
@@ -137,7 +137,7 @@ class Window(QMainWindow):
             caption = QLabel(label); caption.setObjectName('muted'); card_layout.addWidget(caption)
             value = QLabel('0'); value.setObjectName('statValue'); value.setProperty('status',key); card_layout.addWidget(value)
             self.metric_values[key] = value; metrics_row.addWidget(card,1)
-        self.tabs = QTabWidget(); self.tabs.tabBar().setExpanding(False); self.tabs.tabBar().setCursor(Qt.CursorShape.PointingHandCursor); self.tabs.tabBar().setDrawBase(False); self.tabs.setDocumentMode(False); layout.addWidget(self.tabs,1)
+        self.tabs = QTabWidget(); keep_tab_pages_mounted(self.tabs); self.tabs.tabBar().setExpanding(False); self.tabs.tabBar().setCursor(Qt.CursorShape.PointingHandCursor); self.tabs.tabBar().setDrawBase(False); self.tabs.setDocumentMode(False); layout.addWidget(self.tabs,1)
         self.browser_widgets = {}
         self.build_customers(); self.build_accounts(); self.build_bloggers(); self.build_browser_workspace(); self.build_settings()
         self.logs = QPlainTextEdit(); self.logs.setReadOnly(True); self.logs.setMaximumBlockCount(1000)
@@ -199,7 +199,7 @@ class Window(QMainWindow):
         layout = QVBoxLayout(page); layout.setContentsMargins(14,14,14,14); layout.setSpacing(10)
         hint = QLabel('每个账号的页面会保持在独立标签中；任务运行时也可切换查看，请勿在自动操作时手动跳转该页。')
         hint.setObjectName('muted'); hint.setWordWrap(True); layout.addWidget(hint)
-        self.browser_tabs = QTabWidget(); self.browser_tabs.setObjectName('browserTabs')
+        self.browser_tabs = QTabWidget(); keep_tab_pages_mounted(self.browser_tabs); self.browser_tabs.setObjectName('browserTabs')
         # macOS paints a light native strip behind document-mode tabs even when
         # the rest of the application uses a dark stylesheet. Use the regular
         # tab bar and suppress its native base so the workspace stays uniform.

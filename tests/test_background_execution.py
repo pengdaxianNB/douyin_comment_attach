@@ -7,10 +7,10 @@ os.environ.setdefault('QTWEBENGINE_CHROMIUM_FLAGS','--disable-gpu')
 
 from PySide6.QtTest import QTest
 from PySide6.QtWebEngineCore import QWebEnginePage
-from PySide6.QtWidgets import QApplication,QTabWidget
+from PySide6.QtWidgets import QApplication,QTabWidget,QVBoxLayout,QWidget
 
 from app.browser import Browser
-from app.embedded_browser import EmbeddedBrowser
+from app.embedded_browser import EmbeddedBrowser,keep_tab_pages_mounted
 from main import configure_embedded_browser
 
 
@@ -37,15 +37,21 @@ def test_cdp_background_lifecycle_and_focus_are_enabled():
     session.detach.assert_awaited_once()
 
 
-def test_hidden_account_tab_keeps_web_page_active(tmp_path):
+def test_unselected_account_stays_mounted_behind_other_app_tabs(tmp_path):
     app=QApplication.instance() or QApplication([])
-    tabs=QTabWidget();tabs.show()
+    outer=QTabWidget();keep_tab_pages_mounted(outer)
+    browser_page=QWidget();browser_layout=QVBoxLayout(browser_page)
+    tabs=QTabWidget();keep_tab_pages_mounted(tabs);browser_layout.addWidget(tabs)
+    outer.addTab(browser_page,'browsers');outer.addTab(QWidget(),'logs');outer.show()
     first=EmbeddedBrowser(tmp_path/'first','first')
     second=EmbeddedBrowser(tmp_path/'second','second')
     tabs.addTab(first,'first');tabs.addTab(second,'second')
     tabs.setCurrentWidget(second)
+    outer.setCurrentIndex(1)
     QTest.qWait(1100);app.processEvents()
-    assert not first.isVisible()
+    assert first.isVisible()
+    assert second.isVisible()
+    assert browser_page.isVisible()
     assert first.view.page().isVisible()
     assert first.view.page().lifecycleState()==QWebEnginePage.LifecycleState.Active
-    first.shutdown();second.shutdown();tabs.close();app.processEvents()
+    first.shutdown();second.shutdown();outer.close();app.processEvents()

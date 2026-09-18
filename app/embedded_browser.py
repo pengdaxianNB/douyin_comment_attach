@@ -5,7 +5,8 @@ import threading
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QHBoxLayout, QLineEdit, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (QHBoxLayout, QLineEdit, QPushButton, QStackedLayout,
+    QStackedWidget, QTabWidget, QVBoxLayout, QWidget)
 
 
 MARKER_PREFIX = 'panda-embedded-account:'
@@ -26,6 +27,18 @@ def unregister_page(marker):
 def page_id(marker):
     with _PAGE_IDS_LOCK:
         return _PAGE_IDS.get(marker)
+
+
+def keep_tab_pages_mounted(tabs):
+    """Keep non-selected tab contents rendered underneath the current tab."""
+    if not isinstance(tabs,QTabWidget):
+        return False
+    stack = tabs.findChild(QStackedWidget)
+    layout = stack.layout() if stack is not None else None
+    if not isinstance(layout,QStackedLayout):
+        return False
+    layout.setStackingMode(QStackedLayout.StackingMode.StackAll)
+    return True
 
 
 class BrowserView(QWebEngineView):
