@@ -222,6 +222,8 @@ def test_rebuild_scans_keywords_before_bloggers(tmp_path):
     db=DB(tmp_path/'test.sqlite3')
     db.execute("INSERT INTO keywords(keyword) VALUES ('控糖')")
     db.execute("INSERT INTO bloggers(id,name) VALUES ('blogger-id','博主甲')")
+    db.add_manual_video('https://www.douyin.com/video/3234567890123456789','手动视频')
+    db.clear_videos()
     order=[]
     async def keyword_videos(keyword,days):
         order.append(('keyword',keyword))
@@ -235,3 +237,4 @@ def test_rebuild_scans_keywords_before_bloggers(tmp_path):
     asyncio.run(engine.rebuild_video_list({'id':'main','name':'主号'},browser,{'days':7}))
 
     assert order==[('keyword','控糖'),('blogger','blogger-id')]
+    assert {row['source_type'] for row in db.video_tasks()}=={'keyword','blogger','manual'}

@@ -20,6 +20,18 @@ def user_id(value):
     return value
 
 
+def video_id(value):
+    """Extract a work ID from a full Douyin video URL."""
+    text = str(value or '').strip()
+    parsed = urlparse(text)
+    if parsed.scheme != 'https' or parsed.hostname not in ('www.douyin.com','douyin.com'):
+        raise ValueError('请输入完整的抖音视频链接（https://www.douyin.com/video/…）')
+    match = re.fullmatch(r'/video/(\d{8,})/?',parsed.path)
+    if not match:
+        raise ValueError('链接中未找到 /video/数字作品ID；请粘贴视频页地址栏中的完整链接')
+    return match.group(1)
+
+
 class DB:
     def __init__(self, path):
         self.path = str(path)
@@ -32,11 +44,12 @@ class DB:
             CREATE UNIQUE INDEX IF NOT EXISTS one_main ON accounts(role) WHERE role='main';
             CREATE TABLE IF NOT EXISTS bloggers(id TEXT PRIMARY KEY,name TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS keywords(id INTEGER PRIMARY KEY AUTOINCREMENT,keyword TEXT NOT NULL UNIQUE);
+            CREATE TABLE IF NOT EXISTS manual_videos(id TEXT PRIMARY KEY,url TEXT NOT NULL,title TEXT NOT NULL DEFAULT '',added_at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS videos(
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL DEFAULT '',
                 author TEXT NOT NULL DEFAULT '',
-                source_type TEXT NOT NULL CHECK(source_type IN ('blogger','keyword')),
+                source_type TEXT NOT NULL CHECK(source_type IN ('blogger','keyword','manual')),
                 source_name TEXT NOT NULL DEFAULT '',
                 source_ref TEXT NOT NULL DEFAULT '',
                 create_time INTEGER NOT NULL DEFAULT 0,
@@ -53,6 +66,21 @@ class DB:
             account_columns = {row['name'] for row in c.execute('PRAGMA table_info(accounts)')}
             if 'daily_limit' not in account_columns:
                 c.execute('ALTER TABLE accounts ADD COLUMN daily_limit INTEGER NOT NULL DEFAULT 0')
+            video_schema = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='videos'").fetchone()['sql']
+            if "'manual'" not in video_schema:
+                c.executescript('''
+                ALTER TABLE videos RENAME TO videos_without_manual;
+                CREATE TABLE videos(
+                    id TEXT PRIMARY KEY,title TEXT NOT NULL DEFAULT '',author TEXT NOT NULL DEFAULT '',
+                    source_type TEXT NOT NULL CHECK(source_type IN ('blogger','keyword','manual')),
+                    source_name TEXT NOT NULL DEFAULT '',source_ref TEXT NOT NULL DEFAULT '',
+                    create_time INTEGER NOT NULL DEFAULT 0,url TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','scanning','done','failed')),
+                    error TEXT NOT NULL DEFAULT '',discovered_at REAL NOT NULL,scanned_at REAL
+                );
+                INSERT INTO videos SELECT * FROM videos_without_manual;
+                DROP TABLE videos_without_manual;
+                ''')
             c.execute("UPDATE customers SET status='failed',error=CASE WHEN error='' THEN '历史待核验记录，发送结果不明，请勿重复联系' ELSE error END WHERE status='uncertain'")
             # An interrupted comment scan is safe to retry: comments are
             # deduplicated by cid and no outbound message is sent here.
@@ -116,6 +144,30 @@ class DB:
             c.execute('DELETE FROM videos')
             c.execute("DELETE FROM settings WHERE key='video_list_built_at'")
         return int(count)
+
+    def add_manual_video(self, url, title=''):
+        ident = video_id(url)
+        clean_url = 'https://www.douyin.com/video/'+ident
+        clean_title = ' '.join(str(title or '').split()) or '手动录入视频 '+ident
+        now = time.time()
+        with self.connect() as c:
+            if c.execute('SELECT 1 FROM videos WHERE id=?',(ident,)).fetchone():
+                raise ValueError('该视频已在待分析列表中，无需重复录入')
+            if c.execute('SELECT 1 FROM manual_videos WHERE id=?',(ident,)).fetchone():
+                raise ValueError('该视频已在手动录入来源中')
+            c.execute('INSERT INTO manual_videos(id,url,title,added_at) VALUES (?,?,?,?)',
+                      (ident,clean_url,clean_title,now))
+            c.execute('''INSERT INTO videos(id,title,author,source_type,source_name,source_ref,create_time,url,discovered_at)
+                         VALUES (?,?,?,'manual','手动录入',?,0,?,?)''',
+                      (ident,clean_title,'',clean_url,clean_url,now))
+        return ident
+
+    def remove_manual_video(self, ident):
+        with self.connect() as c:
+            if not c.execute('SELECT 1 FROM manual_videos WHERE id=?',(str(ident),)).fetchone():
+                raise ValueError('选中的视频不是手动录入来源')
+            c.execute('DELETE FROM manual_videos WHERE id=?',(str(ident),))
+            c.execute("DELETE FROM videos WHERE id=? AND source_type='manual'",(str(ident),))
 
     def add_video(self, video, source_type, source_name, source_ref=''):
         """Add a discovered video to the current list, deduplicated by ID."""

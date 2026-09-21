@@ -2,7 +2,7 @@ import os
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 import tempfile
 from pathlib import Path
-from PySide6.QtWidgets import QApplication,QMessageBox
+from PySide6.QtWidgets import QApplication,QInputDialog,QMessageBox
 from app.db import DB
 from app.ui import Window,STYLE,format_beijing_time
 
@@ -87,6 +87,29 @@ def test_clear_video_list_button_forces_source_rebuild(tmp_path,monkeypatch):
     assert db.setting('video_list_built_at') is None
     assert w.videos.rowCount()==0
     assert '主号下一轮将重新找视频' in w.statusBar().currentMessage()
+    w.close();app.processEvents()
+
+
+def test_manual_video_can_be_added_and_removed_from_video_page(tmp_path,monkeypatch):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    w=Window(db,tmp_path,start_engine=False)
+    answers=iter([
+        ('https://www.douyin.com/video/1234567890123456789',True),
+        ('手动录入标题',True),
+    ])
+    monkeypatch.setattr(QInputDialog,'getText',lambda *args,**kwargs:next(answers))
+
+    w.add_manual_video()
+
+    assert w.videos.rowCount()==1
+    assert w.videos.item(0,1).text()=='手动录入'
+    assert w.videos.item(0,2).text()=='手动录入标题'
+    assert w.remove_manual_video_button.isEnabled()
+    monkeypatch.setattr(QMessageBox,'question',lambda *args:QMessageBox.StandardButton.Yes)
+    w.remove_manual_video()
+    assert w.videos.rowCount()==0
+    assert db.rows('SELECT * FROM manual_videos')==[]
     w.close();app.processEvents()
 
 

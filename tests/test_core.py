@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from app.db import DB,user_id
+from app.db import DB,user_id,video_id
 from app.browser import parse_comments
 
 UID='MS4wLjABAAAAexample_customer_123456'
@@ -26,6 +26,21 @@ class CoreTests(unittest.TestCase):
             connection.execute("INSERT INTO accounts VALUES ('sender','sender','旧从号',120)")
         migrated=DB(path)
         self.assertEqual(migrated.rows("SELECT daily_limit FROM accounts WHERE id='sender'"),[{'daily_limit':0}])
+
+    def test_legacy_video_table_gains_manual_source_support(self):
+        import sqlite3
+        path=Path(self.tmp.name)/'legacy-videos.sqlite3'
+        with sqlite3.connect(path) as connection:
+            connection.execute('''CREATE TABLE videos(
+                id TEXT PRIMARY KEY,title TEXT NOT NULL DEFAULT '',author TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL CHECK(source_type IN ('blogger','keyword')),
+                source_name TEXT NOT NULL DEFAULT '',source_ref TEXT NOT NULL DEFAULT '',
+                create_time INTEGER NOT NULL DEFAULT 0,url TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','scanning','done','failed')),
+                error TEXT NOT NULL DEFAULT '',discovered_at REAL NOT NULL,scanned_at REAL)''')
+        migrated=DB(path)
+        migrated.add_manual_video('https://www.douyin.com/video/1234567890123456789')
+        self.assertEqual(migrated.video_tasks()[0]['source_type'],'manual')
     def test_dedupe_and_preserve_sent(self):
         self.assertTrue(self.db.ingest(self.comment(),True,'需求明确'))
         self.assertFalse(self.db.ingest(self.comment(),True,'重复'))
@@ -96,6 +111,9 @@ class CoreTests(unittest.TestCase):
     def test_url(self):
         self.assertEqual(user_id('https://www.douyin.com/user/'+UID+'?a=b'),UID)
         with self.assertRaises(ValueError):user_id('https://evil.com/user/'+UID)
+        self.assertEqual(video_id('https://www.douyin.com/video/1234567890123456789?from=web'),
+                         '1234567890123456789')
+        with self.assertRaises(ValueError):video_id('https://v.douyin.com/example/')
     def test_top_level_only(self):
         base=dict(cid='1',text='咨询',create_time=10,user=dict(sec_uid=UID,nickname='客户'))
         data={'comments':[base,dict(base,cid='2',reply_id='1')]}
@@ -136,5 +154,16 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.db.video_tasks(),[])
         self.assertIsNone(self.db.setting('video_list_built_at'))
         self.assertTrue(self.db.prepare_video_scan(24,now=1001))
+
+    def test_manual_video_is_persistent_source_and_can_be_removed(self):
+        ident=self.db.add_manual_video(
+            'https://www.douyin.com/video/1234567890123456789?from=copy','手动视频')
+        row=self.db.video_tasks()[0]
+        self.assertEqual(row['source_type'],'manual')
+        self.assertEqual(row['title'],'手动视频')
+        self.db.clear_videos()
+        self.assertEqual(len(self.db.rows('SELECT * FROM manual_videos')),1)
+        self.db.remove_manual_video(ident)
+        self.assertEqual(self.db.rows('SELECT * FROM manual_videos'),[])
 
 if __name__=='__main__':unittest.main()

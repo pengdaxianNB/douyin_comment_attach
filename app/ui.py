@@ -348,11 +348,17 @@ class Window(QMainWindow):
         self.video_search.setClearButtonEnabled(True); self.video_search.setMinimumWidth(260)
         self.video_search.textChanged.connect(self.refresh_videos); video_bar.addWidget(self.video_search)
         video_bar.addStretch()
+        self.add_manual_video_button = button('录入视频链接',self.add_manual_video)
+        self.add_manual_video_button.setProperty('variant','primary'); video_bar.addWidget(self.add_manual_video_button)
+        self.remove_manual_video_button = button('移除手动视频',self.remove_manual_video)
+        video_bar.addWidget(self.remove_manual_video_button)
         self.clear_videos_button = button('一键清空',self.clear_videos)
         self.clear_videos_button.setProperty('variant','danger'); video_bar.addWidget(self.clear_videos_button)
         self.video_summary = QLabel('共 0 个'); self.video_summary.setObjectName('muted'); video_bar.addWidget(self.video_summary)
         self.videos = table(['状态','来源','视频标题','作者','发布时间','作品 ID','异常说明'])
         for col,width in enumerate([100,160,360,140,160,200,280]): self.videos.setColumnWidth(col,width)
+        self.videos.itemSelectionChanged.connect(self.update_manual_video_action)
+        self.update_manual_video_action()
         videos_layout.addWidget(self.videos,1)
         video_hint = QLabel('列表到期会先清空并重新从全部来源找视频；未到期则保留链接，只重置状态后重新扫描新增评论。')
         video_hint.setObjectName('muted'); video_hint.setWordWrap(True); videos_layout.addWidget(video_hint)
@@ -364,6 +370,12 @@ class Window(QMainWindow):
 
     def update_keyword_actions(self):
         self.delete_keyword_button.setEnabled(bool(self.keywords.selectionModel().selectedRows()))
+
+    def update_manual_video_action(self):
+        row = self.videos.currentRow()
+        manual = (hasattr(self,'video_rows') and 0 <= row < len(self.video_rows)
+                  and self.video_rows[row].get('source_type')=='manual')
+        self.remove_manual_video_button.setEnabled(manual)
 
     def build_settings(self):
         l = self.page('AI 与任务设置'); forms = {}
@@ -559,7 +571,7 @@ class Window(QMainWindow):
         rows = [row for row in all_rows if query in str(row.get('title','')).casefold()]
         self.video_rows = rows
         populate(self.videos,[[VIDEO_STATUS.get(r['status'],r['status']),
-            ('博主：' if r['source_type']=='blogger' else '关键词：')+r['source_name'],
+            ({'blogger':'博主：','keyword':'关键词：','manual':''}.get(r['source_type'],'')+r['source_name']),
             r['title'],r['author'],
             (datetime.fromtimestamp(r['create_time'],BEIJING_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S') if r['create_time'] else ''),
             r['id'],r['error']] for r in rows])
@@ -573,6 +585,7 @@ class Window(QMainWindow):
         colors = {'pending':'#80baff','scanning':'#b7a2ff','done':'#62d7b0','failed':'#f48b96'}
         for i,row in enumerate(rows):
             self.videos.item(i,0).setForeground(QColor(colors.get(row['status'],'#dbe5f3')))
+        self.update_manual_video_action()
 
     def refresh_customers(self):
         counts = {r['status']:r['n'] for r in self.db.rows('SELECT status,count(*) n FROM customers GROUP BY status')}
@@ -678,6 +691,39 @@ class Window(QMainWindow):
             row = self.selected(self.keywords,self.keyword_rows)
             self.db.execute('DELETE FROM keywords WHERE id=?',(row['id'],))
             self.refresh_keywords()
+        self.report(action)
+
+    def add_manual_video(self):
+        def action():
+            url,ok = QInputDialog.getText(
+                self,'录入抖音视频','完整视频链接：',
+                text='https://www.douyin.com/video/')
+            if not ok: return
+            title,ok = QInputDialog.getText(
+                self,'录入抖音视频','视频标题（选填，便于搜索）：')
+            if not ok: return
+            ident = self.db.add_manual_video(url,title)
+            self.refresh_videos()
+            self.video_search.clear()
+            self.video_source_tabs.setCurrentIndex(2)
+            for index,row in enumerate(self.video_rows):
+                if row['id']==ident:
+                    self.videos.selectRow(index)
+                    break
+            self.statusBar().showMessage('视频链接已加入待分析列表',5000)
+        self.report(action)
+
+    def remove_manual_video(self):
+        def action():
+            row = self.selected(self.videos,self.video_rows)
+            if row.get('source_type')!='manual':
+                raise ValueError('只能移除通过“录入视频链接”添加的视频')
+            if QMessageBox.question(self,'移除手动视频',
+                    '确认从手动来源和待分析列表中移除该视频？')!=QMessageBox.StandardButton.Yes:
+                return
+            self.db.remove_manual_video(row['id'])
+            self.refresh_videos()
+            self.statusBar().showMessage('手动录入视频已移除',5000)
         self.report(action)
 
     def clear_videos(self):

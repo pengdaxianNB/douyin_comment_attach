@@ -279,8 +279,9 @@ class Engine(QThread):
         """Discover videos from every configured source before comment scans."""
         bloggers = self.db.rows('SELECT * FROM bloggers ORDER BY name,id')
         keywords = self.db.rows('SELECT * FROM keywords ORDER BY id')
-        if not bloggers and not keywords:
-            raise ValueError('请先添加监控博主或找视频关键词')
+        manual_videos = self.db.rows('SELECT * FROM manual_videos ORDER BY added_at,id')
+        if not bloggers and not keywords and not manual_videos:
+            raise ValueError('请先添加关键词、监控博主或手动视频链接')
         for row in keywords:
             keyword = row['keyword']
             self.status.emit(account['id'],'关键词找视频：'+keyword)
@@ -295,6 +296,12 @@ class Engine(QThread):
             for video in videos:
                 self.db.add_video(video,'blogger',blogger['name'],blogger['id'])
             self.log.emit(blogger['name']+'：已加入待分析视频 '+str(len(videos))+' 个')
+            self.changed.emit()
+        for item in manual_videos:
+            video = {'aweme_id':item['id'],'desc':item['title'],'author':{},'create_time':0}
+            self.db.add_video(video,'manual','手动录入',item['url'])
+        if manual_videos:
+            self.log.emit('手动录入：已加入待分析视频 '+str(len(manual_videos))+' 个')
             self.changed.emit()
 
     async def work(self, account):
