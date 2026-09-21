@@ -216,3 +216,22 @@ def test_scan_abandons_cached_work_when_video_list_was_cleared(tmp_path):
 
     browser.comments.assert_not_awaited()
     assert any('列表已清空' in line for line in logs)
+
+
+def test_rebuild_scans_keywords_before_bloggers(tmp_path):
+    db=DB(tmp_path/'test.sqlite3')
+    db.execute("INSERT INTO keywords(keyword) VALUES ('控糖')")
+    db.execute("INSERT INTO bloggers(id,name) VALUES ('blogger-id','博主甲')")
+    order=[]
+    async def keyword_videos(keyword,days):
+        order.append(('keyword',keyword))
+        return [{'aweme_id':'1234567890123456789','desc':'关键词视频','author':{}}]
+    async def blogger_videos(uid,days):
+        order.append(('blogger',uid))
+        return [{'aweme_id':'2234567890123456789','desc':'博主视频','author':{}}]
+    browser=SimpleNamespace(keyword_videos=keyword_videos,videos=blogger_videos)
+    engine=Engine(db,tmp_path)
+
+    asyncio.run(engine.rebuild_video_list({'id':'main','name':'主号'},browser,{'days':7}))
+
+    assert order==[('keyword','控糖'),('blogger','blogger-id')]
