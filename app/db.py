@@ -31,6 +31,21 @@ class DB:
             CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,role TEXT NOT NULL CHECK(role IN ('main','sender')),name TEXT NOT NULL,interval INTEGER NOT NULL DEFAULT 120,daily_limit INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS one_main ON accounts(role) WHERE role='main';
             CREATE TABLE IF NOT EXISTS bloggers(id TEXT PRIMARY KEY,name TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS keywords(id INTEGER PRIMARY KEY AUTOINCREMENT,keyword TEXT NOT NULL UNIQUE);
+            CREATE TABLE IF NOT EXISTS videos(
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                author TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL CHECK(source_type IN ('blogger','keyword')),
+                source_name TEXT NOT NULL DEFAULT '',
+                source_ref TEXT NOT NULL DEFAULT '',
+                create_time INTEGER NOT NULL DEFAULT 0,
+                url TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','scanning','done','failed')),
+                error TEXT NOT NULL DEFAULT '',
+                discovered_at REAL NOT NULL,
+                scanned_at REAL
+            );
             CREATE TABLE IF NOT EXISTS comments(id TEXT PRIMARY KEY,uid TEXT NOT NULL,name TEXT,text TEXT,comment_time TEXT,video_id TEXT,video_title TEXT,blogger TEXT,target INTEGER,reason TEXT);
             CREATE TABLE IF NOT EXISTS customers(uid TEXT PRIMARY KEY,name TEXT,text TEXT,comment_time TEXT,video_title TEXT,blogger TEXT,url TEXT,status TEXT NOT NULL DEFAULT 'pending',message TEXT DEFAULT '',account_id TEXT,error TEXT DEFAULT '',sent_at TEXT DEFAULT '',updated REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,at TEXT DEFAULT CURRENT_TIMESTAMP,account_id TEXT,uid TEXT,kind TEXT,detail TEXT);
@@ -39,6 +54,9 @@ class DB:
             if 'daily_limit' not in account_columns:
                 c.execute('ALTER TABLE accounts ADD COLUMN daily_limit INTEGER NOT NULL DEFAULT 0')
             c.execute("UPDATE customers SET status='failed',error=CASE WHEN error='' THEN '历史待核验记录，发送结果不明，请勿重复联系' ELSE error END WHERE status='uncertain'")
+            # An interrupted comment scan is safe to retry: comments are
+            # deduplicated by cid and no outbound message is sent here.
+            c.execute("UPDATE videos SET status='pending',error='' WHERE status='scanning'")
 
     @contextmanager
     def connect(self):
@@ -65,6 +83,75 @@ class DB:
     def save_settings(self, values):
         with self.connect() as c:
             c.executemany('INSERT OR REPLACE INTO settings VALUES (?,?)', [(k,json.dumps(v,ensure_ascii=False)) for k,v in values.items()])
+
+    def prepare_video_scan(self, reset_hours, now=None):
+        """Prepare one monitoring pass and report whether sources must be rebuilt.
+
+        A fresh list is rebuilt after ``reset_hours``.  Inside that window the
+        same videos are retained and only their per-pass status is reset, so a
+        user can see exactly which videos the current pass has completed.
+        """
+        current = float(time.time() if now is None else now)
+        reset_after = max(1, int(reset_hours)) * 3600
+        with self.connect() as c:
+            row = c.execute("SELECT value FROM settings WHERE key='video_list_built_at'").fetchone()
+            has_videos = c.execute('SELECT 1 FROM videos LIMIT 1').fetchone() is not None
+            try:
+                built_at = float(json.loads(row['value'])) if row else 0.0
+            except (TypeError, ValueError, json.JSONDecodeError):
+                built_at = 0.0
+            rebuild = not has_videos or not built_at or current - built_at >= reset_after
+            if rebuild:
+                c.execute('DELETE FROM videos')
+                c.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)',
+                          ('video_list_built_at',json.dumps(current)))
+            else:
+                c.execute("UPDATE videos SET status='pending',error='',scanned_at=NULL")
+        return rebuild
+
+    def clear_videos(self):
+        """Clear the queue and force source discovery on the next main pass."""
+        with self.connect() as c:
+            count = c.execute('SELECT count(*) FROM videos').fetchone()[0]
+            c.execute('DELETE FROM videos')
+            c.execute("DELETE FROM settings WHERE key='video_list_built_at'")
+        return int(count)
+
+    def add_video(self, video, source_type, source_name, source_ref=''):
+        """Add a discovered video to the current list, deduplicated by ID."""
+        ident = str(video.get('aweme_id') or '').strip()
+        if not ident:
+            raise ValueError('视频缺少作品 ID')
+        title = ' '.join(str(video.get('desc') or '').split())
+        author = video.get('author') or {}
+        author_name = str(author.get('nickname') or '') if isinstance(author,dict) else str(author)
+        try:
+            created = int(video.get('create_time') or 0)
+        except (TypeError, ValueError):
+            created = 0
+        now = time.time()
+        with self.connect() as c:
+            return bool(c.execute('''
+                INSERT INTO videos(id,title,author,source_type,source_name,source_ref,create_time,url,discovered_at)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE videos.title END,
+                    author=CASE WHEN excluded.author<>'' THEN excluded.author ELSE videos.author END,
+                    create_time=CASE WHEN excluded.create_time>0 THEN excluded.create_time ELSE videos.create_time END
+            ''',(ident,title,author_name,source_type,str(source_name),str(source_ref),created,
+                 'https://www.douyin.com/video/'+ident,now)).rowcount)
+
+    def video_tasks(self, status=None):
+        where = ' WHERE status=?' if status else ''
+        args = (status,) if status else ()
+        return self.rows('SELECT * FROM videos'+where+' ORDER BY create_time DESC,discovered_at,id',args)
+
+    def set_video_status(self, ident, status, error=''):
+        if status not in ('pending','scanning','done','failed'):
+            raise ValueError('不支持的视频状态')
+        scanned_at = time.time() if status in ('done','failed') else None
+        self.execute('UPDATE videos SET status=?,error=?,scanned_at=? WHERE id=?',
+                     (status,str(error),scanned_at,str(ident)))
 
     def account(self, role, name, daily_limit=0):
         ident = uuid.uuid4().hex
@@ -193,6 +280,8 @@ class DB:
             if table=='all':
                 for name in keys:
                     c.execute(f'DELETE FROM {name}')
+                c.execute('DELETE FROM videos')
+                c.execute("DELETE FROM settings WHERE key='video_list_built_at'")
             elif ids is None:
                 c.execute(f'DELETE FROM {table}')
             else:

@@ -11,7 +11,7 @@ from .browser import Browser, AccountNeedsAttention, CommentPageUnavailable, Nee
 from .classifier import classify_comments
 from .embedded_browser import MARKER_PREFIX, page_id, unregister_page
 
-DEFAULTS = dict(days=7,comment_days=7,ai_concurrency=5,poll_seconds=300,scroll_limit=80,base_url='',model='',thinking_mode='default',thinking_effort='high',
+DEFAULTS = dict(days=7,comment_days=7,video_list_reset_hours=24,ai_concurrency=5,poll_seconds=300,scroll_limit=80,base_url='',model='',thinking_mode='default',thinking_effort='high',
     filter_prompt='识别评论中是否明确表达了对我提供的产品或服务的购买或咨询需求。产品和目标客户：请填写。不要把普通互动识别为需求。',
     message_prompt='根据客户评论写一条自然、简短的咨询回复。我的产品或服务：请填写。尊重对方，不夸大，不使用虚假承诺。',
     comment_panel='[data-e2e="comment-list"]',message_editor='[contenteditable="true"]')
@@ -212,6 +212,18 @@ class Engine(QThread):
         failed_videos = 0
         expired_comments = 0
         for video in videos:
+            video_id = str(video.get('aweme_id') or video.get('id') or '')
+            if (video_id and hasattr(self.db,'video_tasks')
+                    and not self.db.rows('SELECT 1 FROM videos WHERE id=?',(video_id,))):
+                self.log.emit(account['name']+'：检测到待分析视频列表已清空，结束当前旧列表扫描')
+                break
+            if 'aweme_id' not in video:
+                video = dict(video,aweme_id=video_id,desc=video.get('title',''),
+                             author={'nickname':video.get('author','')})
+            tracking = bool(video_id and hasattr(self.db,'set_video_status'))
+            if tracking:
+                self.db.set_video_status(video_id,'scanning')
+                self.changed.emit()
             try:
                 comments = await browser.comments(video)
             except CommentPageUnavailable as exc:
@@ -220,21 +232,70 @@ class Engine(QThread):
                 video_id = str(video.get('aweme_id','未知'))
                 title = ' '.join(str(video.get('desc','')).split())[:40]
                 detail = f' · {title}' if title else ''
+                if tracking:
+                    self.db.set_video_status(video_id,'failed',str(exc))
+                    self.changed.emit()
                 self.log.emit(f'{account["name"]}：已跳过视频 {video_id}{detail}：{exc}')
                 if consecutive_failures == 3:
                     self.log.emit(f'{account["name"]}：连续 3 个视频加载失败，暂停 10 秒后继续；本轮跳过的视频下轮会自动重试')
                     await asyncio.sleep(10)
                 continue
+            except asyncio.CancelledError:
+                if tracking:
+                    self.db.set_video_status(video_id,'pending')
+                    self.changed.emit()
+                raise
+            except Exception as exc:
+                if tracking:
+                    self.db.set_video_status(video_id,'failed',str(exc))
+                    self.changed.emit()
+                raise
             consecutive_failures = 0
             eligible = recent_comments(comments,settings.get('comment_days',DEFAULTS['comment_days']))
             expired_comments += len(comments)-len(eligible)
-            await classify_comments(self.db,ai,eligible,settings['ai_concurrency'],
-                lambda text:self.log.emit(account['name']+'：'+text),self.changed.emit)
+            try:
+                await classify_comments(self.db,ai,eligible,settings['ai_concurrency'],
+                    lambda text:self.log.emit(account['name']+'：'+text),self.changed.emit)
+            except asyncio.CancelledError:
+                if tracking:
+                    self.db.set_video_status(video_id,'pending')
+                    self.changed.emit()
+                raise
+            except Exception as exc:
+                if tracking:
+                    self.db.set_video_status(video_id,'failed',str(exc))
+                    self.changed.emit()
+                raise
+            if tracking:
+                self.db.set_video_status(video_id,'done')
+                self.changed.emit()
         if expired_comments:
             days = settings.get('comment_days',DEFAULTS['comment_days'])
             self.log.emit(f'{account["name"]}：本轮已过滤 {expired_comments} 条超过最近 {days} 天的评论，未提交 AI 分析')
         if failed_videos:
             self.log.emit(f'{account["name"]}：本轮有 {failed_videos} 个视频评论区未就绪，已跳过并保持任务运行，下轮自动重试')
+
+    async def rebuild_video_list(self, account, browser, settings):
+        """Discover videos from every configured source before comment scans."""
+        bloggers = self.db.rows('SELECT * FROM bloggers ORDER BY name,id')
+        keywords = self.db.rows('SELECT * FROM keywords ORDER BY id')
+        if not bloggers and not keywords:
+            raise ValueError('请先添加监控博主或找视频关键词')
+        for blogger in bloggers:
+            self.status.emit(account['id'],'整理视频：'+blogger['name'])
+            videos = await browser.videos(blogger['id'],settings['days'])
+            for video in videos:
+                self.db.add_video(video,'blogger',blogger['name'],blogger['id'])
+            self.log.emit(blogger['name']+'：已加入待分析视频 '+str(len(videos))+' 个')
+            self.changed.emit()
+        for row in keywords:
+            keyword = row['keyword']
+            self.status.emit(account['id'],'关键词找视频：'+keyword)
+            videos = await browser.keyword_videos(keyword,7)
+            for video in videos:
+                self.db.add_video(video,'keyword',keyword,keyword)
+            self.log.emit('关键词“'+keyword+'”：近 7 天已加入待分析视频 '+str(len(videos))+' 个')
+            self.changed.emit()
 
     async def work(self, account):
         ident = account['id']
@@ -251,17 +312,33 @@ class Engine(QThread):
             self.status.emit(ident,'运行中')
             while True:
                 if account['role']=='main':
-                    bloggers = self.db.rows('SELECT * FROM bloggers')
-                    if not bloggers:
-                        raise ValueError('请先添加需要监控的博主')
-                    for blogger in bloggers:
-                        self.status.emit(ident,'采集：'+blogger['name'])
-                        videos = await b.videos(blogger['id'],s['days'])
-                        await self.scan_videos(account,b,ai,videos,s)
-                        self.log.emit(blogger['name']+' 本轮检查视频 '+str(len(videos))+' 个')
-                        for warning in b.warnings:
-                            self.log.emit(warning)
-                        b.warnings.clear()
+                    rebuild = self.db.prepare_video_scan(s['video_list_reset_hours'])
+                    if rebuild:
+                        self.status.emit(ident,'正在重建待分析视频列表')
+                        try:
+                            await self.rebuild_video_list(account,b,s)
+                        except BaseException:
+                            # A partial list must not be treated as fresh for a
+                            # full reset interval. The next run rebuilds it.
+                            self.db.save_settings({'video_list_built_at':0})
+                            raise
+                    else:
+                        self.log.emit(account['name']+'：视频列表未到清空时间，已重置逐视频扫描状态')
+                        self.changed.emit()
+                    videos = self.db.video_tasks('pending')
+                    self.log.emit(account['name']+'：本轮待分析视频共 '+str(len(videos))+' 个')
+                    if not videos:
+                        self.status.emit(ident,'本轮没有找到待分析视频')
+                        await asyncio.sleep(s['poll_seconds'])
+                        continue
+                    await self.scan_videos(account,b,ai,videos,s)
+                    for warning in b.warnings:
+                        self.log.emit(warning)
+                    b.warnings.clear()
+                    if not self.db.video_tasks():
+                        self.status.emit(ident,'视频列表为空，立即开始新一轮找视频')
+                        self.log.emit(account['name']+'：待分析视频列表为空，立即重新从全部来源找视频')
+                        continue
                     self.status.emit(ident,'等待下一轮')
                     await asyncio.sleep(s['poll_seconds'])
                 else:

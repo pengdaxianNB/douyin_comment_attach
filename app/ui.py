@@ -13,6 +13,7 @@ from .engine import Engine, DEFAULTS
 from .embedded_browser import EmbeddedBrowser,keep_tab_pages_mounted
 
 STATUS = dict(pending='等待私信',processing='处理中',sent='已私信',failed='失败',skipped='已跳过')
+VIDEO_STATUS = dict(pending='等待扫描',scanning='扫描中',done='已完成',failed='失败')
 BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 
 
@@ -120,6 +121,7 @@ class Window(QMainWindow):
         self.engine.status.connect(self.account_status)
         self.engine.changed.connect(self.refresh_customers)
         self.engine.changed.connect(self.refresh_accounts)
+        self.engine.changed.connect(self.refresh_videos)
         self.engine.changed.connect(self.sync_role_switches)
         self.engine.browser_reset.connect(self.reset_browser_page)
         root = QWidget(); self.setCentralWidget(root)
@@ -147,8 +149,8 @@ class Window(QMainWindow):
         self.build_database()
         self.tabs.currentChanged.connect(lambda: self.refresh_database() if self.tabs.currentWidget() is self.database_page else None)
         self.statusBar().showMessage('站点适配待实号验证 · 登录和验证码请在内嵌浏览器中处理')
-        self.refresh_accounts(); self.refresh_bloggers(); self.refresh_customers()
-        self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_customers); self.timer.timeout.connect(self.refresh_accounts); self.timer.start(4000)
+        self.refresh_accounts(); self.refresh_bloggers(); self.refresh_keywords(); self.refresh_videos(); self.refresh_customers()
+        self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_customers); self.timer.timeout.connect(self.refresh_accounts); self.timer.timeout.connect(self.refresh_videos); self.timer.start(4000)
         if start_engine:
             self.engine.start()
 
@@ -299,23 +301,64 @@ class Window(QMainWindow):
         self.sync_role_switches()
 
     def build_bloggers(self):
-        l = self.page('监控博主')
-        bar = QHBoxLayout(); bar.setSpacing(12); l.addLayout(bar)
-        title = QLabel('监控博主管理'); title.setObjectName('sectionTitle'); bar.addWidget(title); bar.addStretch()
+        l = self.page('视频来源 / 扫描进度')
+        self.video_source_tabs = QTabWidget()
+        self.video_source_tabs.setObjectName('videoSourceTabs')
+        self.video_source_tabs.setDocumentMode(False)
+        self.video_source_tabs.tabBar().setDrawBase(False)
+        self.video_source_tabs.tabBar().setExpanding(False)
+        l.addWidget(self.video_source_tabs,1)
+
+        sources_page = QWidget(); sources_page.setObjectName('subPage')
+        sources = QVBoxLayout(sources_page); sources.setContentsMargins(18,18,18,18); sources.setSpacing(14)
+        self.video_source_tabs.addTab(sources_page,'视频来源配置')
+        bar = QHBoxLayout(); bar.setSpacing(12); sources.addLayout(bar)
+        title = QLabel('指定博主找视频'); title.setObjectName('sectionTitle'); bar.addWidget(title); bar.addStretch()
         add = button('新增博主',self.add_blogger); add.setMinimumWidth(130); bar.addWidget(add)
         self.edit_blogger_button = button('修改备注',self.edit_blogger); self.edit_blogger_button.setProperty('variant','primary'); self.edit_blogger_button.setMinimumWidth(130); bar.addWidget(self.edit_blogger_button)
         self.delete_blogger_button = button('删除博主',self.delete_blogger); bar.addWidget(self.delete_blogger_button)
-        hint = QLabel('选中博主后点击「修改备注」，也可以双击列表中的博主进行修改。'); hint.setObjectName('muted'); l.addWidget(hint)
-        self.bloggers = table(['博主备注','主页 ID']); self.bloggers.setColumnWidth(0,320); l.addWidget(self.bloggers)
+        hint = QLabel('选中博主后点击「修改备注」，也可以双击列表中的博主进行修改。'); hint.setObjectName('muted'); sources.addWidget(hint)
+        self.bloggers = table(['博主备注','主页 ID']); self.bloggers.setColumnWidth(0,320); sources.addWidget(self.bloggers,1)
         self.bloggers.itemDoubleClicked.connect(lambda item:self.edit_blogger())
         self.bloggers.itemSelectionChanged.connect(self.update_blogger_actions)
         self.update_blogger_actions()
-        l.addWidget(QLabel('每轮访问所有博主，检查最近 N 天发布的视频，只采集顶层评论；滚动上限可在设置中调整。'))
+        keyword_bar = QHBoxLayout(); keyword_bar.setSpacing(12); sources.addLayout(keyword_bar)
+        keyword_title = QLabel('关键词找视频'); keyword_title.setObjectName('sectionTitle'); keyword_bar.addWidget(keyword_title)
+        keyword_bar.addStretch()
+        keyword_bar.addWidget(button('新增关键词',self.add_keyword))
+        self.delete_keyword_button = button('删除关键词',self.delete_keyword); keyword_bar.addWidget(self.delete_keyword_button)
+        self.keywords = table(['搜索关键词','发布时间筛选'])
+        self.keywords.setColumnWidth(0,420); sources.addWidget(self.keywords,1)
+        self.keywords.itemSelectionChanged.connect(self.update_keyword_actions)
+        self.update_keyword_actions()
+        source_hint = QLabel('重建清单时先汇总所有来源：博主取设置的最近 N 天，关键词固定打开创作者中心并选择“近7天”。同一作品自动去重。')
+        source_hint.setObjectName('muted'); source_hint.setWordWrap(True); sources.addWidget(source_hint)
+
+        videos_page = QWidget(); videos_page.setObjectName('subPage')
+        videos_layout = QVBoxLayout(videos_page); videos_layout.setContentsMargins(18,18,18,18); videos_layout.setSpacing(14)
+        self.video_source_tabs.addTab(videos_page,'待分析视频')
+        video_bar = QHBoxLayout(); videos_layout.addLayout(video_bar)
+        video_title = QLabel('待分析视频列表'); video_title.setObjectName('sectionTitle'); video_bar.addWidget(video_title)
+        self.video_search = QLineEdit(); self.video_search.setPlaceholderText('按视频标题模糊搜索…')
+        self.video_search.setClearButtonEnabled(True); self.video_search.setMinimumWidth(260)
+        self.video_search.textChanged.connect(self.refresh_videos); video_bar.addWidget(self.video_search)
+        video_bar.addStretch()
+        self.clear_videos_button = button('一键清空',self.clear_videos)
+        self.clear_videos_button.setProperty('variant','danger'); video_bar.addWidget(self.clear_videos_button)
+        self.video_summary = QLabel('共 0 个'); self.video_summary.setObjectName('muted'); video_bar.addWidget(self.video_summary)
+        self.videos = table(['状态','来源','视频标题','作者','发布时间','作品 ID','异常说明'])
+        for col,width in enumerate([100,160,360,140,160,200,280]): self.videos.setColumnWidth(col,width)
+        videos_layout.addWidget(self.videos,1)
+        video_hint = QLabel('列表到期会先清空并重新从全部来源找视频；未到期则保留链接，只重置状态后重新扫描新增评论。')
+        video_hint.setObjectName('muted'); video_hint.setWordWrap(True); videos_layout.addWidget(video_hint)
 
     def update_blogger_actions(self):
         selected = bool(self.bloggers.selectionModel().selectedRows())
         self.edit_blogger_button.setEnabled(selected)
         self.delete_blogger_button.setEnabled(selected)
+
+    def update_keyword_actions(self):
+        self.delete_keyword_button.setEnabled(bool(self.keywords.selectionModel().selectedRows()))
 
     def build_settings(self):
         l = self.page('AI 与任务设置'); forms = {}
@@ -327,7 +370,7 @@ class Window(QMainWindow):
             form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
             forms[name] = form; l.addWidget(group)
         self.fields = {}
-        labels = dict(thinking_mode='DeepSeek 思考模式',thinking_effort='DeepSeek 思考强度',ai_concurrency='评论 AI 并发数（1–20）',days='近期视频：最近 N 天',comment_days='近期评论：最近 N 天',poll_seconds='监控轮询间隔（秒）',scroll_limit='每页最大滚动次数',base_url='AI 接口根地址（含 /v1）',model='模型名称',filter_prompt='目标客户筛选提示词',message_prompt='个性化私信提示词',comment_panel='评论滚动区域 CSS（需实页校准）',message_editor='私信输入框 CSS（需实页校准）')
+        labels = dict(thinking_mode='DeepSeek 思考模式',thinking_effort='DeepSeek 思考强度',ai_concurrency='评论 AI 并发数（1–20）',days='博主近期视频：最近 N 天',comment_days='近期评论：最近 N 天',video_list_reset_hours='视频列表清空重建周期（小时）',poll_seconds='监控轮询间隔（秒）',scroll_limit='每页最大滚动次数',base_url='AI 接口根地址（含 /v1）',model='模型名称',filter_prompt='目标客户筛选提示词',message_prompt='个性化私信提示词',comment_panel='评论滚动区域 CSS（需实页校准）',message_editor='私信输入框 CSS（需实页校准）')
         for k,v in DEFAULTS.items():
             val = self.db.setting(k,v)
             if k in ('thinking_mode','thinking_effort'):
@@ -501,6 +544,31 @@ class Window(QMainWindow):
         self.blogger_rows = self.db.rows('SELECT * FROM bloggers')
         populate(self.bloggers,[[r['name'],r['id']] for r in self.blogger_rows])
 
+    def refresh_keywords(self):
+        self.keyword_rows = self.db.rows('SELECT * FROM keywords ORDER BY id')
+        populate(self.keywords,[[r['keyword'],'近7天'] for r in self.keyword_rows])
+
+    def refresh_videos(self):
+        all_rows = self.db.video_tasks() if hasattr(self.db,'video_tasks') else []
+        query = self.video_search.text().strip().casefold()
+        rows = [row for row in all_rows if query in str(row.get('title','')).casefold()]
+        self.video_rows = rows
+        populate(self.videos,[[VIDEO_STATUS.get(r['status'],r['status']),
+            ('博主：' if r['source_type']=='blogger' else '关键词：')+r['source_name'],
+            r['title'],r['author'],
+            (datetime.fromtimestamp(r['create_time'],BEIJING_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S') if r['create_time'] else ''),
+            r['id'],r['error']] for r in rows])
+        counts = {}
+        for row in rows: counts[row['status']] = counts.get(row['status'],0)+1
+        detail = '，'.join(VIDEO_STATUS[key]+' '+str(counts[key]) for key in VIDEO_STATUS if counts.get(key))
+        prefix = ('显示 '+str(len(rows))+' / 共 '+str(len(all_rows))+' 个'
+                  if query else '共 '+str(len(all_rows))+' 个')
+        self.video_summary.setText(prefix+((' · '+detail) if detail else ''))
+        self.video_source_tabs.setTabText(1,'待分析视频（'+str(len(all_rows))+'）')
+        colors = {'pending':'#80baff','scanning':'#b7a2ff','done':'#62d7b0','failed':'#f48b96'}
+        for i,row in enumerate(rows):
+            self.videos.item(i,0).setForeground(QColor(colors.get(row['status'],'#dbe5f3')))
+
     def refresh_customers(self):
         counts = {r['status']:r['n'] for r in self.db.rows('SELECT status,count(*) n FROM customers GROUP BY status')}
         for key,label in self.metric_values.items():
@@ -587,6 +655,39 @@ class Window(QMainWindow):
         def action():
             r=self.selected(self.bloggers,self.blogger_rows)
             self.db.execute('DELETE FROM bloggers WHERE id=?',(r['id'],)); self.refresh_bloggers()
+        self.report(action)
+
+    def add_keyword(self):
+        def action():
+            value,ok = QInputDialog.getText(self,'新增找视频关键词','关键词：')
+            value = value.strip()
+            if not ok or not value: return
+            inserted = self.db.execute('INSERT OR IGNORE INTO keywords(keyword) VALUES (?)',(value,))
+            if not inserted: raise ValueError('该关键词已存在')
+            self.refresh_keywords()
+            self.statusBar().showMessage('关键词已添加；下次视频清单重建时生效',5000)
+        self.report(action)
+
+    def delete_keyword(self):
+        def action():
+            row = self.selected(self.keywords,self.keyword_rows)
+            self.db.execute('DELETE FROM keywords WHERE id=?',(row['id'],))
+            self.refresh_keywords()
+        self.report(action)
+
+    def clear_videos(self):
+        def action():
+            count = len(self.db.video_tasks())
+            if not count:
+                self.statusBar().showMessage('待分析视频列表已经为空；主号下一轮会重新找视频',5000)
+                return
+            text = (f'确认清空全部 {count} 个待分析视频？\n\n'
+                    '清空后，主号检测到列表为空时会重新从全部博主和关键词来源找视频。')
+            if QMessageBox.question(self,'清空待分析视频',text)!=QMessageBox.StandardButton.Yes:
+                return
+            removed = self.db.clear_videos()
+            self.refresh_videos()
+            self.statusBar().showMessage(f'已清空 {removed} 个视频；主号下一轮将重新找视频',8000)
         self.report(action)
 
     def save_settings(self):

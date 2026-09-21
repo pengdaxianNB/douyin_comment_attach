@@ -106,4 +106,35 @@ class CoreTests(unittest.TestCase):
         self.db.ingest(self.comment(),True,''); p=Path(self.tmp.name)/'backup.sqlite3'; self.db.backup(p)
         self.assertEqual(DB(p).rows('SELECT * FROM customers')[0]['uid'],UID)
 
+    def test_video_list_rebuild_then_reuses_links_inside_reset_window(self):
+        self.assertTrue(self.db.prepare_video_scan(24,now=1000))
+        video=dict(aweme_id='1234567890123456789',desc='测试视频',create_time=900,
+                   author={'nickname':'作者'})
+        self.db.add_video(video,'keyword','糖尿病逆转','糖尿病逆转')
+        self.db.set_video_status(video['aweme_id'],'done')
+
+        self.assertFalse(self.db.prepare_video_scan(24,now=1000+23*3600))
+        row=self.db.video_tasks()[0]
+        self.assertEqual(row['status'],'pending')
+        self.assertEqual(row['title'],'测试视频')
+
+        self.assertTrue(self.db.prepare_video_scan(24,now=1000+24*3600))
+        self.assertEqual(self.db.video_tasks(),[])
+
+    def test_video_list_deduplicates_same_work_across_sources(self):
+        video=dict(aweme_id='1234567890123456789',desc='同一个视频',author={})
+        self.db.add_video(video,'blogger','博主','MS4wLjABAAAAblogger_123456')
+        self.db.add_video(video,'keyword','关键词','关键词')
+        self.assertEqual(len(self.db.video_tasks()),1)
+
+    def test_clearing_video_list_forces_next_pass_to_rebuild(self):
+        video=dict(aweme_id='1234567890123456789',desc='测试视频',author={})
+        self.db.prepare_video_scan(24,now=1000)
+        self.db.add_video(video,'keyword','关键词')
+
+        self.assertEqual(self.db.clear_videos(),1)
+        self.assertEqual(self.db.video_tasks(),[])
+        self.assertIsNone(self.db.setting('video_list_built_at'))
+        self.assertTrue(self.db.prepare_video_scan(24,now=1001))
+
 if __name__=='__main__':unittest.main()

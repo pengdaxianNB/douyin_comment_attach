@@ -2,9 +2,10 @@
 import asyncio
 import json
 from pathlib import Path
+import re
 import time
-from datetime import datetime, timezone
-from urllib.parse import urlparse
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote, urlparse
 from playwright.async_api import Error as PlaywrightError
 
 
@@ -77,6 +78,63 @@ def reached_video_cutoff(packets, cutoff):
         dates.append(timestamp)
     # A batch with an old pinned item before recent videos must not stop scanning.
     return bool(dates) and dates[-1] < cutoff and all(a >= b for a,b in zip(dates,dates[1:]))
+
+
+def creator_search_videos(payload):
+    """Extract video-shaped records from creator-center search JSON.
+
+    Creator Center has changed the nesting and camel/snake-case of this
+    response more than once.  Requiring both a numeric work ID and a title
+    keeps the tolerant traversal from mistaking unrelated analytics IDs for
+    videos.
+    """
+    result = {}
+
+    def visit(value):
+        if isinstance(value,list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value,dict):
+            return
+        nested = next((value.get(key) for key in
+                       ('aweme_info','awemeInfo','video_info','videoInfo','item_info','itemInfo')
+                       if isinstance(value.get(key),dict)),{})
+        candidates = (value,nested)
+        ident = next((item.get(key) for item in candidates for key in
+                      ('aweme_id','awemeId','item_id','itemId','video_id','videoId')
+                      if item.get(key) is not None),None)
+        title = next((item.get(key) for item in candidates for key in
+                      ('desc','title','video_title','videoTitle','item_title','itemTitle','video_name')
+                      if item.get(key)), '')
+        if re.fullmatch(r'\d{8,}',str(ident or '')) and str(title).strip():
+            author = next((item.get(key) for item in candidates for key in
+                           ('author','user','creator') if item.get(key)),{})
+            if not isinstance(author,dict):
+                author = {'nickname':str(author)}
+            if not author:
+                author = {'nickname':str(value.get('nickname') or value.get('author_name') or value.get('authorName') or '')}
+            created = next((item.get(key) for item in candidates for key in
+                            ('create_time','createTime','publish_time','publishTime')
+                            if item.get(key) is not None),0)
+            try:
+                created = int(created or 0)
+                if created > 10_000_000_000:
+                    created //= 1000
+            except (TypeError,ValueError):
+                try:
+                    created = int(datetime.fromisoformat(str(created)).replace(
+                        tzinfo=timezone(timedelta(hours=8))).timestamp())
+                except ValueError:
+                    created = 0
+            result[str(ident)] = dict(aweme_id=str(ident),desc=str(title),author=author,
+                                      create_time=created)
+        for child in value.values():
+            if isinstance(child,(dict,list)):
+                visit(child)
+
+    visit(payload)
+    return list(result.values())
 
 
 def is_send_icon(candidate, editor_rect):
@@ -252,6 +310,91 @@ async def unique_visible(locator):
             if len(visible) > 1:
                 return None
     return visible[0] if visible else None
+
+
+async def smallest_visible_text_control(page, pattern):
+    """Find the tightest visible control/text node matching a flexible label."""
+    candidates = []
+    # Byted's Select renders the selected label as an <input value="…">,
+    # not as a text node. get_by_text() therefore only sees the hidden option
+    # template. Match the live value first.
+    for item in await page.locator('input[placeholder="请选择"]').all():
+        if not await item.is_visible():
+            continue
+        try:
+            value = await item.input_value()
+        except PlaywrightError:
+            continue
+        matched = bool(pattern.search(value)) if hasattr(pattern,'search') else str(pattern) in value
+        if not matched:
+            continue
+        box = await item.bounding_box()
+        if box:
+            candidates.append((box['width']*box['height'],item))
+    # Creator Center currently uses Semi Design selects. Accessible roles are
+    # preferred, while the Byted/Semi class fallbacks tolerate page versions
+    # without a combobox role.
+    for selector in ('[role="combobox"]','.byted-select','.semi-select','[class*="select"]'):
+        for item in await page.locator(selector).filter(has_text=pattern).all():
+            if not await item.is_visible():
+                continue
+            box = await item.bounding_box()
+            if box:
+                candidates.append((box['width']*box['height'],item))
+    if not candidates:
+        for item in await page.get_by_text(pattern).all():
+            if not await item.is_visible():
+                continue
+            box = await item.bounding_box()
+            if box:
+                candidates.append((box['width']*box['height'],item))
+    return min(candidates,key=lambda candidate:candidate[0])[1] if candidates else None
+
+
+async def smallest_visible_text(page, pattern):
+    """Return the smallest visible text match, useful for portal menu items."""
+    candidates = []
+    for item in await page.get_by_text(pattern).all():
+        if not await item.is_visible():
+            continue
+        box = await item.bounding_box()
+        if box:
+            candidates.append((box['width']*box['height'],item))
+    return min(candidates,key=lambda candidate:candidate[0])[1] if candidates else None
+
+
+async def visible_in_page_frames(page, pattern, controls=True):
+    """Find text in the main document or any Creator Center child frame."""
+    finder = smallest_visible_text_control if controls else smallest_visible_text
+    candidates = []
+    for frame in page.frames:
+        try:
+            item = await finder(frame,pattern)
+            if item is None:
+                continue
+            box = await item.bounding_box()
+            if box:
+                candidates.append((box['width']*box['height'],frame,item))
+        except PlaywrightError:
+            # A frame can be replaced while the SPA is still mounting.
+            continue
+    if not candidates:
+        return None,None
+    _,frame,item = min(candidates,key=lambda candidate:candidate[0])
+    return frame,item
+
+
+async def click_visible_control_at_center(page, item):
+    """Click a Byted select without Playwright scrolling it under the header."""
+    target = item
+    trigger = item.locator(
+        'xpath=ancestor::*[contains(concat(" ",normalize-space(@class)," ")," byted-select ")][1]')
+    if await trigger.count() and await trigger.is_visible():
+        target = trigger
+    box = await target.bounding_box()
+    if not box:
+        raise NeedsAttention('发布时间下拉框当前不可见')
+    await page.mouse.click(box['x']+box['width']/2,box['y']+box['height']/2)
 
 
 async def close_open_message_panel(page, guard, log, strict=True):
@@ -689,6 +832,133 @@ class Browser:
                 if int(v.get('create_time',0)) >= cutoff:
                     items[str(v['aweme_id'])] = v
         return list(items.values())
+
+    async def keyword_videos(self, keyword, days=7):
+        """Collect recent videos from Creator Center's keyword search page."""
+        keyword = str(keyword).strip()
+        if not keyword:
+            return []
+        url = ('https://creator.douyin.com/creator-micro/creator-count/'
+               'arithmetic-index/videosearch?query='+quote(keyword)+'&source=creator')
+        items = {}
+        tasks = set()
+
+        async def consume(response):
+            parsed = urlparse(response.url)
+            # Do not ingest unrelated Creator Center widgets (for example the
+            # signed-in creator's own recent works) that may load in parallel.
+            is_video_query = parsed.path.rstrip('/') == '/api/v2/index/itemQuery'
+            if (not is_douyin_host(parsed.hostname)
+                    or (not is_video_query
+                        and 'search' not in (parsed.path+'?'+parsed.query).lower())):
+                return
+            try:
+                payload = await response.json()
+            except Exception:
+                return
+            for video in creator_search_videos(payload):
+                items[str(video['aweme_id'])] = video
+
+        def receive(response):
+            task = asyncio.create_task(consume(response))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+        self.page.on('response',receive)
+        try:
+            await self.page.goto(url,wait_until='domcontentloaded')
+            unlimited_pattern = re.compile(r'发布\s*时间\s*不限')
+            seven_day_pattern = re.compile(r'近\s*7\s*天')
+            search_frame = None
+            publish_filter = current_seven_day = None
+            # DOMContentLoaded is much earlier than the creator SPA's search
+            # controls. Wait up to 20 seconds instead of sampling once at 2s.
+            for _ in range(40):
+                await self.guard()
+                search_frame,publish_filter = await visible_in_page_frames(
+                    self.page,unlimited_pattern,controls=True)
+                if publish_filter is not None:
+                    break
+                search_frame,current_seven_day = await visible_in_page_frames(
+                    self.page,seven_day_pattern,controls=True)
+                if current_seven_day is not None:
+                    break
+                await asyncio.sleep(0.5)
+            if publish_filter is None and current_seven_day is None:
+                try:
+                    path = await self.diagnose_page('keyword-video-filter')
+                    self.log('找视频筛选定位诊断已保存：'+path)
+                except Exception:
+                    pass
+                raise NeedsAttention('找视频页面等待 20 秒仍未出现发布时间筛选；请确认创作者中心已登录，或查看诊断截图')
+            if publish_filter is not None:
+                # The displayed value is an input with pointer-events:none.
+                # A normal locator click auto-scrolls it under the fixed page
+                # header. Click the outer Byted Select at its current position.
+                await click_visible_control_at_center(self.page,publish_filter)
+                seven_day = None
+                for _ in range(20):
+                    await self.guard()
+                    option_frame,seven_day = await visible_in_page_frames(
+                        self.page,seven_day_pattern,controls=False)
+                    if seven_day is not None:
+                        search_frame = option_frame
+                        break
+                    await asyncio.sleep(0.25)
+                if seven_day is None:
+                    raise NeedsAttention('已打开发布时间筛选，但等待 5 秒仍未找到“近7天”选项')
+                await click_visible_control_at_center(self.page,seven_day)
+                # Confirm the dropdown applied before collecting any video.
+                applied = None
+                for _ in range(20):
+                    search_frame,applied = await visible_in_page_frames(
+                        self.page,seven_day_pattern,controls=True)
+                    if applied is not None:
+                        break
+                    await asyncio.sleep(0.25)
+                if applied is None:
+                    raise NeedsAttention('已点击“近7天”，但页面未确认发布时间筛选')
+            await asyncio.sleep(2)
+
+            stale = 0
+            for _ in range(self.s['scroll_limit']):
+                await self.guard()
+                if tasks:
+                    await asyncio.gather(*list(tasks))
+                before = len(items)
+                # Some page versions expose the final Douyin URL directly in
+                # the card/detail DOM. Merge those links with response data.
+                for frame in self.page.frames:
+                    try:
+                        anchors = await frame.locator('a[href*="douyin.com/video/"]').all()
+                    except PlaywrightError:
+                        continue
+                    for anchor in anchors:
+                        href = await anchor.get_attribute('href') or ''
+                        match = re.search(r'/video/(\d{8,})',href)
+                        if not match:
+                            continue
+                        ident = match.group(1)
+                        title = ' '.join((await anchor.inner_text()).split())
+                        items.setdefault(ident,dict(aweme_id=ident,desc=title,author={},create_time=0))
+                await self.page.mouse.move(700,600)
+                await self.page.mouse.wheel(0,1000)
+                await asyncio.sleep(2)
+                stale = stale+1 if len(items)==before else 0
+                if stale >= 4:
+                    break
+            if tasks:
+                await asyncio.gather(*list(tasks))
+        finally:
+            self.page.remove_listener('response',receive)
+            if tasks:
+                await asyncio.gather(*list(tasks),return_exceptions=True)
+
+        cutoff = time.time()-max(1,int(days))*86400
+        # The site-side “近7天” filter is authoritative when a response omits
+        # publish time. Known timestamps receive the same local safety filter.
+        return [video for video in items.values()
+                if not video.get('create_time') or int(video['create_time']) >= cutoff]
 
     async def comments(self, video):
         video_id = str(video['aweme_id'])

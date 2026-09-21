@@ -1,11 +1,27 @@
 import asyncio
 from unittest.mock import AsyncMock
 from types import SimpleNamespace
-from app.browser import Browser,is_douyin_host,reached_video_cutoff
+from app.browser import Browser,creator_search_videos,is_douyin_host,reached_video_cutoff
 
 
 def packet(*videos):
     return [{'aweme_list':list(videos),'has_more':True}]
+
+
+def test_creator_search_parser_accepts_nested_schema_variants_and_ignores_analytics_ids():
+    payload={'data':{'list':[
+        {'itemId':'1234567890123456789','title':'控糖方法','publishTime':1700000000000,
+         'creator':{'nickname':'医生甲'}},
+        {'item_id':'2234567890123456789','item_title':'饮食建议',
+         'nickname':'医生乙','createTime':'2026-09-18 15:26:39'},
+        {'item_id':'3234567890123456789','score':99},
+    ]}}
+    rows={row['aweme_id']:row for row in creator_search_videos(payload)}
+    assert set(rows)=={'1234567890123456789','2234567890123456789'}
+    assert rows['1234567890123456789']['create_time']==1700000000
+    assert rows['1234567890123456789']['author']['nickname']=='医生甲'
+    assert rows['2234567890123456789']['author']['nickname']=='医生乙'
+    assert rows['2234567890123456789']['create_time']>0
 
 
 def test_boundary():

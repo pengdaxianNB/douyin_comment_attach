@@ -1,11 +1,14 @@
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.browser import Browser, CommentPageUnavailable, unique_visible
+from app.browser import (Browser, CommentPageUnavailable, click_visible_control_at_center,
+                         smallest_visible_text_control, unique_visible, visible_in_page_frames)
+from app.db import DB
 from app.engine import Engine, recent_comments
 
 
@@ -48,6 +51,52 @@ def test_unique_visible_ignores_hidden_duplicate_panel():
     )
 
     assert asyncio.run(unique_visible(locator)) is shown
+
+
+def test_creator_filter_lookup_searches_child_frames():
+    item=SimpleNamespace(bounding_box=AsyncMock(return_value={'width':180,'height':44}))
+    page=SimpleNamespace(frames=[object(),object()])
+    with patch('app.browser.smallest_visible_text_control',new=AsyncMock(
+            side_effect=[None,item])) as finder:
+        frame,found=asyncio.run(visible_in_page_frames(page,'发布时间不限'))
+
+    assert frame is page.frames[1]
+    assert found is item
+    assert finder.await_count==2
+
+
+def test_creator_filter_matches_visible_byted_select_input_value():
+    item=SimpleNamespace(
+        is_visible=AsyncMock(return_value=True),
+        input_value=AsyncMock(return_value='发布时间不限'),
+        bounding_box=AsyncMock(return_value={'width':100,'height':22}),
+    )
+    empty=SimpleNamespace(all=AsyncMock(return_value=[]))
+    empty.filter=lambda **kwargs:empty
+    page=SimpleNamespace(
+        locator=lambda selector: SimpleNamespace(all=AsyncMock(return_value=[item]))
+            if selector=='input[placeholder="请选择"]' else empty,
+        get_by_text=lambda pattern:empty,
+    )
+
+    found=asyncio.run(smallest_visible_text_control(
+        page,re.compile(r'发布\s*时间\s*不限')))
+
+    assert found is item
+
+
+def test_creator_filter_clicks_outer_select_without_auto_scroll():
+    trigger=SimpleNamespace(
+        count=AsyncMock(return_value=1),
+        is_visible=AsyncMock(return_value=True),
+        bounding_box=AsyncMock(return_value={'x':100,'y':200,'width':140,'height':34}),
+    )
+    item=SimpleNamespace(locator=lambda selector:trigger)
+    page=SimpleNamespace(mouse=SimpleNamespace(click=AsyncMock()))
+
+    asyncio.run(click_visible_control_at_center(page,item))
+
+    page.mouse.click.assert_awaited_once_with(170,217)
 
 
 def test_comments_retry_with_backoff_when_panel_is_temporarily_missing(monkeypatch):
@@ -131,3 +180,39 @@ def test_scan_keeps_running_after_three_consecutive_comment_page_failures(tmp_pa
     assert browser.comments.await_count == 4
     sleep.assert_awaited_once_with(10)
     assert any('保持任务运行' in line for line in logs)
+
+
+def test_scan_updates_persisted_video_statuses(tmp_path):
+    db=DB(tmp_path/'test.sqlite3')
+    good={'aweme_id':'1234567890123456789','desc':'正常视频','author':{}}
+    bad={'aweme_id':'2234567890123456789','desc':'失败视频','author':{}}
+    db.add_video(good,'keyword','控糖')
+    db.add_video(bad,'keyword','控糖')
+    engine=Engine(db,tmp_path)
+    browser=SimpleNamespace(comments=AsyncMock(side_effect=[[],CommentPageUnavailable('评论区未就绪')]))
+
+    with patch('app.engine.classify_comments',new=AsyncMock()):
+        asyncio.run(engine.scan_videos({'name':'主号'},browser,SimpleNamespace(),[good,bad],
+                                       {'ai_concurrency':5,'comment_days':7}))
+
+    statuses={row['id']:(row['status'],row['error']) for row in db.video_tasks()}
+    assert statuses[good['aweme_id']]==('done','')
+    assert statuses[bad['aweme_id']][0]=='failed'
+    assert '评论区未就绪' in statuses[bad['aweme_id']][1]
+
+
+def test_scan_abandons_cached_work_when_video_list_was_cleared(tmp_path):
+    db=DB(tmp_path/'test.sqlite3')
+    video={'aweme_id':'1234567890123456789','desc':'旧列表视频','author':{}}
+    db.add_video(video,'keyword','控糖')
+    cached=db.video_tasks()
+    db.clear_videos()
+    engine=Engine(db,tmp_path)
+    logs=[];engine.log.connect(logs.append)
+    browser=SimpleNamespace(comments=AsyncMock())
+
+    asyncio.run(engine.scan_videos({'name':'主号'},browser,SimpleNamespace(),cached,
+                                   {'ai_concurrency':5,'comment_days':7}))
+
+    browser.comments.assert_not_awaited()
+    assert any('列表已清空' in line for line in logs)

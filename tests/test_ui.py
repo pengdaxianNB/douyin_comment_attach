@@ -24,6 +24,9 @@ def test_window():
         w.show(); app.processEvents()
         assert w.tabs.count()==7
         assert any(w.tabs.tabText(i)=='内嵌浏览器' for i in range(w.tabs.count()))
+        assert w.video_source_tabs.count()==2
+        assert w.video_source_tabs.tabText(0)=='视频来源配置'
+        assert w.video_source_tabs.tabText(1)=='待分析视频（0）'
         assert w.fields['base_url'].text()==''
         assert w.fields['comment_days'].value()==7
         assert w.customers.rowCount()==0
@@ -34,6 +37,18 @@ def test_window():
         assert w.customers.item(0,3).text()=='2026-09-14 16:00:00'
         w.filter.setCurrentIndex(3)
         assert w.customers.rowCount()==0
+        db.add_video({'aweme_id':'1234567890123456789','desc':'七天控糖方法','author':{}},
+                     'keyword','控糖')
+        w.refresh_videos()
+        assert w.videos.rowCount()==1
+        assert w.video_source_tabs.tabText(1)=='待分析视频（1）'
+        w.video_search.setText('控糖')
+        assert w.videos.rowCount()==1
+        w.video_search.setText('不存在的标题')
+        assert w.videos.rowCount()==0
+        assert '显示 0 / 共 1 个' in w.video_summary.text()
+        w.video_search.clear()
+        assert w.videos.rowCount()==1
         w.close(); app.processEvents()
 
 
@@ -54,6 +69,24 @@ def test_requeue_all_failed_from_customer_toolbar(tmp_path,monkeypatch):
     assert questions and '全部 1 位失败客户' in questions[0] and '避免重复私信' in questions[0]
     assert '已将 1 位失败客户重新排队' in w.statusBar().currentMessage()
     w.close(); app.processEvents()
+
+
+def test_clear_video_list_button_forces_source_rebuild(tmp_path,monkeypatch):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    db.prepare_video_scan(24,now=1000)
+    db.add_video({'aweme_id':'1234567890123456789','desc':'待清空视频','author':{}},
+                 'keyword','控糖')
+    w=Window(db,tmp_path,start_engine=False)
+    monkeypatch.setattr(QMessageBox,'question',lambda *args:QMessageBox.StandardButton.Yes)
+
+    w.clear_videos()
+
+    assert db.video_tasks()==[]
+    assert db.setting('video_list_built_at') is None
+    assert w.videos.rowCount()==0
+    assert '主号下一轮将重新找视频' in w.statusBar().currentMessage()
+    w.close();app.processEvents()
 
 
 def test_send_attempt_remains_in_processing_metric(tmp_path):
