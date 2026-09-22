@@ -329,17 +329,32 @@ class Engine(QThread):
         manual_videos = self.db.rows('SELECT * FROM manual_videos ORDER BY added_at,id')
         if not bloggers and not keywords and not manual_videos:
             raise ValueError('请先添加关键词、监控博主或手动视频链接')
+        complete = True
         for row in keywords:
             keyword = row['keyword']
             self.status.emit(account['id'],'关键词找视频：'+keyword)
-            videos = await browser.keyword_videos(keyword,7)
+            try:
+                videos = await browser.keyword_videos(keyword,7)
+            except AccountNeedsAttention:
+                raise
+            except NeedsAttention as exc:
+                complete = False
+                self.log.emit(account['name']+f'：关键词“{keyword}”视频获取失败，已跳过并继续其他来源：{exc}')
+                continue
             for video in videos:
                 self.db.add_video(video,'keyword',keyword,keyword)
             self.log.emit('关键词“'+keyword+'”：近 7 天已加入待分析视频 '+str(len(videos))+' 个')
             self.changed.emit()
         for blogger in bloggers:
             self.status.emit(account['id'],'整理视频：'+blogger['name'])
-            videos = await browser.videos(blogger['id'],settings['days'])
+            try:
+                videos = await browser.videos(blogger['id'],settings['days'])
+            except AccountNeedsAttention:
+                raise
+            except NeedsAttention as exc:
+                complete = False
+                self.log.emit(account['name']+f'：博主“{blogger["name"]}”视频获取失败，已跳过并继续其他来源：{exc}')
+                continue
             for video in videos:
                 self.db.add_video(video,'blogger',blogger['name'],blogger['id'])
             self.log.emit(blogger['name']+'：已加入待分析视频 '+str(len(videos))+' 个')
@@ -350,6 +365,7 @@ class Engine(QThread):
         if manual_videos:
             self.log.emit('手动录入：已加入待分析视频 '+str(len(manual_videos))+' 个')
             self.changed.emit()
+        return complete
 
     async def work(self, account):
         ident = account['id']
@@ -372,7 +388,12 @@ class Engine(QThread):
                     if rebuild:
                         self.status.emit(ident,'正在重建待分析视频列表')
                         try:
-                            await self.rebuild_video_list(account,b,s)
+                            complete = await self.rebuild_video_list(account,b,s)
+                            if not complete:
+                                # Keep the successfully discovered subset for
+                                # this pass, but retry all sources next round.
+                                self.db.save_settings({'video_list_built_at':0})
+                                self.log.emit(account['name']+'：本次视频列表获取不完整，已保留成功结果，下一轮会自动重新获取')
                         except BaseException:
                             # A partial list must not be treated as fresh for a
                             # full reset interval. The next run rebuilds it.

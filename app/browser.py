@@ -746,6 +746,7 @@ class Browser:
         packets = []
         stopped_at_boundary = False
         errors = []
+        recovered_errors = []
         tasks = set()
         async def consume(response):
             parsed = urlparse(response.url)
@@ -809,25 +810,29 @@ class Browser:
                     break
             if tasks:
                 await asyncio.gather(*list(tasks))
-            if errors:
-                raise NeedsAttention(errors[0])
             if not packets:
                 # A long comment list can occasionally leave Douyin's SPA in
                 # an empty feed state. Re-open the intended URL once so that a
                 # transient black page does not stop the main account task.
-                self.log('没有捕获到页面数据，正在重新打开当前页面重试')
+                recovered_errors.extend(errors)
+                errors.clear()
+                detail = '（'+recovered_errors[0]+'）' if recovered_errors else ''
+                self.log('没有捕获到页面数据'+detail+'，正在重新打开当前页面重试')
                 await self.page.goto(url,wait_until='domcontentloaded')
                 await asyncio.sleep(3)
                 await self.guard()
                 if tasks:
                     await asyncio.gather(*list(tasks))
-                if errors:
-                    raise NeedsAttention(errors[0])
                 if not packets:
+                    if errors or recovered_errors:
+                        raise NeedsAttention((errors or recovered_errors)[0])
                     error = '刷新重试后仍没有捕获到页面数据'
                     if key == 'comments':
                         raise CommentPageUnavailable(error)
                     raise NeedsAttention(error+'，请检查登录、页面结构及站点适配')
+            ignored_errors = recovered_errors + errors
+            if ignored_errors:
+                self.warnings.append(f'已忽略 {len(ignored_errors)} 个异常页面响应，有效数据已正常采集')
             stopped_at_boundary = stopped_at_boundary or bool(stop_when and stop_when(packets))
             if stopped_at_boundary:
                 self.warnings.append('作品扫描已到设定日期边界，停止加载更早作品')

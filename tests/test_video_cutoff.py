@@ -112,3 +112,36 @@ def test_capture_reopens_page_once_when_first_navigation_has_no_data(monkeypatch
     assert result==[payload]
     assert visits==2
     assert '重新打开当前页面重试' in logs[0]
+
+
+def test_capture_recovers_when_first_matching_response_is_not_json(monkeypatch):
+    payload={'aweme_list':[],'has_more':False}
+    callback=None
+    visits=0
+    logs=[]
+    page=SimpleNamespace(mouse=SimpleNamespace(move=AsyncMock(),wheel=AsyncMock()))
+    def on(event,fn):
+        nonlocal callback
+        callback=fn
+    async def goto(*args,**kwargs):
+        nonlocal visits
+        visits+=1
+        response=(SimpleNamespace(
+            url='https://www.douyin.com/aweme/v1/web/aweme/post/',
+            json=AsyncMock(side_effect=ValueError('empty body')))
+            if visits==1 else SimpleNamespace(
+                url='https://www.douyin.com/aweme/v1/web/aweme/post/',
+                json=AsyncMock(return_value=payload)))
+        callback(response)
+    page.on=on;page.goto=goto;page.remove_listener=lambda *args:None
+    browser=Browser(SimpleNamespace(pages=[page]),{},log=logs.append)
+    browser.guard=AsyncMock()
+    monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
+
+    result=asyncio.run(browser.capture(
+        'https://www.douyin.com/user/test','/aweme/v1/web/aweme/post/','aweme_list',0))
+
+    assert result==[payload]
+    assert visits==2
+    assert '页面响应无法解析' in logs[0]
+    assert any('有效数据已正常采集' in warning for warning in browser.warnings)

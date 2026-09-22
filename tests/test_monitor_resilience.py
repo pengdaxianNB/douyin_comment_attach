@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from playwright.async_api import Error as PlaywrightError
 
-from app.browser import (Browser, CommentPageUnavailable, VideoUnavailable, click_visible_control_at_center,
+from app.browser import (Browser, CommentPageUnavailable, VideoUnavailable, NeedsAttention, click_visible_control_at_center,
                          smallest_visible_text_control, unique_visible, visible_in_page_frames)
 from app.db import DB
 from app.engine import Engine, recent_comments
@@ -345,3 +345,23 @@ def test_rebuild_scans_keywords_before_bloggers(tmp_path):
 
     assert order==[('keyword','控糖'),('blogger','blogger-id')]
     assert {row['source_type'] for row in db.video_tasks()}=={'keyword','blogger','manual'}
+
+
+def test_rebuild_skips_one_blogger_with_unparseable_response(tmp_path):
+    db=DB(tmp_path/'test.sqlite3')
+    db.execute("INSERT INTO bloggers(id,name) VALUES ('bad-id','A 异常博主')")
+    db.execute("INSERT INTO bloggers(id,name) VALUES ('good-id','B 正常博主')")
+    good={'aweme_id':'1234567890123456789','desc':'正常视频','author':{}}
+    browser=SimpleNamespace(videos=AsyncMock(side_effect=[
+        NeedsAttention('页面响应无法解析'),[good],
+    ]))
+    engine=Engine(db,tmp_path)
+    logs=[];engine.log.connect(logs.append)
+
+    complete=asyncio.run(engine.rebuild_video_list(
+        {'id':'main','name':'主号'},browser,{'days':7}))
+
+    assert complete is False
+    assert browser.videos.await_count==2
+    assert [row['id'] for row in db.video_tasks()]==[good['aweme_id']]
+    assert any('A 异常博主' in line and '继续其他来源' in line for line in logs)
