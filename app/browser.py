@@ -23,6 +23,11 @@ class CommentPageUnavailable(NeedsAttention):
     pass
 
 
+class VideoUnavailable(CommentPageUnavailable):
+    """页面已明确提示作品不存在或已失效。"""
+    pass
+
+
 class UncertainSend(RuntimeError):
     pass
 
@@ -719,6 +724,17 @@ class Browser:
                 await asyncio.gather(*list(tasks))
             if packets:
                 return await unique_visible(panel_locator) if panel_locator is not None else None
+            # Deleted/removed works never expose a comment API or
+            # panel.  Detect the site's terminal empty-state instead of
+            # spending all comment retries waiting on a panel that cannot
+            # appear.
+            get_by_text = getattr(self.page,'get_by_text',None)
+            if get_by_text is not None:
+                for text in ('你要观看的视频不存在','视频不存在','作品不存在',
+                             '视频已删除','作品已删除','视频已下架','作品已下架'):
+                    notice = get_by_text(text,exact=True)
+                    if await notice.count() and await notice.first.is_visible():
+                        raise VideoUnavailable('视频已失效：页面提示“'+text+'”')
             panel = await unique_visible(panel_locator) if panel_locator is not None else None
             if panel is not None:
                 return panel
@@ -966,6 +982,10 @@ class Browser:
             try:
                 packets = await self.capture('https://www.douyin.com/video/'+video_id,'/aweme/v1/web/comment/list/','comments',self.s['scroll_limit'])
                 break
+            except VideoUnavailable:
+                # This is a terminal page state, so reopening the same URL
+                # cannot make its comments available.
+                raise
             except CommentPageUnavailable:
                 if attempt + 1 >= COMMENT_CAPTURE_ATTEMPTS:
                     raise

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.browser import (Browser, CommentPageUnavailable, click_visible_control_at_center,
+from app.browser import (Browser, CommentPageUnavailable, VideoUnavailable, click_visible_control_at_center,
                          smallest_visible_text_control, unique_visible, visible_in_page_frames)
 from app.db import DB
 from app.engine import Engine, recent_comments
@@ -125,6 +125,34 @@ def test_comments_retry_with_backoff_when_panel_is_temporarily_missing(monkeypat
     assert '第 3/3 次' in logs[1]
 
 
+def test_comments_immediately_skips_explicitly_missing_video(monkeypatch):
+    panel = SimpleNamespace(count=AsyncMock(return_value=0))
+    missing = SimpleNamespace(
+        count=AsyncMock(return_value=1),
+        first=SimpleNamespace(is_visible=AsyncMock(return_value=True)),
+    )
+    absent = SimpleNamespace(count=AsyncMock(return_value=0))
+    page = SimpleNamespace(
+        goto=AsyncMock(),
+        locator=lambda selector: panel,
+        get_by_text=lambda text,exact=True: missing
+            if text=='你要观看的视频不存在' else absent,
+        on=lambda *args: None,
+        remove_listener=lambda *args: None,
+    )
+    browser = Browser(SimpleNamespace(pages=[page]),
+                      {'comment_panel':'#comments','scroll_limit':1},log=lambda text: None)
+    browser.guard = AsyncMock()
+    sleep = AsyncMock()
+    monkeypatch.setattr('app.browser.asyncio.sleep',sleep)
+
+    with pytest.raises(VideoUnavailable,match='视频已失效'):
+        asyncio.run(browser.comments({'aweme_id':'123'}))
+
+    page.goto.assert_awaited_once()
+    sleep.assert_not_awaited()
+
+
 def test_scan_skips_one_bad_video_and_continues(tmp_path):
     engine = Engine(SimpleNamespace(),tmp_path)
     logs = []
@@ -199,6 +227,34 @@ def test_scan_updates_persisted_video_statuses(tmp_path):
     assert statuses[good['aweme_id']]==('done','')
     assert statuses[bad['aweme_id']][0]=='failed'
     assert '评论区未就绪' in statuses[bad['aweme_id']][1]
+
+
+def test_scan_permanently_skips_missing_video_and_continues(tmp_path):
+    db=DB(tmp_path/'test.sqlite3')
+    missing={'aweme_id':'1234567890123456789','desc':'已删除视频','author':{}}
+    good={'aweme_id':'2234567890123456789','desc':'正常视频','author':{}}
+    db.add_video(missing,'keyword','控糖')
+    db.add_video(good,'keyword','控糖')
+    engine=Engine(db,tmp_path)
+    logs=[];engine.log.connect(logs.append)
+    browser=SimpleNamespace(comments=AsyncMock(side_effect=[
+        VideoUnavailable('视频已失效：页面提示“视频不存在”'),[],
+    ]))
+
+    with patch('app.engine.classify_comments',new=AsyncMock()):
+        asyncio.run(engine.scan_videos({'name':'主号'},browser,SimpleNamespace(),[missing,good],
+                                       {'ai_concurrency':5,'comment_days':7}))
+
+    statuses={row['id']:(row['status'],row['error']) for row in db.video_tasks()}
+    assert statuses[missing['aweme_id']][0]=='failed'
+    assert statuses[good['aweme_id']]==('done','')
+    assert any('已标记并继续下一个' in line for line in logs)
+
+    db.save_settings({'video_list_built_at':1000})
+    assert db.prepare_video_scan(24,now=1001) is False
+    statuses={row['id']:row['status'] for row in db.video_tasks()}
+    assert statuses[missing['aweme_id']]=='failed'
+    assert statuses[good['aweme_id']]=='pending'
 
 
 def test_scan_abandons_cached_work_when_video_list_was_cleared(tmp_path):

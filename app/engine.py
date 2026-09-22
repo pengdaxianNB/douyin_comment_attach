@@ -7,7 +7,7 @@ from PySide6.QtCore import QThread, Signal
 from playwright.async_api import async_playwright, Error as PlaywrightError
 from playwright._impl._async_base import mapping as async_api_mapping
 from .ai import AI, get_key
-from .browser import Browser, AccountNeedsAttention, CommentPageUnavailable, NeedsAttention, UncertainSend, SkippedCustomer, PrivateAccount
+from .browser import Browser, AccountNeedsAttention, CommentPageUnavailable, VideoUnavailable, NeedsAttention, UncertainSend, SkippedCustomer, PrivateAccount
 from .classifier import classify_comments
 from .embedded_browser import MARKER_PREFIX, page_id, unregister_page
 
@@ -210,6 +210,7 @@ class Engine(QThread):
         """跳过暂时未就绪的单视频，不让慢加载终止整个监控任务。"""
         consecutive_failures = 0
         failed_videos = 0
+        unavailable_videos = 0
         expired_comments = 0
         for video in videos:
             video_id = str(video.get('aweme_id') or video.get('id') or '')
@@ -226,6 +227,17 @@ class Engine(QThread):
                 self.changed.emit()
             try:
                 comments = await browser.comments(video)
+            except VideoUnavailable as exc:
+                unavailable_videos += 1
+                consecutive_failures = 0
+                video_id = str(video.get('aweme_id','未知'))
+                title = ' '.join(str(video.get('desc','')).split())[:40]
+                detail = f' · {title}' if title else ''
+                if tracking:
+                    self.db.set_video_status(video_id,'failed',str(exc))
+                    self.changed.emit()
+                self.log.emit(f'{account["name"]}：视频 {video_id}{detail} 已失效，已标记并继续下一个：{exc}')
+                continue
             except CommentPageUnavailable as exc:
                 consecutive_failures += 1
                 failed_videos += 1
@@ -274,6 +286,8 @@ class Engine(QThread):
             self.log.emit(f'{account["name"]}：本轮已过滤 {expired_comments} 条超过最近 {days} 天的评论，未提交 AI 分析')
         if failed_videos:
             self.log.emit(f'{account["name"]}：本轮有 {failed_videos} 个视频评论区未就绪，已跳过并保持任务运行，下轮自动重试')
+        if unavailable_videos:
+            self.log.emit(f'{account["name"]}：本轮发现 {unavailable_videos} 个已失效视频，当前列表不再重试')
 
     async def rebuild_video_list(self, account, browser, settings):
         """Discover videos from every configured source before comment scans."""

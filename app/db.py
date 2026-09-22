@@ -134,7 +134,11 @@ class DB:
                 c.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)',
                           ('video_list_built_at',json.dumps(current)))
             else:
-                c.execute("UPDATE videos SET status='pending',error='',scanned_at=NULL")
+                # Explicitly missing/deleted works are terminal for the
+                # current discovered list.  Keep them out of every polling
+                # pass until the normal list rebuild rediscovers sources.
+                c.execute("""UPDATE videos SET status='pending',error='',scanned_at=NULL
+                             WHERE error NOT LIKE '视频已失效：%'""")
         return rebuild
 
     def clear_videos(self):
