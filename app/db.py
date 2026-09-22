@@ -116,8 +116,9 @@ class DB:
         """Prepare one monitoring pass and report whether sources must be rebuilt.
 
         A fresh list is rebuilt after ``reset_hours``.  Inside that window the
-        same videos are retained and only their per-pass status is reset, so a
-        user can see exactly which videos the current pass has completed.
+        same videos are retained.  An interrupted pass keeps its completed and
+        pending statuses for resume; only a fully finished pass is reset for a
+        new comment polling round.
         """
         current = float(time.time() if now is None else now)
         reset_after = max(1, int(reset_hours)) * 3600
@@ -134,11 +135,18 @@ class DB:
                 c.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)',
                           ('video_list_built_at',json.dumps(current)))
             else:
+                # A task can be interrupted between marking a video as
+                # scanning and restoring it to pending. Recover that one item
+                # before deciding whether this is a resume or a new pass.
+                c.execute("UPDATE videos SET status='pending',error='' WHERE status='scanning'")
+                unfinished = c.execute(
+                    "SELECT 1 FROM videos WHERE status='pending' LIMIT 1").fetchone()
                 # Explicitly missing/deleted works are terminal for the
                 # current discovered list.  Keep them out of every polling
                 # pass until the normal list rebuild rediscovers sources.
-                c.execute("""UPDATE videos SET status='pending',error='',scanned_at=NULL
-                             WHERE error NOT LIKE '视频已失效：%'""")
+                if not unfinished:
+                    c.execute("""UPDATE videos SET status='pending',error='',scanned_at=NULL
+                                 WHERE error NOT LIKE '视频已失效：%'""")
         return rebuild
 
     def clear_videos(self):

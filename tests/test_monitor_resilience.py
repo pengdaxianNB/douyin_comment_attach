@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 
 from app.browser import (Browser, CommentPageUnavailable, VideoUnavailable, click_visible_control_at_center,
                          smallest_visible_text_control, unique_visible, visible_in_page_frames)
@@ -208,6 +209,56 @@ def test_scan_keeps_running_after_three_consecutive_comment_page_failures(tmp_pa
     assert browser.comments.await_count == 4
     sleep.assert_awaited_once_with(10)
     assert any('保持任务运行' in line for line in logs)
+
+
+def test_scan_rebuilds_frozen_main_browser_and_retries_current_video(tmp_path):
+    db=DB(tmp_path/'test.sqlite3')
+    video={'aweme_id':'1234567890123456789','desc':'待恢复视频','author':{}}
+    db.add_video(video,'keyword','控糖')
+    engine=Engine(db,tmp_path)
+    logs=[];engine.log.connect(logs.append)
+    frozen=SimpleNamespace(comments=AsyncMock(
+        side_effect=PlaywrightError('Timeout 30000ms exceeded')))
+    recovered=SimpleNamespace(comments=AsyncMock(return_value=[]),s=None)
+    engine.rebuild_browser=AsyncMock(return_value=recovered)
+
+    with patch('app.engine.classify_comments',new=AsyncMock()):
+        result=asyncio.run(engine.scan_videos(
+            {'id':'main','name':'主号'},frozen,SimpleNamespace(),[video],
+            {'ai_concurrency':5,'comment_days':7}))
+
+    assert result is recovered
+    engine.rebuild_browser.assert_awaited_once()
+    recovered.comments.assert_awaited_once_with(video)
+    assert db.video_tasks()[0]['status']=='done'
+    assert any('重试当前视频' in line for line in logs)
+
+
+def test_scan_skips_video_after_second_browser_freeze_and_continues(tmp_path):
+    db=DB(tmp_path/'test.sqlite3')
+    bad={'aweme_id':'1234567890123456789','desc':'两次超时','author':{}}
+    good={'aweme_id':'2234567890123456789','desc':'后续视频','author':{}}
+    db.add_video(bad,'keyword','控糖')
+    db.add_video(good,'keyword','控糖')
+    first=SimpleNamespace(comments=AsyncMock(
+        side_effect=PlaywrightError('first timeout')))
+    retry=SimpleNamespace(comments=AsyncMock(
+        side_effect=PlaywrightError('second timeout')),s=None)
+    final=SimpleNamespace(comments=AsyncMock(return_value=[]),s=None)
+    engine=Engine(db,tmp_path)
+    engine.rebuild_browser=AsyncMock(side_effect=[retry,final])
+
+    with patch('app.engine.classify_comments',new=AsyncMock()):
+        result=asyncio.run(engine.scan_videos(
+            {'id':'main','name':'主号'},first,SimpleNamespace(),[bad,good],
+            {'ai_concurrency':5,'comment_days':7}))
+
+    assert result is final
+    assert engine.rebuild_browser.await_count==2
+    statuses={row['id']:(row['status'],row['error']) for row in db.video_tasks()}
+    assert statuses[bad['aweme_id']][0]=='failed'
+    assert '重建后重试仍失败' in statuses[bad['aweme_id']][1]
+    assert statuses[good['aweme_id']]==('done','')
 
 
 def test_scan_updates_persisted_video_statuses(tmp_path):

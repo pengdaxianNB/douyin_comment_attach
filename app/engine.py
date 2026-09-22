@@ -207,9 +207,10 @@ class Engine(QThread):
         self.status.emit(ident,'已停止')
 
     async def scan_videos(self, account, browser, ai, videos, settings):
-        """跳过暂时未就绪的单视频，不让慢加载终止整个监控任务。"""
+        """跳过单视频异常，页面卡死时重建浏览器后继续队列。"""
         consecutive_failures = 0
         failed_videos = 0
+        browser_failed_videos = 0
         unavailable_videos = 0
         expired_comments = 0
         for video in videos:
@@ -222,46 +223,75 @@ class Engine(QThread):
                 video = dict(video,aweme_id=video_id,desc=video.get('title',''),
                              author={'nickname':video.get('author','')})
             tracking = bool(video_id and hasattr(self.db,'set_video_status'))
-            if tracking:
-                self.db.set_video_status(video_id,'scanning')
-                self.changed.emit()
-            try:
-                comments = await browser.comments(video)
-            except VideoUnavailable as exc:
-                unavailable_videos += 1
-                consecutive_failures = 0
-                video_id = str(video.get('aweme_id','未知'))
-                title = ' '.join(str(video.get('desc','')).split())[:40]
-                detail = f' · {title}' if title else ''
+            browser_restarts = 0
+            while True:
                 if tracking:
-                    self.db.set_video_status(video_id,'failed',str(exc))
+                    self.db.set_video_status(video_id,'scanning')
                     self.changed.emit()
-                self.log.emit(f'{account["name"]}：视频 {video_id}{detail} 已失效，已标记并继续下一个：{exc}')
+                try:
+                    comments = await browser.comments(video)
+                    break
+                except VideoUnavailable as exc:
+                    unavailable_videos += 1
+                    consecutive_failures = 0
+                    title = ' '.join(str(video.get('desc','')).split())[:40]
+                    detail = f' · {title}' if title else ''
+                    if tracking:
+                        self.db.set_video_status(video_id,'failed',str(exc))
+                        self.changed.emit()
+                    self.log.emit(f'{account["name"]}：视频 {video_id or "未知"}{detail} 已失效，已标记并继续下一个：{exc}')
+                    comments = None
+                    break
+                except CommentPageUnavailable as exc:
+                    consecutive_failures += 1
+                    failed_videos += 1
+                    title = ' '.join(str(video.get('desc','')).split())[:40]
+                    detail = f' · {title}' if title else ''
+                    if tracking:
+                        self.db.set_video_status(video_id,'failed',str(exc))
+                        self.changed.emit()
+                    self.log.emit(f'{account["name"]}：已跳过视频 {video_id or "未知"}{detail}：{exc}')
+                    if consecutive_failures == 3:
+                        self.log.emit(f'{account["name"]}：连续 3 个视频加载失败，暂停 10 秒后继续；本轮跳过的视频下轮会自动重试')
+                        await asyncio.sleep(10)
+                    comments = None
+                    break
+                except asyncio.CancelledError:
+                    if tracking:
+                        self.db.set_video_status(video_id,'pending')
+                        self.changed.emit()
+                    raise
+                except (PlaywrightError, asyncio.TimeoutError) as exc:
+                    # A frozen renderer makes subsequent navigations fail as
+                    # well. Rebuild the account page and retry this exact
+                    # video once; after a second failure rebuild once more for
+                    # the next video and leave this item failed.
+                    browser_restarts += 1
+                    if tracking:
+                        self.db.set_video_status(video_id,'pending')
+                        self.changed.emit()
+                    reason = str(exc) or '页面操作超时'
+                    self.log.emit(f'{account["name"]}：视频 {video_id or "未知"} 扫描时浏览器无响应：{reason}')
+                    browser = await self.rebuild_browser(account)
+                    browser.s = settings
+                    if browser_restarts == 1:
+                        self.log.emit(f'{account["name"]}：已自动重建浏览器，重试当前视频 {video_id or "未知"}')
+                        continue
+                    browser_failed_videos += 1
+                    consecutive_failures = 0
+                    if tracking:
+                        self.db.set_video_status(video_id,'failed','浏览器重建后重试仍失败：'+reason)
+                        self.changed.emit()
+                    self.log.emit(f'{account["name"]}：视频 {video_id or "未知"} 重试仍超时，已跳过并继续队列')
+                    comments = None
+                    break
+                except Exception as exc:
+                    if tracking:
+                        self.db.set_video_status(video_id,'failed',str(exc))
+                        self.changed.emit()
+                    raise
+            if comments is None:
                 continue
-            except CommentPageUnavailable as exc:
-                consecutive_failures += 1
-                failed_videos += 1
-                video_id = str(video.get('aweme_id','未知'))
-                title = ' '.join(str(video.get('desc','')).split())[:40]
-                detail = f' · {title}' if title else ''
-                if tracking:
-                    self.db.set_video_status(video_id,'failed',str(exc))
-                    self.changed.emit()
-                self.log.emit(f'{account["name"]}：已跳过视频 {video_id}{detail}：{exc}')
-                if consecutive_failures == 3:
-                    self.log.emit(f'{account["name"]}：连续 3 个视频加载失败，暂停 10 秒后继续；本轮跳过的视频下轮会自动重试')
-                    await asyncio.sleep(10)
-                continue
-            except asyncio.CancelledError:
-                if tracking:
-                    self.db.set_video_status(video_id,'pending')
-                    self.changed.emit()
-                raise
-            except Exception as exc:
-                if tracking:
-                    self.db.set_video_status(video_id,'failed',str(exc))
-                    self.changed.emit()
-                raise
             consecutive_failures = 0
             eligible = recent_comments(comments,settings.get('comment_days',DEFAULTS['comment_days']))
             expired_comments += len(comments)-len(eligible)
@@ -286,8 +316,11 @@ class Engine(QThread):
             self.log.emit(f'{account["name"]}：本轮已过滤 {expired_comments} 条超过最近 {days} 天的评论，未提交 AI 分析')
         if failed_videos:
             self.log.emit(f'{account["name"]}：本轮有 {failed_videos} 个视频评论区未就绪，已跳过并保持任务运行，下轮自动重试')
+        if browser_failed_videos:
+            self.log.emit(f'{account["name"]}：本轮有 {browser_failed_videos} 个视频在浏览器重建后仍超时，已跳过并继续运行')
         if unavailable_videos:
             self.log.emit(f'{account["name"]}：本轮发现 {unavailable_videos} 个已失效视频，当前列表不再重试')
+        return browser
 
     async def rebuild_video_list(self, account, browser, settings):
         """Discover videos from every configured source before comment scans."""
@@ -333,6 +366,8 @@ class Engine(QThread):
             self.status.emit(ident,'运行中')
             while True:
                 if account['role']=='main':
+                    resume = bool(self.db.video_tasks('pending') or
+                                  self.db.rows("SELECT 1 FROM videos WHERE status='scanning' LIMIT 1"))
                     rebuild = self.db.prepare_video_scan(s['video_list_reset_hours'])
                     if rebuild:
                         self.status.emit(ident,'正在重建待分析视频列表')
@@ -344,7 +379,10 @@ class Engine(QThread):
                             self.db.save_settings({'video_list_built_at':0})
                             raise
                     else:
-                        self.log.emit(account['name']+'：视频列表未到清空时间，已重置逐视频扫描状态')
+                        if resume:
+                            self.log.emit(account['name']+'：视频列表未到重建时间，从上次断点继续扫描未完成视频')
+                        else:
+                            self.log.emit(account['name']+'：上一轮视频已全部处理，开始新一轮评论扫描')
                         self.changed.emit()
                     videos = self.db.video_tasks('pending')
                     self.log.emit(account['name']+'：本轮待分析视频共 '+str(len(videos))+' 个')
@@ -352,7 +390,7 @@ class Engine(QThread):
                         self.status.emit(ident,'本轮没有找到待分析视频')
                         await asyncio.sleep(s['poll_seconds'])
                         continue
-                    await self.scan_videos(account,b,ai,videos,s)
+                    b = await self.scan_videos(account,b,ai,videos,s)
                     for warning in b.warnings:
                         self.log.emit(warning)
                     b.warnings.clear()

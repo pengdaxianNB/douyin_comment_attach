@@ -139,6 +139,23 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(self.db.prepare_video_scan(24,now=1000+24*3600))
         self.assertEqual(self.db.video_tasks(),[])
 
+    def test_video_scan_resumes_pending_items_without_resetting_completed_ones(self):
+        self.assertTrue(self.db.prepare_video_scan(24,now=1000))
+        completed=dict(aweme_id='1234567890123456789',desc='已完成',author={})
+        pending=dict(aweme_id='2234567890123456789',desc='未扫描',author={})
+        interrupted=dict(aweme_id='3234567890123456789',desc='扫描中',author={})
+        for video in (completed,pending,interrupted):
+            self.db.add_video(video,'keyword','关键词')
+        self.db.set_video_status(completed['aweme_id'],'done')
+        self.db.set_video_status(interrupted['aweme_id'],'scanning')
+
+        self.assertFalse(self.db.prepare_video_scan(24,now=1001))
+
+        statuses={row['id']:row['status'] for row in self.db.video_tasks()}
+        self.assertEqual(statuses[completed['aweme_id']],'done')
+        self.assertEqual(statuses[pending['aweme_id']],'pending')
+        self.assertEqual(statuses[interrupted['aweme_id']],'pending')
+
     def test_video_list_deduplicates_same_work_across_sources(self):
         video=dict(aweme_id='1234567890123456789',desc='同一个视频',author={})
         self.db.add_video(video,'blogger','博主','MS4wLjABAAAAblogger_123456')
