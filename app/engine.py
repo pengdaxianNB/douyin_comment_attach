@@ -16,6 +16,11 @@ DEFAULTS = dict(days=7,comment_days=7,video_list_reset_hours=24,ai_concurrency=5
     message_prompt='根据客户评论写一条自然、简短的咨询回复。我的产品或服务：请填写。尊重对方，不夸大，不使用虚假承诺。',
     comment_panel='[data-e2e="comment-list"]',message_editor='[contenteditable="true"]')
 
+# A soft unload happens after every completed page workflow. Replacing the
+# whole QWebEnginePage periodically also releases renderer/process state that a
+# normal navigation cannot reach, while preserving the account profile/login.
+PAGE_RECYCLE_OPERATIONS = 20
+
 
 def recent_comments(comments, days, now=None):
     """Keep comments inside the rolling UTC time window, including its boundary."""
@@ -52,6 +57,7 @@ class Engine(QThread):
         self.loop = None
         self.commands = None
         self.running_accounts = set()
+        self.page_operations = {}
         self.lock = threading.Lock()
         self.ready = threading.Event()
 
@@ -133,23 +139,53 @@ class Engine(QThread):
                 raise
         return self.contexts[ident]
 
-    async def rebuild_browser(self, account):
+    async def rebuild_browser(self, account, memory_cleanup=False):
         """让 GUI 重建单个账号页面，然后重新绑定 Playwright。"""
         ident = account['id']
+        self.page_operations[ident] = 0
         contexts = getattr(self,'contexts',None)
         if contexts is not None:
             contexts.pop(ident,None)
         # Prevent embedded_page() from immediately rediscovering the stale
         # target before the queued GUI reset signal is handled.
         unregister_page(ident)
-        self.status.emit(ident,'浏览器无响应，正在自动重建')
-        self.log.emit(account['name']+'：检测到页面超时或内核异常，正在重建该账号浏览器')
+        if memory_cleanup:
+            self.status.emit(ident,'正在定期释放浏览器内存')
+            self.log.emit(account['name']+'：达到页面操作回收周期，正在重建该账号浏览器')
+        else:
+            self.status.emit(ident,'浏览器无响应，正在自动重建')
+            self.log.emit(account['name']+'：检测到页面超时或内核异常，正在重建该账号浏览器')
         self.browser_reset.emit(ident)
         try:
             browser = await self.open(account)
         except Exception as exc:
             raise AccountNeedsAttention('浏览器自动重建失败，请停止该账号后点击“重启浏览器”：'+str(exc)) from exc
         self.log.emit(account['name']+'：浏览器已重建，将继续处理队列')
+        return browser
+
+    async def maintain_browser_memory(self, account, browser):
+        """Bound per-account Chromium growth between completed operations."""
+        ident = account.get('id',account['name'])
+        operations = self.page_operations.get(ident,0) + 1
+        self.page_operations[ident] = operations
+        if operations >= PAGE_RECYCLE_OPERATIONS:
+            self.log.emit(account['name']+'：已完成多轮页面操作，正在释放浏览器内存')
+            warnings = list(getattr(browser,'warnings',[]))
+            rebuilt = await self.rebuild_browser(account,memory_cleanup=True)
+            if warnings and hasattr(rebuilt,'warnings'):
+                rebuilt.warnings[:0] = warnings
+            return rebuilt
+        release = getattr(browser,'release_page_memory',None)
+        if release is not None:
+            try:
+                await release()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Cleanup must not turn a successfully handled video/customer
+                # into a business failure. The periodic full rebuild remains a
+                # hard fallback.
+                self.log.emit(account['name']+'：页面内存轻量清理未完成，将在定期重建时回收：'+str(exc))
         return browser
 
     def cdp_endpoint(self):
@@ -290,27 +326,27 @@ class Engine(QThread):
                         self.db.set_video_status(video_id,'failed',str(exc))
                         self.changed.emit()
                     raise
-            if comments is None:
-                continue
-            consecutive_failures = 0
-            eligible = recent_comments(comments,settings.get('comment_days',DEFAULTS['comment_days']))
-            expired_comments += len(comments)-len(eligible)
-            try:
-                await classify_comments(self.db,ai,eligible,settings['ai_concurrency'],
-                    lambda text:self.log.emit(account['name']+'：'+text),self.changed.emit)
-            except asyncio.CancelledError:
+            if comments is not None:
+                consecutive_failures = 0
+                eligible = recent_comments(comments,settings.get('comment_days',DEFAULTS['comment_days']))
+                expired_comments += len(comments)-len(eligible)
+                try:
+                    await classify_comments(self.db,ai,eligible,settings['ai_concurrency'],
+                        lambda text:self.log.emit(account['name']+'：'+text),self.changed.emit)
+                except asyncio.CancelledError:
+                    if tracking:
+                        self.db.set_video_status(video_id,'pending')
+                        self.changed.emit()
+                    raise
+                except Exception as exc:
+                    if tracking:
+                        self.db.set_video_status(video_id,'failed',str(exc))
+                        self.changed.emit()
+                    raise
                 if tracking:
-                    self.db.set_video_status(video_id,'pending')
+                    self.db.set_video_status(video_id,'done')
                     self.changed.emit()
-                raise
-            except Exception as exc:
-                if tracking:
-                    self.db.set_video_status(video_id,'failed',str(exc))
-                    self.changed.emit()
-                raise
-            if tracking:
-                self.db.set_video_status(video_id,'done')
-                self.changed.emit()
+            browser = await self.maintain_browser_memory(account,browser)
         if expired_comments:
             days = settings.get('comment_days',DEFAULTS['comment_days'])
             self.log.emit(f'{account["name"]}：本轮已过滤 {expired_comments} 条超过最近 {days} 天的评论，未提交 AI 分析')
@@ -365,6 +401,7 @@ class Engine(QThread):
         if manual_videos:
             self.log.emit('手动录入：已加入待分析视频 '+str(len(manual_videos))+' 个')
             self.changed.emit()
+        browser = await self.maintain_browser_memory(account,browser)
         return complete
 
     async def work(self, account):
@@ -389,6 +426,9 @@ class Engine(QThread):
                         self.status.emit(ident,'正在重建待分析视频列表')
                         try:
                             complete = await self.rebuild_video_list(account,b,s)
+                            # A periodic memory cycle inside source discovery
+                            # replaces the account Browser in this registry.
+                            b = self.contexts.get(ident,b)
                             if not complete:
                                 # Keep the successfully discovered subset for
                                 # this pass, but retry all sources next round.
@@ -477,6 +517,7 @@ class Engine(QThread):
                         self.log.emit(account['name']+'：'+detail)
                         b = await self.rebuild_browser(account)
                     self.changed.emit()
+                    b = await self.maintain_browser_memory(account,b)
                     customer = None
                     if skip_cooldown:
                         self.status.emit(ident,'私密账号已跳过，继续处理')

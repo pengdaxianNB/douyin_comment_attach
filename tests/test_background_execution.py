@@ -37,6 +37,21 @@ def test_cdp_background_lifecycle_and_focus_are_enabled():
     session.detach.assert_awaited_once()
 
 
+def test_completed_page_is_unloaded_and_chromium_heap_is_collected():
+    session=Mock(send=AsyncMock(),detach=AsyncMock())
+    page=Mock(goto=AsyncMock())
+    context=Mock(new_cdp_session=AsyncMock(return_value=session))
+    browser=Browser(context,{},page=page)
+
+    asyncio.run(browser.release_page_memory())
+
+    page.goto.assert_awaited_once_with(
+        'about:blank',wait_until='commit',timeout=10000)
+    assert [call.args[0] for call in session.send.await_args_list]==[
+        'Page.resetNavigationHistory','HeapProfiler.collectGarbage']
+    session.detach.assert_awaited_once()
+
+
 def test_unselected_account_stays_mounted_behind_other_app_tabs(tmp_path):
     app=QApplication.instance() or QApplication([])
     outer=QTabWidget();keep_tab_pages_mounted(outer)
@@ -62,6 +77,7 @@ def test_embedded_browser_blocks_unknown_external_url_schemes(tmp_path):
     browser=EmbeddedBrowser(tmp_path/'profile','account')
     assert browser.profile.settings().unknownUrlSchemePolicy()==(
         QWebEngineSettings.UnknownUrlSchemePolicy.DisallowUnknownUrlSchemes)
+    assert browser.profile.httpCacheMaximumSize()==128*1024*1024
     browser.shutdown();app.processEvents()
 
 

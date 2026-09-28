@@ -2,6 +2,7 @@ import os
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 import tempfile
 from pathlib import Path
+from PySide6.QtTest import QSignalSpy,QTest
 from PySide6.QtWidgets import QApplication,QInputDialog,QMessageBox
 from app.db import DB
 from app.ui import Window,STYLE,format_beijing_time
@@ -51,6 +52,21 @@ def test_window():
         w.video_search.clear()
         assert w.videos.rowCount()==1
         w.close(); app.processEvents()
+
+
+def test_runtime_change_bursts_are_coalesced(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    w=Window(db,tmp_path,start_engine=False)
+    w.timer.stop()
+    spy=QSignalSpy(w.refresh_timer.timeout)
+
+    for _ in range(50):
+        w.schedule_runtime_refresh()
+    QTest.qWait(400);app.processEvents()
+
+    assert spy.count()==1
+    w.close();app.processEvents()
 
 
 def test_requeue_all_failed_from_customer_toolbar(tmp_path,monkeypatch):

@@ -119,10 +119,14 @@ class Window(QMainWindow):
         self.engine = Engine(db,data)
         self.engine.log.connect(self.add_log)
         self.engine.status.connect(self.account_status)
-        self.engine.changed.connect(self.refresh_customers)
-        self.engine.changed.connect(self.refresh_accounts)
-        self.engine.changed.connect(self.refresh_videos)
-        self.engine.changed.connect(self.sync_role_switches)
+        # AI classification can finish several comments at once. Coalesce its
+        # change burst instead of rebuilding thousands of QTableWidgetItems for
+        # every individual result queued on the GUI thread.
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.setSingleShot(True)
+        self.refresh_timer.setInterval(300)
+        self.refresh_timer.timeout.connect(self.refresh_runtime_views)
+        self.engine.changed.connect(self.schedule_runtime_refresh)
         self.engine.browser_reset.connect(self.reset_browser_page)
         root = QWidget(); self.setCentralWidget(root)
         layout = QVBoxLayout(root); layout.setContentsMargins(26,22,26,20); layout.setSpacing(16)
@@ -150,7 +154,7 @@ class Window(QMainWindow):
         self.tabs.currentChanged.connect(lambda: self.refresh_database() if self.tabs.currentWidget() is self.database_page else None)
         self.statusBar().showMessage('站点适配待实号验证 · 登录和验证码请在内嵌浏览器中处理')
         self.refresh_accounts(); self.refresh_bloggers(); self.refresh_keywords(); self.refresh_videos(); self.refresh_customers()
-        self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_customers); self.timer.timeout.connect(self.refresh_accounts); self.timer.timeout.connect(self.refresh_videos); self.timer.start(4000)
+        self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_runtime_views); self.timer.start(4000)
         if start_engine:
             self.engine.start()
 
@@ -540,6 +544,15 @@ class Window(QMainWindow):
 
     def account_status(self, ident, status):
         self.states[ident]=status; self.refresh_accounts()
+
+    def schedule_runtime_refresh(self):
+        if not self.refresh_timer.isActive():
+            self.refresh_timer.start()
+
+    def refresh_runtime_views(self):
+        self.refresh_customers()
+        self.refresh_accounts()
+        self.refresh_videos()
 
     def refresh_accounts(self):
         self.account_rows = self.db.rows('SELECT * FROM accounts ORDER BY role,id')

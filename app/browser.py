@@ -653,6 +653,30 @@ class Browser:
                 self.log('后台页面已保持活跃，无需切换到当前账号标签')
             self.background_prepared = True
 
+    async def release_page_memory(self):
+        """Unload the completed site page and ask Chromium to reclaim its heap.
+
+        Douyin is a long-lived SPA. Repeated profile/video/chat navigations can
+        otherwise leave detached DOM trees and back-forward entries resident in
+        the renderer for a long time. Cookies and local storage live in the
+        profile, so unloading the document does not log the account out.
+        """
+        if self.page is None:
+            return
+        await self.page.goto('about:blank',wait_until='commit',timeout=10000)
+        session = await self.context.new_cdp_session(self.page)
+        try:
+            # QtWebEngine versions differ in which memory-related CDP domains
+            # they expose. Navigation is the essential cleanup; these commands
+            # are best-effort additions.
+            for method in ('Page.resetNavigationHistory','HeapProfiler.collectGarbage'):
+                try:
+                    await session.send(method)
+                except Exception:
+                    pass
+        finally:
+            await session.detach()
+
     async def diagnose_sender(self):
         if self.diagnostics_dir is None:
             raise NeedsAttention('未配置诊断目录')
@@ -757,7 +781,11 @@ class Browser:
                 if p.get('status_code',0) != 0:
                     errors.append('接口状态异常 '+str(p.get('status_code')))
                 elif key in p:
-                    packets.append(p)
+                    # Keep only the collection used by the caller. Douyin API
+                    # responses contain large side payloads which needlessly
+                    # inflate the peak heap across dozens of scroll requests.
+                    packets.append({key:p.get(key) or [],
+                                    'has_more':bool(p.get('has_more',False))})
             except Exception:
                 errors.append('页面响应无法解析')
         def receive(response):
@@ -851,7 +879,12 @@ class Browser:
         for p in packets:
             for v in p.get('aweme_list') or []:
                 if int(v.get('create_time',0)) >= cutoff:
-                    items[str(v['aweme_id'])] = v
+                    items[str(v['aweme_id'])] = {
+                        'aweme_id':str(v['aweme_id']),
+                        'desc':str(v.get('desc','')),
+                        'author':v.get('author') or {},
+                        'create_time':int(v.get('create_time',0)),
+                    }
         return list(items.values())
 
     async def keyword_videos(self, keyword, days=7):

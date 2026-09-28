@@ -65,6 +65,11 @@ class EmbeddedBrowser(QWidget):
         self.profile = QWebEngineProfile('panda-'+marker, self)
         self.profile.setPersistentStoragePath(str(profile_dir/'storage'))
         self.profile.setCachePath(str(profile_dir/'cache'))
+        # The default is selected by Chromium from available system memory and
+        # is multiplied by every account profile. Use an explicit per-account
+        # ceiling so many sender accounts cannot grow their caches without a
+        # bound.
+        self.profile.setHttpCacheMaximumSize(128 * 1024 * 1024)
         self.profile.setPersistentCookiesPolicy(
             QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
         # Do not hand custom app links such as bitbrowser:// to Windows. When no
