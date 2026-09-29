@@ -270,6 +270,10 @@ COMMENT_PANEL_SCROLL = r"""panel => {
 }"""
 
 
+# Image-text notes keep the comment list hidden behind a "评论(N)" tab that sits
+# beside "相关推荐"; video pages show the list directly and have no such tab.
+COMMENT_TAB = re.compile(r'^评论\s*(?:[（(][^)）]*[)）])?$')
+COMMENT_TAB_CLICKS = 3
 COMMENT_READY_CHECKS = 20
 COMMENT_READY_INTERVAL = 0.5
 COMMENT_CAPTURE_ATTEMPTS = 3
@@ -770,10 +774,29 @@ class Browser:
             if await self.page.get_by_text(text,exact=True).count() and await self.page.get_by_text(text,exact=True).first.is_visible():
                 raise AccountNeedsAttention('页面需要人工处理：'+text)
 
+    async def open_comment_tab(self):
+        """Click the note page's 评论(N) tab; True when a click was delivered."""
+        get_by_text = getattr(self.page,'get_by_text',None)
+        if get_by_text is None:
+            return False
+        try:
+            tabs = [item for item in await get_by_text(COMMENT_TAB).all()
+                    if await item.is_visible()]
+            # Never guess between several "评论" texts.
+            if len(tabs) != 1:
+                return False
+            await self.guard()
+            await tabs[0].click(timeout=PROFILE_CLICK_TIMEOUT)
+        except PlaywrightError:
+            return False
+        self.log('评论区在标签页内，已点击“评论”标签')
+        return True
+
     async def wait_for_comment_ready(self, packets, tasks):
         """Give a slow page time to expose either its API data or comment panel."""
         selector = self.s.get('comment_panel','')
         panel_locator = self.page.locator(selector) if selector else None
+        tab_clicks = 0
         for check in range(COMMENT_READY_CHECKS):
             await self.guard()
             if tasks:
@@ -795,6 +818,8 @@ class Browser:
             panel = await unique_visible(panel_locator) if panel_locator is not None else None
             if panel is not None:
                 return panel
+            if tab_clicks < COMMENT_TAB_CLICKS and await self.open_comment_tab():
+                tab_clicks += 1
             if check + 1 < COMMENT_READY_CHECKS:
                 await asyncio.sleep(COMMENT_READY_INTERVAL)
         return None
@@ -850,11 +875,24 @@ class Browser:
                     selector = self.s.get('comment_panel','')
                     panel_locator = self.page.locator(selector) if selector else None
                     panel = await unique_visible(panel_locator) if panel_locator is not None else None
+                    if panel is None and await self.open_comment_tab():
+                        await asyncio.sleep(1)
+                        panel = await unique_visible(panel_locator) if panel_locator is not None else None
                     if panel is not None:
                         scroll = await panel.evaluate(COMMENT_PANEL_SCROLL)
                         if not scroll.get('found'):
+                            # A short list fits without a scrollbar, and a note's
+                            # list only requests its data once the tab is open.
+                            # Give that response a moment before judging.
+                            for _ in range(10):
+                                if packets:
+                                    break
+                                await asyncio.sleep(0.5)
+                                if tasks:
+                                    await asyncio.gather(*list(tasks))
                             if packets:
-                                self.warnings.append('仅采集已加载评论：未找到评论区的可滚动容器，请校准 CSS')
+                                if packets[-1].get('has_more',False):
+                                    self.warnings.append('仅采集已加载评论：未找到评论区的可滚动容器，请校准 CSS')
                                 break
                             raise CommentPageUnavailable('未找到评论区的可滚动容器')
                     else:

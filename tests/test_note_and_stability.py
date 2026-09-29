@@ -290,3 +290,93 @@ def test_json_object_tolerates_prose_and_fences():
     assert json_object('判断如下：{"target": true, "reason": "y"} 完毕') == {'target':True,'reason':'y'}
     with pytest.raises(ValueError):
         json_object('没有 JSON')
+
+
+# ---------- note comment tab ----------
+
+def tab_page(tabs, panel_visible_after_click=True):
+    """Page whose comment panel only becomes visible after the tab is clicked."""
+    state = {'clicked':False}
+    async def click(timeout=None):
+        state['clicked'] = True
+    items = [SimpleNamespace(is_visible=AsyncMock(return_value=visible),click=AsyncMock(side_effect=click))
+             for visible in tabs]
+    panel = SimpleNamespace(
+        count=AsyncMock(return_value=1),
+        is_visible=AsyncMock(side_effect=lambda:state['clicked'] and panel_visible_after_click))
+    page = SimpleNamespace(
+        locator=lambda selector:panel,
+        get_by_text=lambda pattern,exact=False:SimpleNamespace(
+            all=AsyncMock(return_value=items),count=AsyncMock(return_value=0)))
+    return page,items,panel
+
+
+def test_comment_tab_pattern_only_matches_the_tab_label():
+    from app.browser import COMMENT_TAB
+    for text in ('评论(9)','评论（12）','评论 (1.2万)','评论'):
+        assert COMMENT_TAB.match(text), text
+    for text in ('相关推荐','评论区','留下你的精彩评论吧','评论(9)相关推荐','查看全部评论'):
+        assert not COMMENT_TAB.match(text), text
+
+
+def test_note_page_comment_tab_is_clicked_before_waiting_for_panel(monkeypatch):
+    page,items,panel = tab_page([True])
+    browser = Browser(SimpleNamespace(pages=[page]),{'comment_panel':'[data-e2e="comment-list"]'},page=page)
+    browser.guard = AsyncMock()
+    monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
+
+    ready = asyncio.run(browser.wait_for_comment_ready([],set()))
+
+    assert ready is panel
+    items[0].click.assert_awaited_once()
+
+
+def test_comment_tab_is_not_clicked_when_ambiguous_or_hidden():
+    for tabs in ([True,True],[False],[]):
+        page,items,_ = tab_page(tabs)
+        browser = Browser(SimpleNamespace(pages=[page]),{},page=page)
+        browser.guard = AsyncMock()
+        assert asyncio.run(browser.open_comment_tab()) is False
+        for item in items:
+            item.click.assert_not_awaited()
+
+
+def test_comment_tab_click_failure_is_not_fatal():
+    page,items,_ = tab_page([True])
+    items[0].click = AsyncMock(side_effect=PlaywrightError('intercepts pointer events'))
+    browser = Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard = AsyncMock()
+    assert asyncio.run(browser.open_comment_tab()) is False
+
+
+def test_short_comment_list_waits_for_api_instead_of_failing(monkeypatch):
+    """Note pages fetch comments once the tab opens; a list that fits has no scrollbar."""
+    handlers = []
+    panel = SimpleNamespace(
+        count=AsyncMock(return_value=1),
+        is_visible=AsyncMock(return_value=True),
+        evaluate=AsyncMock(return_value={'found':False,'moved':False}))
+    page = SimpleNamespace(
+        goto=AsyncMock(),
+        locator=lambda selector:panel,
+        on=lambda event,callback:handlers.append(callback),
+        remove_listener=lambda *args:None)
+    browser = Browser(SimpleNamespace(pages=[page]),
+                      {'comment_panel':'#c','scroll_limit':3},log=lambda text:None,page=page)
+    browser.guard = AsyncMock()
+    browser.wait_for_comment_ready = AsyncMock()
+    reply = {'status_code':0,'has_more':0,'comments':[]}
+    response = SimpleNamespace(url='https://www.douyin.com/aweme/v1/web/comment/list/?x=1',
+                               json=AsyncMock(return_value=reply))
+
+    async def late_response(delay):
+        if not any(h for h in handlers if getattr(h,'fired',False)):
+            for handler in handlers:
+                handler(response)
+                handler.fired = True
+
+    monkeypatch.setattr('app.browser.asyncio.sleep',late_response)
+
+    packets = asyncio.run(browser.capture(NOTE,'/aweme/v1/web/comment/list/','comments',3))
+
+    assert len(packets) == 1 and not browser.warnings
