@@ -21,6 +21,11 @@ DEFAULTS = dict(days=7,comment_days=7,video_list_reset_hours=24,ai_concurrency=5
 # normal navigation cannot reach, while preserving the account profile/login.
 PAGE_RECYCLE_OPERATIONS = 20
 
+# Unattended stability: transient failures back off and retry instead of ending
+# the job. After this many consecutive failures the account is stopped so an
+# operator can look at it.
+MAX_TRANSIENT_FAILURES = 5
+
 
 def recent_comments(comments, days, now=None):
     """Keep comments inside the rolling UTC time window, including its boundary."""
@@ -75,7 +80,16 @@ class Engine(QThread):
             return bool(self.running_accounts)
 
     def run(self):
-        asyncio.run(self.main())
+        try:
+            asyncio.run(self.main())
+        except Exception as exc:
+            # Without this the worker thread would die silently and every later
+            # button press would be dropped by command().
+            self.loop = None
+            self.log.emit('后台引擎异常退出，请重启应用：'+type(exc).__name__+'：'+str(exc))
+            with self.lock:
+                self.running_accounts.clear()
+            self.changed.emit()
 
     async def main(self):
         self.loop = asyncio.get_running_loop()
@@ -278,7 +292,16 @@ class Engine(QThread):
                     self.log.emit(f'{account["name"]}：视频 {video_id or "未知"}{detail} 已失效，已标记并继续下一个：{exc}')
                     comments = None
                     break
-                except CommentPageUnavailable as exc:
+                except AccountNeedsAttention:
+                    # Login/verification prompts are not the video's fault; keep
+                    # it queued for when the operator resumes the account.
+                    if tracking:
+                        self.db.set_video_status(video_id,'pending')
+                        self.changed.emit()
+                    raise
+                except NeedsAttention as exc:
+                    # Includes CommentPageUnavailable and abnormal API replies:
+                    # skip this one work and keep the whole monitor running.
                     consecutive_failures += 1
                     failed_videos += 1
                     title = ' '.join(str(video.get('desc','')).split())[:40]
@@ -377,6 +400,12 @@ class Engine(QThread):
                 complete = False
                 self.log.emit(account['name']+f'：关键词“{keyword}”视频获取失败，已跳过并继续其他来源：{exc}')
                 continue
+            except (PlaywrightError, asyncio.TimeoutError) as exc:
+                complete = False
+                self.log.emit(account['name']+f'：关键词“{keyword}”页面操作超时，正在重建浏览器并继续其他来源：{exc or "超时"}')
+                browser = await self.rebuild_browser(account)
+                browser.s = settings
+                continue
             for video in videos:
                 self.db.add_video(video,'keyword',keyword,keyword)
             self.log.emit('关键词“'+keyword+'”：近 7 天已加入待分析视频 '+str(len(videos))+' 个')
@@ -391,12 +420,18 @@ class Engine(QThread):
                 complete = False
                 self.log.emit(account['name']+f'：博主“{blogger["name"]}”视频获取失败，已跳过并继续其他来源：{exc}')
                 continue
+            except (PlaywrightError, asyncio.TimeoutError) as exc:
+                complete = False
+                self.log.emit(account['name']+f'：博主“{blogger["name"]}”页面操作超时，正在重建浏览器并继续其他来源：{exc or "超时"}')
+                browser = await self.rebuild_browser(account)
+                browser.s = settings
+                continue
             for video in videos:
                 self.db.add_video(video,'blogger',blogger['name'],blogger['id'])
             self.log.emit(blogger['name']+'：已加入待分析视频 '+str(len(videos))+' 个')
             self.changed.emit()
         for item in manual_videos:
-            video = {'aweme_id':item['id'],'desc':item['title'],'author':{},'create_time':0}
+            video = {'aweme_id':item['id'],'desc':item['title'],'author':{},'create_time':0,'url':item['url']}
             self.db.add_video(video,'manual','手动录入',item['url'])
         if manual_videos:
             self.log.emit('手动录入：已加入待分析视频 '+str(len(manual_videos))+' 个')
@@ -404,11 +439,60 @@ class Engine(QThread):
         browser = await self.maintain_browser_memory(account,browser)
         return complete
 
+    async def monitor_round(self, account, b, ai, s):
+        """One main-account pass: refresh the video list if due, then scan it."""
+        ident = account['id']
+        resume = bool(self.db.video_tasks('pending') or
+                      self.db.rows("SELECT 1 FROM videos WHERE status='scanning' LIMIT 1"))
+        rebuild = self.db.prepare_video_scan(s['video_list_reset_hours'])
+        if rebuild:
+            self.status.emit(ident,'正在重建待分析视频列表')
+            try:
+                complete = await self.rebuild_video_list(account,b,s)
+                # A periodic memory cycle inside source discovery
+                # replaces the account Browser in this registry.
+                b = self.contexts.get(ident,b)
+                if not complete:
+                    # Keep the successfully discovered subset for
+                    # this pass, but retry all sources next round.
+                    self.db.save_settings({'video_list_built_at':0})
+                    self.log.emit(account['name']+'：本次视频列表获取不完整，已保留成功结果，下一轮会自动重新获取')
+            except BaseException:
+                # A partial list must not be treated as fresh for a
+                # full reset interval. The next run rebuilds it.
+                self.db.save_settings({'video_list_built_at':0})
+                raise
+        else:
+            if resume:
+                self.log.emit(account['name']+'：视频列表未到重建时间，从上次断点继续扫描未完成视频')
+            else:
+                self.log.emit(account['name']+'：上一轮视频已全部处理，开始新一轮评论扫描')
+            self.changed.emit()
+        videos = self.db.video_tasks('pending')
+        self.log.emit(account['name']+'：本轮待分析视频共 '+str(len(videos))+' 个')
+        if not videos:
+            self.status.emit(ident,'本轮没有找到待分析视频')
+            await asyncio.sleep(s['poll_seconds'])
+            return b
+        b = await self.scan_videos(account,b,ai,videos,s)
+        for warning in b.warnings:
+            self.log.emit(warning)
+        b.warnings.clear()
+        if not self.db.video_tasks():
+            self.status.emit(ident,'视频列表为空，立即开始新一轮找视频')
+            self.log.emit(account['name']+'：待分析视频列表为空，立即重新从全部来源找视频')
+            return b
+        self.status.emit(ident,'等待下一轮')
+        await asyncio.sleep(s['poll_seconds'])
+        return b
+
     async def work(self, account):
         ident = account['id']
         customer = None
         message = ''
         clicked = False
+        monitor_failures = 0
+        ai_failures = 0
         try:
             s = self.settings()
             ai = AI(s, log=lambda text: self.log.emit(account["name"]+"："+text))
@@ -419,48 +503,26 @@ class Engine(QThread):
             self.status.emit(ident,'运行中')
             while True:
                 if account['role']=='main':
-                    resume = bool(self.db.video_tasks('pending') or
-                                  self.db.rows("SELECT 1 FROM videos WHERE status='scanning' LIMIT 1"))
-                    rebuild = self.db.prepare_video_scan(s['video_list_reset_hours'])
-                    if rebuild:
-                        self.status.emit(ident,'正在重建待分析视频列表')
-                        try:
-                            complete = await self.rebuild_video_list(account,b,s)
-                            # A periodic memory cycle inside source discovery
-                            # replaces the account Browser in this registry.
-                            b = self.contexts.get(ident,b)
-                            if not complete:
-                                # Keep the successfully discovered subset for
-                                # this pass, but retry all sources next round.
-                                self.db.save_settings({'video_list_built_at':0})
-                                self.log.emit(account['name']+'：本次视频列表获取不完整，已保留成功结果，下一轮会自动重新获取')
-                        except BaseException:
-                            # A partial list must not be treated as fresh for a
-                            # full reset interval. The next run rebuilds it.
-                            self.db.save_settings({'video_list_built_at':0})
-                            raise
-                    else:
-                        if resume:
-                            self.log.emit(account['name']+'：视频列表未到重建时间，从上次断点继续扫描未完成视频')
-                        else:
-                            self.log.emit(account['name']+'：上一轮视频已全部处理，开始新一轮评论扫描')
-                        self.changed.emit()
-                    videos = self.db.video_tasks('pending')
-                    self.log.emit(account['name']+'：本轮待分析视频共 '+str(len(videos))+' 个')
-                    if not videos:
-                        self.status.emit(ident,'本轮没有找到待分析视频')
-                        await asyncio.sleep(s['poll_seconds'])
-                        continue
-                    b = await self.scan_videos(account,b,ai,videos,s)
-                    for warning in b.warnings:
-                        self.log.emit(warning)
-                    b.warnings.clear()
-                    if not self.db.video_tasks():
-                        self.status.emit(ident,'视频列表为空，立即开始新一轮找视频')
-                        self.log.emit(account['name']+'：待分析视频列表为空，立即重新从全部来源找视频')
-                        continue
-                    self.status.emit(ident,'等待下一轮')
-                    await asyncio.sleep(s['poll_seconds'])
+                    try:
+                        b = await self.monitor_round(account,b,ai,s)
+                        monitor_failures = 0
+                    except (AccountNeedsAttention, asyncio.CancelledError, ValueError):
+                        # Account prompts and configuration problems need a person.
+                        raise
+                    except Exception as exc:
+                        # An unexpected page/DB hiccup must not end an unattended
+                        # monitor; back off, refresh the page, and try again.
+                        monitor_failures += 1
+                        reason = type(exc).__name__+('：'+str(exc) if str(exc) else '')
+                        if monitor_failures >= MAX_TRANSIENT_FAILURES:
+                            raise RuntimeError(f'连续 {monitor_failures} 轮监控异常，已停止：{reason}') from exc
+                        delay = min(120,15*monitor_failures)
+                        self.log.emit(f'{account["name"]}：监控本轮异常（{monitor_failures}/{MAX_TRANSIENT_FAILURES}），{delay} 秒后自动重试：{reason}')
+                        self.status.emit(ident,f'异常，{delay} 秒后重试')
+                        if isinstance(exc,(PlaywrightError,asyncio.TimeoutError)):
+                            b = await self.rebuild_browser(account)
+                            b.s = s
+                        await asyncio.sleep(delay)
                 else:
                     customer = self.db.claim(ident)
                     if not customer:
@@ -482,7 +544,24 @@ class Engine(QThread):
                             self.status.emit(ident,'复用已有文案：'+customer['name'])
                         else:
                             self.status.emit(ident,'生成文案：'+customer['name'])
-                            message = await ai.message(customer)
+                            try:
+                                message = await ai.message(customer)
+                            except ValueError as exc:
+                                # AI outages/rate limits happen before any page
+                                # side effect: put the customer back in the queue
+                                # and back off instead of stopping the sender.
+                                ai_failures += 1
+                                self.db.finish(customer['uid'],ident,'pending','','AI 文案生成失败，已放回队列：'+str(exc))
+                                customer = None
+                                self.changed.emit()
+                                if ai_failures >= MAX_TRANSIENT_FAILURES:
+                                    raise ValueError(f'AI 连续 {ai_failures} 次生成文案失败，已停止：{exc}') from exc
+                                delay = min(120,15*ai_failures)
+                                self.log.emit(f'{account["name"]}：AI 文案生成失败（{ai_failures}/{MAX_TRANSIENT_FAILURES}），客户已放回队列，{delay} 秒后重试：{exc}')
+                                self.status.emit(ident,f'AI 异常，{delay} 秒后重试')
+                                await asyncio.sleep(delay)
+                                continue
+                            ai_failures = 0
                         self.db.finish(customer['uid'],ident,'processing',message)
                         def before_click():
                             nonlocal clicked
@@ -522,7 +601,10 @@ class Engine(QThread):
                     if skip_cooldown:
                         self.status.emit(ident,'私密账号已跳过，继续处理')
                         continue
-                    interval = self.db.rows('SELECT interval FROM accounts WHERE id=?',(ident,))[0]['interval']
+                    row = self.db.rows('SELECT interval FROM accounts WHERE id=?',(ident,))
+                    if not row:
+                        raise ValueError('账号已被删除，任务已停止')
+                    interval = row[0]['interval']
                     self.status.emit(ident,f'间隔等待 {interval} 秒')
                     await asyncio.sleep(interval)
         except asyncio.CancelledError:

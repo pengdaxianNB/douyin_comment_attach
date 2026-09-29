@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlparse
 from playwright.async_api import Error as PlaywrightError
+from .db import parse_work_url, work_url
 
 
 class NeedsAttention(RuntimeError):
@@ -52,18 +53,49 @@ def is_douyin_host(hostname):
     return hostname == 'douyin.com' or hostname.endswith('.douyin.com')
 
 
+SEC_UID = re.compile(r'MS4[\w-]{10,}')
+
+
 def parse_comments(payload, video):
     result = []
     for c in payload.get('comments') or []:
+        if not isinstance(c,dict):
+            continue
         if str(c.get('reply_id', '0')) not in ('0', '', 'None'):
             continue
         u = c.get('user') or {}
-        if not c.get('cid') or not u.get('sec_uid') or not c.get('text'):
+        # One malformed record must not abort the whole video: the database
+        # rejects a non-standard sec_uid, so such a comment is skipped here.
+        if (not c.get('cid') or not isinstance(u,dict) or not SEC_UID.fullmatch(str(u.get('sec_uid') or ''))
+                or not isinstance(c.get('text'),str) or not c['text'].strip()):
             continue
-        result.append(dict(id=str(c['cid']),uid=u['sec_uid'],name=u.get('nickname',''),text=c['text'],
-            comment_time=datetime.fromtimestamp(int(c.get('create_time',0)),timezone.utc).isoformat(),
+        try:
+            created = datetime.fromtimestamp(int(c.get('create_time') or 0),timezone.utc)
+        except (TypeError,ValueError,OverflowError,OSError):
+            created = datetime.fromtimestamp(0,timezone.utc)
+        result.append(dict(id=str(c['cid']),uid=u['sec_uid'],name=str(u.get('nickname') or ''),text=c['text'],
+            comment_time=created.isoformat(),
             video_id=str(video['aweme_id']),video_title=video.get('desc',''),blogger=(video.get('author') or {}).get('nickname','')))
     return result
+
+
+def is_note_post(item):
+    """Image-text posts (aweme_type 68 / an images array) live under /note/."""
+    if not isinstance(item,dict):
+        return False
+    return str(item.get('aweme_type','')) == '68' or bool(item.get('images'))
+
+
+def comment_page_url(video):
+    """Page that hosts a work's comments; notes are served under /note/."""
+    ident = str(video['aweme_id'])
+    try:
+        found,kind = parse_work_url(video.get('url'))
+        if found == ident:
+            return work_url(ident,kind)
+    except ValueError:
+        pass
+    return work_url(ident,'note' if video.get('kind')=='note' else 'video')
 
 
 def reached_video_cutoff(packets, cutoff):
@@ -755,7 +787,8 @@ class Browser:
             get_by_text = getattr(self.page,'get_by_text',None)
             if get_by_text is not None:
                 for text in ('你要观看的视频不存在','视频不存在','作品不存在',
-                             '视频已删除','作品已删除','视频已下架','作品已下架'):
+                             '视频已删除','作品已删除','视频已下架','作品已下架',
+                             '你要观看的笔记不存在','笔记不存在','笔记已删除','笔记已下架'):
                     notice = get_by_text(text,exact=True)
                     if await notice.count() and await notice.first.is_visible():
                         raise VideoUnavailable('视频已失效：页面提示“'+text+'”')
@@ -878,12 +911,18 @@ class Browser:
         items = {}
         for p in packets:
             for v in p.get('aweme_list') or []:
-                if int(v.get('create_time',0)) >= cutoff:
-                    items[str(v['aweme_id'])] = {
-                        'aweme_id':str(v['aweme_id']),
+                try:
+                    created = int(v.get('create_time') or 0)
+                    ident = str(v['aweme_id'])
+                except (AttributeError,KeyError,TypeError,ValueError):
+                    continue
+                if created >= cutoff:
+                    items[ident] = {
+                        'aweme_id':ident,
                         'desc':str(v.get('desc','')),
                         'author':v.get('author') or {},
-                        'create_time':int(v.get('create_time',0)),
+                        'create_time':created,
+                        'kind':'note' if is_note_post(v) else 'video',
                     }
         return list(items.values())
 
@@ -984,17 +1023,19 @@ class Browser:
                 # the card/detail DOM. Merge those links with response data.
                 for frame in self.page.frames:
                     try:
-                        anchors = await frame.locator('a[href*="douyin.com/video/"]').all()
+                        anchors = await frame.locator(
+                        'a[href*="douyin.com/video/"], a[href*="douyin.com/note/"]').all()
                     except PlaywrightError:
                         continue
                     for anchor in anchors:
                         href = await anchor.get_attribute('href') or ''
-                        match = re.search(r'/video/(\d{8,})',href)
+                        match = re.search(r'/(video|note)/(\d{8,})',href)
                         if not match:
                             continue
-                        ident = match.group(1)
+                        ident = match.group(2)
                         title = ' '.join((await anchor.inner_text()).split())
-                        items.setdefault(ident,dict(aweme_id=ident,desc=title,author={},create_time=0))
+                        items.setdefault(ident,dict(aweme_id=ident,desc=title,author={},create_time=0,
+                                                    kind='note' if match.group(1)=='note' else 'video'))
                 await self.page.mouse.move(700,600)
                 await self.page.mouse.wheel(0,1000)
                 await asyncio.sleep(2)
@@ -1018,7 +1059,7 @@ class Browser:
         video_id = str(video['aweme_id'])
         for attempt in range(COMMENT_CAPTURE_ATTEMPTS):
             try:
-                packets = await self.capture('https://www.douyin.com/video/'+video_id,'/aweme/v1/web/comment/list/','comments',self.s['scroll_limit'])
+                packets = await self.capture(comment_page_url(video),'/aweme/v1/web/comment/list/','comments',self.s['scroll_limit'])
                 break
             except VideoUnavailable:
                 # This is a terminal page state, so reopening the same URL

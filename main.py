@@ -1,6 +1,9 @@
+import logging
 import os
 import socket
 import sys
+import threading
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from PySide6.QtCore import QLockFile
 from PySide6.QtWidgets import QApplication,QMessageBox
@@ -28,6 +31,23 @@ def configure_embedded_browser():
     os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = flags
 
 
+def configure_logging(data):
+    """Keep a rotating log file: the on-screen log only holds the last 1000 lines."""
+    logger = logging.getLogger('panda')
+    logger.setLevel(logging.INFO)
+    folder = data/'logs'
+    folder.mkdir(parents=True,exist_ok=True)
+    handler = RotatingFileHandler(folder/'app.log',maxBytes=2*1024*1024,backupCount=5,encoding='utf-8')
+    handler.setFormatter(logging.Formatter('%(asctime)s  %(message)s'))
+    logger.addHandler(handler)
+
+    def crash(exc_type, exc, tb):
+        logger.error('未捕获异常',exc_info=(exc_type,exc,tb))
+        sys.__excepthook__(exc_type,exc,tb)
+    sys.excepthook = crash
+    threading.excepthook = lambda args: crash(args.exc_type,args.exc_value,args.exc_traceback)
+
+
 def main():
     configure_embedded_browser()
     # Importing the UI also imports QtWebEngine. Keep it after the environment
@@ -37,6 +57,7 @@ def main():
     app.setApplicationName('熊猫领航')
     data=Path(os.environ.get('DOUYIN_DATA_DIR',str(Path(__file__).parent/'data')))
     data.mkdir(parents=True,exist_ok=True)
+    configure_logging(data)
     lock=QLockFile(str(data/'app.lock'))
     lock.setStaleLockTime(0)
     if not lock.tryLock(100):

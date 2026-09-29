@@ -1,5 +1,6 @@
 import csv
 import json
+import logging
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -352,7 +353,7 @@ class Window(QMainWindow):
         self.video_search.setClearButtonEnabled(True); self.video_search.setMinimumWidth(260)
         self.video_search.textChanged.connect(self.refresh_videos); video_bar.addWidget(self.video_search)
         video_bar.addStretch()
-        self.add_manual_video_button = button('录入视频链接',self.add_manual_video)
+        self.add_manual_video_button = button('录入视频/笔记链接',self.add_manual_video)
         self.add_manual_video_button.setProperty('variant','primary'); video_bar.addWidget(self.add_manual_video_button)
         self.remove_manual_video_button = button('移除手动视频',self.remove_manual_video)
         video_bar.addWidget(self.remove_manual_video_button)
@@ -541,6 +542,7 @@ class Window(QMainWindow):
 
     def add_log(self,text):
         self.logs.appendPlainText(datetime.now().strftime('%H:%M:%S')+'  '+text)
+        logging.getLogger('panda').info(text)
 
     def account_status(self, ident, status):
         self.states[ident]=status; self.refresh_accounts()
@@ -583,11 +585,17 @@ class Window(QMainWindow):
         query = self.video_search.text().strip().casefold()
         rows = [row for row in all_rows if query in str(row.get('title','')).casefold()]
         self.video_rows = rows
-        populate(self.videos,[[VIDEO_STATUS.get(r['status'],r['status']),
+        view = [[VIDEO_STATUS.get(r['status'],r['status']),
             ({'blogger':'博主：','keyword':'关键词：','manual':''}.get(r['source_type'],'')+r['source_name']),
             r['title'],r['author'],
             (datetime.fromtimestamp(r['create_time'],BEIJING_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S') if r['create_time'] else ''),
-            r['id'],r['error']] for r in rows])
+            r['id'],r['error']] for r in rows]
+        # This runs every few seconds; rebuilding thousands of unchanged cells
+        # wastes GUI time and resets scrolling/selection for no reason.
+        changed = view != getattr(self,'_video_view',None)
+        if changed:
+            self._video_view = view
+            populate(self.videos,view)
         counts = {}
         for row in rows: counts[row['status']] = counts.get(row['status'],0)+1
         detail = '，'.join(VIDEO_STATUS[key]+' '+str(counts[key]) for key in VIDEO_STATUS if counts.get(key))
@@ -596,7 +604,7 @@ class Window(QMainWindow):
         self.video_summary.setText(prefix+((' · '+detail) if detail else ''))
         self.video_source_tabs.setTabText(2,'待分析视频（'+str(len(all_rows))+'）')
         colors = {'pending':'#80baff','scanning':'#b7a2ff','done':'#62d7b0','failed':'#f48b96'}
-        for i,row in enumerate(rows):
+        for i,row in enumerate(rows if changed else ()):
             self.videos.item(i,0).setForeground(QColor(colors.get(row['status'],'#dbe5f3')))
         self.update_manual_video_action()
 
@@ -609,7 +617,10 @@ class Window(QMainWindow):
         selected_uid = self.customer_rows[current]['uid'] if hasattr(self,'customer_rows') and 0<=current<len(self.customer_rows) else None
         q = '%'+self.search.text()+'%'; status = self.filter.currentData()
         self.customer_rows = self.db.rows("SELECT c.*,a.name sender_name FROM customers c LEFT JOIN accounts a ON c.account_id=a.id WHERE (c.name LIKE ? OR c.text LIKE ? OR c.blogger LIKE ?) AND (?='' OR c.status=?) ORDER BY updated DESC LIMIT 1000",(q,q,q,status,status))
-        populate(self.customers,[[r['name'],STATUS.get(r['status'],r['status']),r['text'],format_beijing_time(r['comment_time']),r['video_title'],r['blogger'],r['uid'],r['sender_name'],r['message'],r['error']] for r in self.customer_rows])
+        view = [[r['name'],STATUS.get(r['status'],r['status']),r['text'],format_beijing_time(r['comment_time']),r['video_title'],r['blogger'],r['uid'],r['sender_name'],r['message'],r['error']] for r in self.customer_rows]
+        if view == getattr(self,'_customer_view',None): return
+        self._customer_view = view
+        populate(self.customers,view)
         colors = {'pending':'#80baff','processing':'#b7a2ff','sent':'#62d7b0','failed':'#f48b96','skipped':'#9ba9bd'}
         for i,r in enumerate(self.customer_rows):
             self.customers.item(i,1).setForeground(QColor(colors.get(r['status'],'#dbe5f3')))
@@ -709,11 +720,11 @@ class Window(QMainWindow):
     def add_manual_video(self):
         def action():
             url,ok = QInputDialog.getText(
-                self,'录入抖音视频','完整视频链接：',
-                text='https://www.douyin.com/video/')
+                self,'录入抖音视频 / 笔记','完整链接（https://www.douyin.com/video/… 或 /note/…）：',
+                text='https://www.douyin.com/')
             if not ok: return
             title,ok = QInputDialog.getText(
-                self,'录入抖音视频','视频标题（选填，便于搜索）：')
+                self,'录入抖音视频 / 笔记','标题（选填，便于搜索）：')
             if not ok: return
             ident = self.db.add_manual_video(url,title)
             self.refresh_videos()
@@ -723,7 +734,7 @@ class Window(QMainWindow):
                 if row['id']==ident:
                     self.videos.selectRow(index)
                     break
-            self.statusBar().showMessage('视频链接已加入待分析列表',5000)
+            self.statusBar().showMessage('链接已加入待分析列表',5000)
         self.report(action)
 
     def remove_manual_video(self):
@@ -828,11 +839,23 @@ class Window(QMainWindow):
             self.refresh_customers(); QMessageBox.information(self,'已备份并清空',str(path))
         self.report(action)
 
+    def force_shutdown(self):
+        # The worker did not stop in time (for example a hung page call).
+        # Never leave the operator with an unclosable window.
+        if self.engine.isRunning():
+            self.add_log('后台任务未能及时停止，已强制退出')
+            self.engine.terminate()
+            self.engine.wait(3000)
+        self.close()
+
     def closeEvent(self,event):
         if self.engine.isRunning():
             self.engine.command('shutdown')
             self.setEnabled(False)
-            self.engine.finished.connect(self.close)
+            if not getattr(self,'_closing',False):
+                self._closing = True
+                self.engine.finished.connect(self.close)
+                QTimer.singleShot(20000,self.force_shutdown)
             self.statusBar().showMessage('正在停止任务并关闭内嵌浏览器…')
             event.ignore()
         else:

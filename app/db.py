@@ -20,16 +20,29 @@ def user_id(value):
     return value
 
 
-def video_id(value):
-    """Extract a work ID from a full Douyin video URL."""
+WORK_KINDS = ('video','note')
+
+
+def work_url(ident, kind='video'):
+    """Canonical page URL of a video or an image-text note."""
+    return 'https://www.douyin.com/'+('note' if kind=='note' else 'video')+'/'+str(ident)
+
+
+def parse_work_url(value):
+    """Extract (work ID, kind) from a full Douyin video or note URL."""
     text = str(value or '').strip()
     parsed = urlparse(text)
     if parsed.scheme != 'https' or parsed.hostname not in ('www.douyin.com','douyin.com'):
-        raise ValueError('请输入完整的抖音视频链接（https://www.douyin.com/video/…）')
-    match = re.fullmatch(r'/video/(\d{8,})/?',parsed.path)
+        raise ValueError('请输入完整的抖音视频或笔记链接（https://www.douyin.com/video/… 或 /note/…）')
+    match = re.fullmatch(r'/(video|note)/(\d{8,})/?',parsed.path)
     if not match:
-        raise ValueError('链接中未找到 /video/数字作品ID；请粘贴视频页地址栏中的完整链接')
-    return match.group(1)
+        raise ValueError('链接中未找到 /video/ 或 /note/ 后的数字作品ID；请粘贴页面地址栏中的完整链接')
+    return match.group(2),match.group(1)
+
+
+def video_id(value):
+    """Extract a work ID from a full Douyin video or note URL."""
+    return parse_work_url(value)[0]
 
 
 class DB:
@@ -158,9 +171,9 @@ class DB:
         return int(count)
 
     def add_manual_video(self, url, title=''):
-        ident = video_id(url)
-        clean_url = 'https://www.douyin.com/video/'+ident
-        clean_title = ' '.join(str(title or '').split()) or '手动录入视频 '+ident
+        ident,kind = parse_work_url(url)
+        clean_url = work_url(ident,kind)
+        clean_title = ' '.join(str(title or '').split()) or ('手动录入笔记 ' if kind=='note' else '手动录入视频 ')+ident
         now = time.time()
         with self.connect() as c:
             if c.execute('SELECT 1 FROM videos WHERE id=?',(ident,)).fetchone():
@@ -194,6 +207,15 @@ class DB:
         except (TypeError, ValueError):
             created = 0
         now = time.time()
+        # Image-text notes live under /note/. Trust an explicit page URL only
+        # when it is a Douyin work URL for this very ID.
+        kind = 'note' if video.get('kind')=='note' else 'video'
+        page_url = work_url(ident,kind)
+        try:
+            explicit_id,explicit_kind = parse_work_url(video.get('url'))
+            if explicit_id==ident: page_url = work_url(ident,explicit_kind)
+        except ValueError:
+            pass
         with self.connect() as c:
             return bool(c.execute('''
                 INSERT INTO videos(id,title,author,source_type,source_name,source_ref,create_time,url,discovered_at)
@@ -201,9 +223,10 @@ class DB:
                 ON CONFLICT(id) DO UPDATE SET
                     title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE videos.title END,
                     author=CASE WHEN excluded.author<>'' THEN excluded.author ELSE videos.author END,
+                    url=CASE WHEN excluded.url LIKE '%/note/%' THEN excluded.url ELSE videos.url END,
                     create_time=CASE WHEN excluded.create_time>0 THEN excluded.create_time ELSE videos.create_time END
             ''',(ident,title,author_name,source_type,str(source_name),str(source_ref),created,
-                 'https://www.douyin.com/video/'+ident,now)).rowcount)
+                 page_url,now)).rowcount)
 
     def video_tasks(self, status=None):
         where = ' WHERE status=?' if status else ''
@@ -311,8 +334,13 @@ class DB:
             return c.total_changes-before
 
     def backup(self, path):
-        with self.connect() as src, sqlite3.connect(path) as dst:
-            src.backup(dst)
+        dst = sqlite3.connect(path)
+        try:
+            with self.connect() as src:
+                src.backup(dst)
+        finally:
+            # A lingering handle keeps the backup file locked on Windows.
+            dst.close()
 
     def data_page(self, table, search='', page=0, size=100):
         keys = {'comments':'id','customers':'uid','events':'id'}

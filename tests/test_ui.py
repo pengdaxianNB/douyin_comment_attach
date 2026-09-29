@@ -129,6 +129,21 @@ def test_manual_video_can_be_added_and_removed_from_video_page(tmp_path,monkeypa
     w.close();app.processEvents()
 
 
+def test_manual_note_link_can_be_added(tmp_path,monkeypatch):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    w=Window(db,tmp_path,start_engine=False)
+    answers=iter([('https://www.douyin.com/note/7690537643185017257',True),('',True)])
+    monkeypatch.setattr(QInputDialog,'getText',lambda *args,**kwargs:next(answers))
+
+    w.add_manual_video()
+
+    assert w.videos.rowCount()==1
+    assert w.videos.item(0,5).text()=='7690537643185017257'
+    assert db.video_tasks()[0]['url']=='https://www.douyin.com/note/7690537643185017257'
+    w.close();app.processEvents()
+
+
 def test_send_attempt_remains_in_processing_metric(tmp_path):
     app=QApplication.instance() or QApplication([])
     db=DB(tmp_path/'test.sqlite3')
