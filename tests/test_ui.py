@@ -25,10 +25,11 @@ def test_window():
         w.show(); app.processEvents()
         assert w.tabs.count()==7
         assert any(w.tabs.tabText(i)=='内嵌浏览器' for i in range(w.tabs.count()))
-        assert w.video_source_tabs.count()==3
+        assert w.video_source_tabs.count()==4
         assert w.video_source_tabs.tabText(0)=='关键词找视频'
-        assert w.video_source_tabs.tabText(1)=='指定博主找视频'
-        assert w.video_source_tabs.tabText(2)=='待分析视频（0）'
+        assert w.video_source_tabs.tabText(1)=='抖音搜索找视频'
+        assert w.video_source_tabs.tabText(2)=='指定博主找视频'
+        assert w.video_source_tabs.tabText(3)=='待分析视频（0）'
         assert w.fields['base_url'].text()==''
         assert w.fields['comment_days'].value()==7
         assert w.customers.rowCount()==0
@@ -43,7 +44,7 @@ def test_window():
                      'keyword','控糖')
         w.refresh_videos()
         assert w.videos.rowCount()==1
-        assert w.video_source_tabs.tabText(2)=='待分析视频（1）'
+        assert w.video_source_tabs.tabText(3)=='待分析视频（1）'
         w.video_search.setText('控糖')
         assert w.videos.rowCount()==1
         w.video_search.setText('不存在的标题')

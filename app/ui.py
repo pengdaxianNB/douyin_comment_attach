@@ -154,7 +154,7 @@ class Window(QMainWindow):
         self.build_database()
         self.tabs.currentChanged.connect(lambda: self.refresh_database() if self.tabs.currentWidget() is self.database_page else None)
         self.statusBar().showMessage('站点适配待实号验证 · 登录和验证码请在内嵌浏览器中处理')
-        self.refresh_accounts(); self.refresh_bloggers(); self.refresh_keywords(); self.refresh_videos(); self.refresh_customers()
+        self.refresh_accounts(); self.refresh_bloggers(); self.refresh_keywords(); self.refresh_search_keywords(); self.refresh_videos(); self.refresh_customers()
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_runtime_views); self.timer.start(4000)
         if start_engine:
             self.engine.start()
@@ -329,6 +329,21 @@ class Window(QMainWindow):
         self.keywords.itemSelectionChanged.connect(self.update_keyword_actions)
         self.update_keyword_actions()
 
+        search_page = QWidget(); search_page.setObjectName('subPage')
+        search_layout = QVBoxLayout(search_page); search_layout.setContentsMargins(18,18,18,18); search_layout.setSpacing(14)
+        self.video_source_tabs.addTab(search_page,'抖音搜索找视频')
+        search_bar = QHBoxLayout(); search_bar.setSpacing(12); search_layout.addLayout(search_bar)
+        search_title = QLabel('抖音搜索找视频'); search_title.setObjectName('sectionTitle'); search_bar.addWidget(search_title)
+        search_bar.addStretch()
+        search_bar.addWidget(button('新增搜索词',self.add_search_keyword))
+        self.delete_search_button = button('删除搜索词',self.delete_search_keyword); search_bar.addWidget(self.delete_search_button)
+        search_hint = QLabel('打开抖音网页版搜索页（douyin.com/search/关键词），不限发布时间，一直向下滑动加载，直到出现“暂时没有更多了”才结束；视频和图文笔记都会收集。视频较多时耗时较长。')
+        search_hint.setObjectName('muted'); search_hint.setWordWrap(True); search_layout.addWidget(search_hint)
+        self.search_keywords = table(['搜索词','范围'])
+        self.search_keywords.setColumnWidth(0,600); search_layout.addWidget(self.search_keywords,1)
+        self.search_keywords.itemSelectionChanged.connect(self.update_search_actions)
+        self.update_search_actions()
+
         bloggers_page = QWidget(); bloggers_page.setObjectName('subPage')
         bloggers_layout = QVBoxLayout(bloggers_page); bloggers_layout.setContentsMargins(18,18,18,18); bloggers_layout.setSpacing(14)
         self.video_source_tabs.addTab(bloggers_page,'指定博主找视频')
@@ -346,6 +361,7 @@ class Window(QMainWindow):
 
         videos_page = QWidget(); videos_page.setObjectName('subPage')
         videos_layout = QVBoxLayout(videos_page); videos_layout.setContentsMargins(18,18,18,18); videos_layout.setSpacing(14)
+        self.videos_page = videos_page
         self.video_source_tabs.addTab(videos_page,'待分析视频')
         video_bar = QHBoxLayout(); videos_layout.addLayout(video_bar)
         video_title = QLabel('待分析视频列表'); video_title.setObjectName('sectionTitle'); video_bar.addWidget(video_title)
@@ -375,6 +391,9 @@ class Window(QMainWindow):
 
     def update_keyword_actions(self):
         self.delete_keyword_button.setEnabled(bool(self.keywords.selectionModel().selectedRows()))
+
+    def update_search_actions(self):
+        self.delete_search_button.setEnabled(bool(self.search_keywords.selectionModel().selectedRows()))
 
     def update_manual_video_action(self):
         row = self.videos.currentRow()
@@ -580,13 +599,17 @@ class Window(QMainWindow):
         self.keyword_rows = self.db.rows('SELECT * FROM keywords ORDER BY id')
         populate(self.keywords,[[r['keyword'],'近7天'] for r in self.keyword_rows])
 
+    def refresh_search_keywords(self):
+        self.search_rows = self.db.rows('SELECT * FROM search_keywords ORDER BY id')
+        populate(self.search_keywords,[[r['keyword'],'全部结果（滑到底）'] for r in self.search_rows])
+
     def refresh_videos(self):
         all_rows = self.db.video_tasks() if hasattr(self.db,'video_tasks') else []
         query = self.video_search.text().strip().casefold()
         rows = [row for row in all_rows if query in str(row.get('title','')).casefold()]
         self.video_rows = rows
         view = [[VIDEO_STATUS.get(r['status'],r['status']),
-            ({'blogger':'博主：','keyword':'关键词：','manual':''}.get(r['source_type'],'')+r['source_name']),
+            ({'blogger':'博主：','keyword':'关键词：','search':'抖音搜索：','manual':''}.get(r['source_type'],'')+r['source_name']),
             r['title'],r['author'],
             (datetime.fromtimestamp(r['create_time'],BEIJING_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S') if r['create_time'] else ''),
             r['id'],r['error']] for r in rows]
@@ -602,7 +625,7 @@ class Window(QMainWindow):
         prefix = ('显示 '+str(len(rows))+' / 共 '+str(len(all_rows))+' 个'
                   if query else '共 '+str(len(all_rows))+' 个')
         self.video_summary.setText(prefix+((' · '+detail) if detail else ''))
-        self.video_source_tabs.setTabText(2,'待分析视频（'+str(len(all_rows))+'）')
+        self.video_source_tabs.setTabText(self.video_source_tabs.indexOf(self.videos_page),'待分析视频（'+str(len(all_rows))+'）')
         colors = {'pending':'#80baff','scanning':'#b7a2ff','done':'#62d7b0','failed':'#f48b96'}
         for i,row in enumerate(rows if changed else ()):
             self.videos.item(i,0).setForeground(QColor(colors.get(row['status'],'#dbe5f3')))
@@ -717,6 +740,24 @@ class Window(QMainWindow):
             self.refresh_keywords()
         self.report(action)
 
+    def add_search_keyword(self):
+        def action():
+            value,ok = QInputDialog.getText(self,'新增抖音搜索词','搜索关键词：')
+            value = value.strip()
+            if not ok or not value: return
+            inserted = self.db.execute('INSERT OR IGNORE INTO search_keywords(keyword) VALUES (?)',(value,))
+            if not inserted: raise ValueError('该搜索词已存在')
+            self.refresh_search_keywords()
+            self.statusBar().showMessage('搜索词已添加；下次视频清单重建时生效',5000)
+        self.report(action)
+
+    def delete_search_keyword(self):
+        def action():
+            row = self.selected(self.search_keywords,self.search_rows)
+            self.db.execute('DELETE FROM search_keywords WHERE id=?',(row['id'],))
+            self.refresh_search_keywords()
+        self.report(action)
+
     def add_manual_video(self):
         def action():
             url,ok = QInputDialog.getText(
@@ -729,7 +770,7 @@ class Window(QMainWindow):
             ident = self.db.add_manual_video(url,title)
             self.refresh_videos()
             self.video_search.clear()
-            self.video_source_tabs.setCurrentIndex(2)
+            self.video_source_tabs.setCurrentWidget(self.videos_page)
             for index,row in enumerate(self.video_rows):
                 if row['id']==ident:
                     self.videos.selectRow(index)
@@ -757,7 +798,7 @@ class Window(QMainWindow):
                 self.statusBar().showMessage('待分析视频列表已经为空；主号下一轮会重新找视频',5000)
                 return
             text = (f'确认清空全部 {count} 个待分析视频？\n\n'
-                    '清空后，主号检测到列表为空时会重新从全部博主和关键词来源找视频。')
+                    '清空后，主号检测到列表为空时会重新从全部搜索词、关键词和博主来源找视频。')
             if QMessageBox.question(self,'清空待分析视频',text)!=QMessageBox.StandardButton.Yes:
                 return
             removed = self.db.clear_videos()

@@ -1,7 +1,11 @@
 import asyncio
 from unittest.mock import AsyncMock
 from types import SimpleNamespace
-from app.browser import Browser,creator_search_videos,is_douyin_host,reached_video_cutoff
+
+import pytest
+
+from app.browser import (Browser,NeedsAttention,creator_search_videos,human_scroll,is_douyin_host,
+                         reached_video_cutoff,search_result_videos)
 
 
 def packet(*videos):
@@ -145,3 +149,124 @@ def test_capture_recovers_when_first_matching_response_is_not_json(monkeypatch):
     assert visits==2
     assert '页面响应无法解析' in logs[0]
     assert any('有效数据已正常采集' in warning for warning in browser.warnings)
+
+
+def search_page(pages, end_after, hrefs=()):
+    """Fake search page: every wheel turn delivers the next batch of results."""
+    callback=None
+    state={'wheels':0}
+    anchors=[SimpleNamespace(get_attribute=AsyncMock(return_value=href)) for href in hrefs]
+    frame=SimpleNamespace(locator=lambda selector:SimpleNamespace(all=AsyncMock(return_value=anchors)))
+    marker=SimpleNamespace(is_visible=AsyncMock(side_effect=lambda:state['wheels']>=end_after))
+    page=SimpleNamespace(frames=[frame],remove_listener=lambda *args:None,
+                         get_by_text=lambda text:SimpleNamespace(first=marker))
+    def deliver(index):
+        if index<len(pages):
+            callback(SimpleNamespace(url='https://www.douyin.com/aweme/v1/web/general/search/single/?keyword=x',
+                                     json=AsyncMock(return_value=pages[index])))
+    async def wheel(*args):
+        state['wheels']+=1
+        deliver(state['wheels'])
+    page.mouse=SimpleNamespace(move=AsyncMock(),wheel=wheel)
+    def on(event,fn):
+        nonlocal callback
+        callback=fn
+    page.on=on
+    async def goto(*args,**kwargs):
+        deliver(0)
+    page.goto=goto
+    return page,state
+
+
+def patch_scroll(monkeypatch, page):
+    async def one_wheel(target):
+        await target.mouse.wheel(0,1000)
+    monkeypatch.setattr('app.browser.human_scroll',one_wheel)
+
+
+def search_payload(*items):
+    return {'data':[{'aweme_info':item} for item in items]}
+
+
+def test_search_result_videos_reads_only_result_list_and_marks_notes():
+    payload={'data':[
+        {'aweme_info':{'aweme_id':'1234567890123456789','desc':'视频','create_time':1700000000,'author':{'nickname':'甲'}}},
+        {'aweme_info':{'aweme_id':'2234567890123456789','desc':'笔记','aweme_type':68}},
+        {'user_list':[{'aweme_id':'3234567890123456789','desc':'相关用户卡片'}]},
+        {'aweme_info':{'aweme_id':'bad','desc':'非法ID'}},
+    ],'user_list':[{'aweme_id':'4234567890123456789'}]}
+    result={video['aweme_id']:video for video in search_result_videos(payload)}
+    assert set(result)=={'1234567890123456789','2234567890123456789'}
+    assert result['1234567890123456789']['author']=={'nickname':'甲'}
+    assert result['2234567890123456789']['kind']=='note'
+    assert search_result_videos(None)==[] and search_result_videos({'data':None})==[]
+
+
+def test_search_videos_scrolls_until_no_more_marker(monkeypatch):
+    pages=[search_payload({'aweme_id':'1234567890123456789','desc':'一'}),
+           search_payload({'aweme_id':'2234567890123456789','desc':'二'}),
+           search_payload({'aweme_id':'3234567890123456789','desc':'三','aweme_type':68})]
+    page,state=search_page(pages,end_after=2,hrefs=['/video/5234567890123456789','https://www.douyin.com/note/6234567890123456789'])
+    browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard=AsyncMock()
+    monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
+    patch_scroll(monkeypatch,page)
+    result=asyncio.run(browser.search_videos(' 干细胞 '))
+    assert state['wheels']==2
+    ids={video['aweme_id']:video for video in result}
+    assert set(ids)=={'1234567890123456789','2234567890123456789','3234567890123456789',
+                      '5234567890123456789','6234567890123456789'}
+    assert ids['3234567890123456789']['kind']=='note' and ids['6234567890123456789']['kind']=='note'
+    assert not browser.warnings
+
+
+def test_search_videos_url_and_incomplete_warning(monkeypatch):
+    urls=[]
+    page,state=search_page([search_payload({'aweme_id':'1234567890123456789','desc':'一'})],end_after=10**9)
+    inner=page.goto
+    async def goto(url,**kwargs):
+        urls.append(url); await inner(url,**kwargs)
+    page.goto=goto
+    browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard=AsyncMock()
+    monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
+    patch_scroll(monkeypatch,page)
+    result=asyncio.run(browser.search_videos('干细胞'))
+    assert urls==['https://www.douyin.com/search/%E5%B9%B2%E7%BB%86%E8%83%9E']
+    assert [video['aweme_id'] for video in result]==['1234567890123456789']
+    assert '暂时没有更多了' in browser.warnings[0]
+
+
+def test_search_videos_without_any_result_needs_attention(monkeypatch):
+    page,_=search_page([],end_after=10**9)
+    browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard=AsyncMock()
+    monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
+    patch_scroll(monkeypatch,page)
+    with pytest.raises(NeedsAttention):
+        asyncio.run(browser.search_videos('干细胞'))
+    assert asyncio.run(browser.search_videos('  ')) == []
+
+
+def test_human_scroll_varies_position_distance_and_timing(monkeypatch):
+    import random
+    sleeps=[]
+    async def sleep(seconds): sleeps.append(seconds)
+    monkeypatch.setattr('app.browser.asyncio.sleep',sleep)
+    totals=set(); positions=set(); scrolled_back=False
+    for seed in range(40):
+        page=SimpleNamespace(viewport_size={'width':1000,'height':700},
+                             mouse=SimpleNamespace(move=AsyncMock(),wheel=AsyncMock()))
+        asyncio.run(human_scroll(page,random.Random(seed)))
+        deltas=[call.args[1] for call in page.mouse.wheel.await_args_list]
+        down=sum(d for d in deltas if d>0)
+        assert 600<=down<=1800
+        scrolled_back=scrolled_back or any(d<0 for d in deltas)
+        totals.add(down)
+        x,y=page.mouse.move.await_args.args
+        assert 300<=x<=700 and 245<=y<=490
+        assert page.mouse.move.await_args.kwargs['steps']>=4
+        positions.add((round(x),round(y)))
+    assert len(totals)>20 and len(positions)>20 and scrolled_back
+    assert len({round(value,2) for value in sleeps})>50
+    assert min(sleeps)>=.06

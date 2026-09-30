@@ -57,12 +57,13 @@ class DB:
             CREATE UNIQUE INDEX IF NOT EXISTS one_main ON accounts(role) WHERE role='main';
             CREATE TABLE IF NOT EXISTS bloggers(id TEXT PRIMARY KEY,name TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS keywords(id INTEGER PRIMARY KEY AUTOINCREMENT,keyword TEXT NOT NULL UNIQUE);
+            CREATE TABLE IF NOT EXISTS search_keywords(id INTEGER PRIMARY KEY AUTOINCREMENT,keyword TEXT NOT NULL UNIQUE);
             CREATE TABLE IF NOT EXISTS manual_videos(id TEXT PRIMARY KEY,url TEXT NOT NULL,title TEXT NOT NULL DEFAULT '',added_at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS videos(
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL DEFAULT '',
                 author TEXT NOT NULL DEFAULT '',
-                source_type TEXT NOT NULL CHECK(source_type IN ('blogger','keyword','manual')),
+                source_type TEXT NOT NULL CHECK(source_type IN ('blogger','keyword','manual','search')),
                 source_name TEXT NOT NULL DEFAULT '',
                 source_ref TEXT NOT NULL DEFAULT '',
                 create_time INTEGER NOT NULL DEFAULT 0,
@@ -80,19 +81,19 @@ class DB:
             if 'daily_limit' not in account_columns:
                 c.execute('ALTER TABLE accounts ADD COLUMN daily_limit INTEGER NOT NULL DEFAULT 0')
             video_schema = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='videos'").fetchone()['sql']
-            if "'manual'" not in video_schema:
+            if "'manual'" not in video_schema or "'search'" not in video_schema:
                 c.executescript('''
-                ALTER TABLE videos RENAME TO videos_without_manual;
+                ALTER TABLE videos RENAME TO videos_before_source_change;
                 CREATE TABLE videos(
                     id TEXT PRIMARY KEY,title TEXT NOT NULL DEFAULT '',author TEXT NOT NULL DEFAULT '',
-                    source_type TEXT NOT NULL CHECK(source_type IN ('blogger','keyword','manual')),
+                    source_type TEXT NOT NULL CHECK(source_type IN ('blogger','keyword','manual','search')),
                     source_name TEXT NOT NULL DEFAULT '',source_ref TEXT NOT NULL DEFAULT '',
                     create_time INTEGER NOT NULL DEFAULT 0,url TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','scanning','done','failed')),
                     error TEXT NOT NULL DEFAULT '',discovered_at REAL NOT NULL,scanned_at REAL
                 );
-                INSERT INTO videos SELECT * FROM videos_without_manual;
-                DROP TABLE videos_without_manual;
+                INSERT INTO videos SELECT * FROM videos_before_source_change;
+                DROP TABLE videos_before_source_change;
                 ''')
             c.execute("UPDATE customers SET status='failed',error=CASE WHEN error='' THEN '历史待核验记录，发送结果不明，请勿重复联系' ELSE error END WHERE status='uncertain'")
             # An interrupted comment scan is safe to retry: comments are

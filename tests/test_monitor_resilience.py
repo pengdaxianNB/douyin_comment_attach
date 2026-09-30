@@ -386,3 +386,44 @@ def test_rebuild_skips_one_blogger_with_unparseable_response(tmp_path):
     assert browser.videos.await_count==2
     assert [row['id'] for row in db.video_tasks()]==[good['aweme_id']]
     assert any('A 异常博主' in line and '继续其他来源' in line for line in logs)
+
+
+def test_rebuild_scans_douyin_search_between_keywords_and_bloggers(tmp_path):
+    db=DB(tmp_path/'test.sqlite3')
+    db.execute("INSERT INTO keywords(keyword) VALUES ('控糖')")
+    db.execute("INSERT INTO search_keywords(keyword) VALUES ('干细胞')")
+    db.execute("INSERT INTO bloggers(id,name) VALUES ('blogger-id','博主甲')")
+    order=[]
+    async def keyword_videos(keyword,days):
+        order.append(('keyword',keyword)); return []
+    async def search_videos(keyword):
+        order.append(('search',keyword))
+        return [{'aweme_id':'4234567890123456789','desc':'搜索视频','author':{}},
+                {'aweme_id':'5234567890123456789','desc':'搜索笔记','author':{},'kind':'note'}]
+    async def blogger_videos(uid,days):
+        order.append(('blogger',uid)); return []
+    browser=SimpleNamespace(keyword_videos=keyword_videos,search_videos=search_videos,videos=blogger_videos)
+    engine=Engine(db,tmp_path)
+
+    complete=asyncio.run(engine.rebuild_video_list({'id':'main','name':'主号'},browser,{'days':7}))
+
+    assert complete
+    assert order==[('keyword','控糖'),('search','干细胞'),('blogger','blogger-id')]
+    rows={row['id']:row for row in db.video_tasks()}
+    assert {row['source_type'] for row in rows.values()}=={'search'}
+    assert rows['5234567890123456789']['url'].endswith('/note/5234567890123456789')
+
+
+def test_rebuild_with_only_search_keyword_is_allowed_and_failure_is_isolated(tmp_path):
+    db=DB(tmp_path/'test.sqlite3')
+    db.execute("INSERT INTO search_keywords(keyword) VALUES ('坏词'),('好词')")
+    async def search_videos(keyword):
+        if keyword=='坏词': raise NeedsAttention('抖音搜索页没有捕获到任何作品')
+        return [{'aweme_id':'4234567890123456789','desc':'搜索视频','author':{}}]
+    engine=Engine(db,tmp_path)
+
+    complete=asyncio.run(engine.rebuild_video_list({'id':'main','name':'主号'},
+        SimpleNamespace(search_videos=search_videos),{'days':7}))
+
+    assert complete is False
+    assert [row['id'] for row in db.video_tasks()]==['4234567890123456789']

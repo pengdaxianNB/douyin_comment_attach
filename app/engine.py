@@ -385,9 +385,10 @@ class Engine(QThread):
         """Discover videos from every configured source before comment scans."""
         bloggers = self.db.rows('SELECT * FROM bloggers ORDER BY name,id')
         keywords = self.db.rows('SELECT * FROM keywords ORDER BY id')
+        searches = self.db.rows('SELECT * FROM search_keywords ORDER BY id')
         manual_videos = self.db.rows('SELECT * FROM manual_videos ORDER BY added_at,id')
-        if not bloggers and not keywords and not manual_videos:
-            raise ValueError('请先添加关键词、监控博主或手动视频链接')
+        if not bloggers and not keywords and not searches and not manual_videos:
+            raise ValueError('请先添加关键词、抖音搜索词、监控博主或手动视频链接')
         complete = True
         for row in keywords:
             keyword = row['keyword']
@@ -409,6 +410,27 @@ class Engine(QThread):
             for video in videos:
                 self.db.add_video(video,'keyword',keyword,keyword)
             self.log.emit('关键词“'+keyword+'”：近 7 天已加入待分析视频 '+str(len(videos))+' 个')
+            self.changed.emit()
+        for row in searches:
+            keyword = row['keyword']
+            self.status.emit(account['id'],'抖音搜索找视频：'+keyword)
+            try:
+                videos = await browser.search_videos(keyword)
+            except AccountNeedsAttention:
+                raise
+            except NeedsAttention as exc:
+                complete = False
+                self.log.emit(account['name']+f'：抖音搜索“{keyword}”视频获取失败，已跳过并继续其他来源：{exc}')
+                continue
+            except (PlaywrightError, asyncio.TimeoutError) as exc:
+                complete = False
+                self.log.emit(account['name']+f'：抖音搜索“{keyword}”页面操作超时，正在重建浏览器并继续其他来源：{exc or "超时"}')
+                browser = await self.rebuild_browser(account)
+                browser.s = settings
+                continue
+            for video in videos:
+                self.db.add_video(video,'search',keyword,keyword)
+            self.log.emit('抖音搜索“'+keyword+'”：已加入待分析视频 '+str(len(videos))+' 个')
             self.changed.emit()
         for blogger in bloggers:
             self.status.emit(account['id'],'整理视频：'+blogger['name'])

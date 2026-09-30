@@ -2,6 +2,7 @@
 import asyncio
 import json
 from pathlib import Path
+import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -172,6 +173,76 @@ def creator_search_videos(payload):
 
     visit(payload)
     return list(result.values())
+
+
+SEARCH_END_TEXT = '暂时没有更多了'
+# Safety cap only: a search normally ends at the "no more" marker long before.
+SEARCH_MAX_SCROLLS = 600
+SEARCH_STALE_LIMIT = 6
+# Every so often take a longer break, like someone stepping away for a moment.
+SEARCH_BREAK_EVERY = (12,25)
+SEARCH_BREAK_SECONDS = (8,20)
+
+
+def search_result_videos(payload):
+    """Extract works from a douyin.com search response (``data[].aweme_info``).
+
+    Only the result list itself is read.  Related-user cards and other side
+    widgets in the same response are deliberately ignored so that unrelated
+    works never enter the video queue.
+    """
+    result = {}
+    entries = payload.get('data') if isinstance(payload,dict) else None
+    for entry in entries if isinstance(entries,list) else []:
+        if not isinstance(entry,dict):
+            continue
+        item = entry.get('aweme_info')
+        if not isinstance(item,dict):
+            item = entry if entry.get('aweme_id') else None
+        if not isinstance(item,dict):
+            continue
+        ident = str(item.get('aweme_id') or '')
+        if not re.fullmatch(r'\d{8,}',ident):
+            continue
+        try:
+            created = int(item.get('create_time') or 0)
+        except (TypeError,ValueError):
+            created = 0
+        author = item.get('author')
+        result[ident] = dict(aweme_id=ident,desc=str(item.get('desc') or ''),
+                             author=author if isinstance(author,dict) else {},
+                             create_time=created,kind='note' if is_note_post(item) else 'video')
+    return list(result.values())
+
+
+async def human_scroll(page, rng=random):
+    """Scroll a results feed the way a person browsing it would.
+
+    A fixed wheel delta on a fixed timer is an easy automation signature.
+    Each call varies the pointer position, splits the distance into uneven
+    wheel ticks with short gaps, sometimes drifts back up a little, and ends
+    with a "reading" pause of random length (occasionally a long one).
+    """
+    size = getattr(page,'viewport_size',None) or {}
+    width = size.get('width') or 1200
+    height = size.get('height') or 800
+    await page.mouse.move(rng.uniform(width*.3,width*.7),rng.uniform(height*.35,height*.7),
+                          steps=rng.randint(4,14))
+    remaining = rng.randint(600,1800)
+    while remaining > 0:
+        step = min(remaining,rng.randint(90,420))
+        await page.mouse.wheel(0,step)
+        remaining -= step
+        await asyncio.sleep(rng.uniform(.06,.4))
+    if rng.random() < .12:
+        await asyncio.sleep(rng.uniform(.4,1.2))
+        await page.mouse.wheel(0,-rng.randint(80,320))
+        await asyncio.sleep(rng.uniform(.4,1.0))
+    # Give the next batch time to load and the "reader" time to look at it.
+    pause = rng.uniform(1.5,4.0)
+    if rng.random() < .12:
+        pause += rng.uniform(4,10)
+    await asyncio.sleep(pause)
 
 
 def is_send_icon(candidate, editor_rect):
@@ -1092,6 +1163,103 @@ class Browser:
         # publish time. Known timestamps receive the same local safety filter.
         return [video for video in items.values()
                 if not video.get('create_time') or int(video['create_time']) >= cutoff]
+
+    async def search_videos(self, keyword):
+        """Collect every work listed by douyin.com's own search page.
+
+        The result feed loads more works as the page is scrolled and shows
+        "暂时没有更多了" once it is exhausted; scrolling stops there.
+        """
+        keyword = str(keyword).strip()
+        if not keyword:
+            return []
+        url = 'https://www.douyin.com/search/'+quote(keyword)
+        items = {}
+        tasks = set()
+
+        async def consume(response):
+            parsed = urlparse(response.url)
+            if not is_douyin_host(parsed.hostname) or '/aweme/v1/web/' not in parsed.path or 'search' not in parsed.path:
+                return
+            try:
+                payload = await response.json()
+            except Exception:
+                return
+            for video in search_result_videos(payload):
+                items[str(video['aweme_id'])] = video
+
+        def receive(response):
+            task = asyncio.create_task(consume(response))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+        async def collect_links():
+            # The rendered cards link to the final work page; merge them with
+            # response data so a changed API shape still yields the videos.
+            for frame in self.page.frames:
+                try:
+                    anchors = await frame.locator(
+                        'a[href*="douyin.com/video/"], a[href*="douyin.com/note/"], a[href^="/video/"], a[href^="/note/"]').all()
+                except PlaywrightError:
+                    continue
+                for anchor in anchors:
+                    try:
+                        href = await anchor.get_attribute('href') or ''
+                    except PlaywrightError:
+                        continue
+                    match = re.search(r'/(video|note)/(\d{8,})',href)
+                    if not match:
+                        continue
+                    ident = match.group(2)
+                    if ident not in items:
+                        items[ident] = dict(aweme_id=ident,desc='',author={},create_time=0,
+                                            kind='note' if match.group(1)=='note' else 'video')
+
+        async def reached_end():
+            try:
+                marker = self.page.get_by_text(SEARCH_END_TEXT).first
+                return await marker.is_visible()
+            except PlaywrightError:
+                return False
+
+        self.page.on('response',receive)
+        try:
+            await self.page.goto(url,wait_until='domcontentloaded')
+            await asyncio.sleep(3)
+            stale = 0
+            finished = False
+            until_break = random.randint(*SEARCH_BREAK_EVERY)
+            for _ in range(SEARCH_MAX_SCROLLS):
+                await self.guard()
+                if tasks:
+                    await asyncio.gather(*list(tasks))
+                before = len(items)
+                await collect_links()
+                if await reached_end():
+                    finished = True
+                    break
+                await human_scroll(self.page)
+                until_break -= 1
+                if until_break <= 0:
+                    await asyncio.sleep(random.uniform(*SEARCH_BREAK_SECONDS))
+                    until_break = random.randint(*SEARCH_BREAK_EVERY)
+                stale = stale+1 if len(items)==before else 0
+                if stale >= SEARCH_STALE_LIMIT:
+                    break
+            if tasks:
+                await asyncio.gather(*list(tasks))
+            await collect_links()
+        finally:
+            self.page.remove_listener('response',receive)
+            if tasks:
+                await asyncio.gather(*list(tasks),return_exceptions=True)
+        if not items:
+            if finished:
+                return []
+            raise NeedsAttention('抖音搜索页没有捕获到任何作品，请检查登录状态或页面结构')
+        if not finished:
+            self.warnings.append(f'搜索“{keyword}”未出现“{SEARCH_END_TEXT}”就停止加载，本轮覆盖可能不完整')
+        return list(items.values())
 
     async def comments(self, video):
         video_id = str(video['aweme_id'])

@@ -41,6 +41,22 @@ class CoreTests(unittest.TestCase):
         migrated=DB(path)
         migrated.add_manual_video('https://www.douyin.com/video/1234567890123456789')
         self.assertEqual(migrated.video_tasks()[0]['source_type'],'manual')
+    def test_video_table_gains_search_source_support_and_keeps_rows(self):
+        import sqlite3
+        path=Path(self.tmp.name)/'manual-only-videos.sqlite3'
+        with sqlite3.connect(path) as connection:
+            connection.execute('''CREATE TABLE videos(
+                id TEXT PRIMARY KEY,title TEXT NOT NULL DEFAULT '',author TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL CHECK(source_type IN ('blogger','keyword','manual')),
+                source_name TEXT NOT NULL DEFAULT '',source_ref TEXT NOT NULL DEFAULT '',
+                create_time INTEGER NOT NULL DEFAULT 0,url TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','scanning','done','failed')),
+                error TEXT NOT NULL DEFAULT '',discovered_at REAL NOT NULL,scanned_at REAL)''')
+            connection.execute("INSERT INTO videos(id,title,source_type,url,discovered_at) VALUES ('1','旧','keyword','https://www.douyin.com/video/1',1)")
+        migrated=DB(path)
+        migrated.add_video({'aweme_id':'2234567890123456789','desc':'搜索'},'search','干细胞')
+        self.assertEqual({r['source_type'] for r in migrated.video_tasks()},{'keyword','search'})
+        self.assertEqual(migrated.rows('SELECT keyword FROM search_keywords'),[])
     def test_dedupe_and_preserve_sent(self):
         self.assertTrue(self.db.ingest(self.comment(),True,'需求明确'))
         self.assertFalse(self.db.ingest(self.comment(),True,'重复'))
