@@ -69,6 +69,19 @@ def table(headers):
     return t
 
 
+class NoWheelSpinBox(QSpinBox):
+    # Ignore the wheel so scrolling the settings page never changes a value by accident.
+    def __init__(self):
+        super().__init__(); self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    def wheelEvent(self, event): event.ignore()
+
+
+class NoWheelComboBox(QComboBox):
+    def __init__(self):
+        super().__init__(); self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    def wheelEvent(self, event): event.ignore()
+
+
 def populate(t, rows):
     t.setRowCount(len(rows))
     for i,row in enumerate(rows):
@@ -415,12 +428,12 @@ class Window(QMainWindow):
         for k,v in DEFAULTS.items():
             val = self.db.setting(k,v)
             if k in ('thinking_mode','thinking_effort'):
-                field = QComboBox()
+                field = NoWheelComboBox()
                 options = [('跟随服务默认','default'),('开启','enabled'),('关闭','disabled')] if k=='thinking_mode' else [('低（low）','low'),('高（high）','high'),('最高（max）','max')]
                 for label,value in options: field.addItem(label,value)
                 field.setCurrentIndex(max(0,field.findData(val)))
             elif isinstance(v,int):
-                field = QSpinBox(); field.setRange(1,20 if k=='ai_concurrency' else 86400 if k=='poll_seconds' else 1000); field.setValue(val)
+                field = NoWheelSpinBox(); field.setRange(1,20 if k=='ai_concurrency' else 86400 if k=='poll_seconds' else 1000); field.setValue(val)
             elif k.endswith('prompt'):
                 field = QPlainTextEdit(val); field.setMinimumHeight(300)
             else: field = QLineEdit(val)
