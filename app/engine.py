@@ -7,7 +7,7 @@ from PySide6.QtCore import QThread, Signal
 from playwright.async_api import async_playwright, Error as PlaywrightError
 from playwright._impl._async_base import mapping as async_api_mapping
 from .ai import AI, get_key
-from .browser import Browser, AccountNeedsAttention, CommentPageUnavailable, VideoUnavailable, NeedsAttention, UncertainSend, SkippedCustomer, PrivateAccount
+from .browser import Browser, AccountNeedsAttention, CommentPageUnavailable, VideoUnavailable, NeedsAttention, UncertainSend, SkippedCustomer, PrivateAccount, detach_cdp_session
 from .classifier import classify_comments
 from .embedded_browser import MARKER_PREFIX, page_id, unregister_page
 
@@ -20,6 +20,9 @@ DEFAULTS = dict(days=7,comment_days=7,video_list_reset_hours=24,ai_concurrency=5
 # whole QWebEnginePage periodically also releases renderer/process state that a
 # normal navigation cannot reach, while preserving the account profile/login.
 PAGE_RECYCLE_OPERATIONS = 20
+PAGE_CLEANUP_TIMEOUT = 15
+BROWSER_OPEN_TIMEOUT = 45
+BROWSER_REBUILD_ATTEMPTS = 3
 
 # Unattended stability: transient failures back off and retry instead of ending
 # the job. After this many consecutive failures the account is stopped so an
@@ -147,7 +150,7 @@ class Engine(QThread):
                 log=lambda text:self.log.emit(account['name']+'：'+text),page=page)
             self.contexts[ident] = b
             try:
-                await b.init()
+                await asyncio.wait_for(b.init(),timeout=BROWSER_OPEN_TIMEOUT)
             except BaseException:
                 self.contexts.pop(ident,None)
                 raise
@@ -158,24 +161,33 @@ class Engine(QThread):
         ident = account['id']
         self.page_operations[ident] = 0
         contexts = getattr(self,'contexts',None)
-        if contexts is not None:
-            contexts.pop(ident,None)
-        # Prevent embedded_page() from immediately rediscovering the stale
-        # target before the queued GUI reset signal is handled.
-        unregister_page(ident)
         if memory_cleanup:
             self.status.emit(ident,'正在定期释放浏览器内存')
             self.log.emit(account['name']+'：达到页面操作回收周期，正在重建该账号浏览器')
         else:
             self.status.emit(ident,'浏览器无响应，正在自动重建')
             self.log.emit(account['name']+'：检测到页面超时或内核异常，正在重建该账号浏览器')
-        self.browser_reset.emit(ident)
-        try:
-            browser = await self.open(account)
-        except Exception as exc:
-            raise AccountNeedsAttention('浏览器自动重建失败，请停止该账号后点击“重启浏览器”：'+str(exc)) from exc
-        self.log.emit(account['name']+'：浏览器已重建，将继续处理队列')
-        return browser
+        for attempt in range(1,BROWSER_REBUILD_ATTEMPTS+1):
+            if contexts is not None:
+                contexts.pop(ident,None)
+            unregister_page(ident)
+            self.browser_reset.emit(ident)
+            try:
+                browser = await asyncio.wait_for(self.open(account),timeout=BROWSER_OPEN_TIMEOUT)
+            except AccountNeedsAttention:
+                raise
+            except Exception as exc:
+                reason = str(exc) or '连接或初始化超过处理时限'
+                if attempt == BROWSER_REBUILD_ATTEMPTS:
+                    raise AccountNeedsAttention(
+                        f'浏览器连续 {attempt} 次自动重建失败，请停止该账号后点击“重启浏览器”：'+reason) from exc
+                delay = 5*attempt
+                self.status.emit(ident,f'浏览器重建失败，{delay} 秒后重试（{attempt}/{BROWSER_REBUILD_ATTEMPTS}）')
+                self.log.emit(account['name']+f'：浏览器重建暂时失败，{delay} 秒后自动重试：'+reason)
+                await asyncio.sleep(delay)
+                continue
+            self.log.emit(account['name']+'：浏览器已重建，将继续处理队列')
+            return browser
 
     async def maintain_browser_memory(self, account, browser):
         """Bound per-account Chromium growth between completed operations."""
@@ -191,15 +203,17 @@ class Engine(QThread):
             return rebuilt
         release = getattr(browser,'release_page_memory',None)
         if release is not None:
+            self.status.emit(ident,f'正在释放页面内存（最多 {PAGE_CLEANUP_TIMEOUT} 秒）')
             try:
-                await release()
+                await asyncio.wait_for(release(),timeout=PAGE_CLEANUP_TIMEOUT)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # Cleanup must not turn a successfully handled video/customer
-                # into a business failure. The periodic full rebuild remains a
-                # hard fallback.
-                self.log.emit(account['name']+'：页面内存轻量清理未完成，将在定期重建时回收：'+str(exc))
+                # CDP heap collection has no built-in timeout. If it hangs
+                # after unloading to about:blank, rebuild instead of leaving
+                # the sender stuck between two customers indefinitely.
+                self.log.emit(account['name']+'：页面内存清理超时或失败，正在自动重建：'+(str(exc) or '超过处理时限'))
+                return await self.rebuild_browser(account)
         return browser
 
     def cdp_endpoint(self):
@@ -231,17 +245,39 @@ class Engine(QThread):
     async def embedded_page(self, ident):
         browser = await self.connect_embedded_browser()
         expected = MARKER_PREFIX+ident
-        for _ in range(60):
+        deadline = asyncio.get_running_loop().time()+15
+
+        async def matches(context,page,expected_target):
+            session = None
+            try:
+                session = await context.new_cdp_session(page)
+                info = await session.send('Target.getTargetInfo')
+                target = (info.get('targetInfo') or {}).get('targetId')
+                # Known target IDs don't require touching another account's
+                # renderer, which may be frozen and never answer title().
+                if expected_target:
+                    return target == expected_target
+                return await page.title() == expected
+            finally:
+                if session is not None:
+                    await detach_cdp_session(session)
+
+        while asyncio.get_running_loop().time() < deadline:
             expected_target = page_id(ident)
+            if expected_target is None:
+                # A GUI reset is pending. Do not bind an old marker page while
+                # the new target has not been registered yet.
+                await asyncio.sleep(0.25)
+                continue
             for context in browser.contexts:
                 for page in context.pages:
+                    remaining = deadline-asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
                     try:
-                        session = await context.new_cdp_session(page)
-                        info = await session.send('Target.getTargetInfo')
-                        await session.detach()
-                        target = (info.get('targetInfo') or {}).get('targetId')
-                        if (expected_target and target == expected_target) or await page.title() == expected:
-                            return page
+                        if await asyncio.wait_for(matches(context,page,expected_target),timeout=min(2,remaining)):
+                            if page_id(ident) == expected_target:
+                                return page
                     except Exception:
                         pass
             await asyncio.sleep(0.25)
@@ -616,10 +652,13 @@ class Engine(QThread):
                                   '页面操作超时或失败，尚未提交发送')+'：'+(str(exc) or '超过处理时限')
                         self.db.finish(customer['uid'],ident,'failed',message,detail)
                         self.log.emit(account['name']+'：'+detail)
+                        customer = None
                         b = await self.rebuild_browser(account)
                     self.changed.emit()
-                    b = await self.maintain_browser_memory(account,b)
+                    # The customer's outcome is final before maintenance. A
+                    # reset failure/cancellation must not overwrite it.
                     customer = None
+                    b = await self.maintain_browser_memory(account,b)
                     if skip_cooldown:
                         self.status.emit(ident,'私密账号已跳过，继续处理')
                         continue

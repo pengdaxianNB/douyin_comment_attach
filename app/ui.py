@@ -245,6 +245,7 @@ class Window(QMainWindow):
                 self.browser_empty = None
             widget = EmbeddedBrowser(self.data/'embedded_profiles'/ident,ident,self)
             widget.restart_requested.connect(self.restart_account_browser)
+            widget.set_task_status(self.states.get(ident,'等待操作'))
             self.browser_widgets[ident] = widget
             self.browser_tabs.addTab(widget,account['name'])
         else:
@@ -577,7 +578,11 @@ class Window(QMainWindow):
         logging.getLogger('panda').info(text)
 
     def account_status(self, ident, status):
-        self.states[ident]=status; self.refresh_accounts()
+        self.states[ident]=status
+        widget = self.browser_widgets.get(ident)
+        if widget is not None:
+            widget.set_task_status(status)
+        self.refresh_accounts()
 
     def schedule_runtime_refresh(self):
         if not self.refresh_timer.isActive():

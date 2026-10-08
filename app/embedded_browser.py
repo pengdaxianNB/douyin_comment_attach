@@ -5,7 +5,7 @@ import threading
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import (QHBoxLayout, QLineEdit, QPushButton, QStackedLayout,
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QLineEdit, QPushButton, QStackedLayout,
     QStackedWidget, QTabWidget, QVBoxLayout, QWidget)
 from shiboken6 import delete as delete_qt_object, isValid
 
@@ -103,6 +103,10 @@ class EmbeddedBrowser(QWidget):
             control.clicked.connect(callback)
             toolbar.addWidget(control)
         toolbar.addWidget(self.address, 1)
+        self.task_status = QLabel('账号任务状态：等待操作')
+        self.task_status.setWordWrap(True)
+        self.task_status.setToolTip('about:blank 可能是处理完成后释放内存的空白页，请结合任务状态判断运行情况。')
+        root.addWidget(self.task_status)
         root.addWidget(self.view, 1)
 
         self.view.urlChanged.connect(lambda url: self.address.setText(url.toString()))
@@ -146,6 +150,9 @@ class EmbeddedBrowser(QWidget):
 
     def home(self):
         self.view.setUrl(QUrl('https://www.douyin.com/'))
+
+    def set_task_status(self, status):
+        self.task_status.setText('账号任务状态：'+status)
 
     def navigate_address(self):
         self.view.setUrl(QUrl.fromUserInput(self.address.text().strip()))

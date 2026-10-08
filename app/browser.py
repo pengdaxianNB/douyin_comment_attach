@@ -43,6 +43,14 @@ class PrivateAccount(SkippedCustomer):
     pass
 
 
+async def detach_cdp_session(session):
+    """Best-effort disposal must not prolong cancellation of a frozen page."""
+    try:
+        await asyncio.wait_for(session.detach(),timeout=1)
+    except Exception:
+        pass
+
+
 def customer_skip(reason):
     error = PrivateAccount if reason.startswith('私密账号') else SkippedCustomer
     raise error(reason)
@@ -752,7 +760,7 @@ class Browser:
                 except Exception as exc:
                     errors.append(type(exc).__name__)
         finally:
-            await session.detach()
+            await detach_cdp_session(session)
         if not self.background_prepared:
             if errors:
                 self.log('后台页面保活部分不受当前内核支持，已启用兼容模式')
@@ -782,7 +790,7 @@ class Browser:
                 except Exception:
                     pass
         finally:
-            await session.detach()
+            await detach_cdp_session(session)
 
     async def diagnose_sender(self):
         if self.diagnostics_dir is None:
@@ -837,7 +845,7 @@ class Browser:
     async def init(self):
         if self.page is None:
             self.page = await self.context.new_page()
-        await self.page.goto('https://www.douyin.com/',wait_until='domcontentloaded')
+        await self.page.goto('https://www.douyin.com/',wait_until='domcontentloaded',timeout=20000)
         await self.prepare_background_execution()
 
     async def guard(self):
