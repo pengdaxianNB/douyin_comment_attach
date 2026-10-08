@@ -7,7 +7,7 @@ from PySide6.QtCore import QThread, Signal
 from playwright.async_api import async_playwright, Error as PlaywrightError
 from playwright._impl._async_base import mapping as async_api_mapping
 from .ai import AI, get_key
-from .browser import Browser, AccountNeedsAttention, CommentPageUnavailable, VideoUnavailable, NeedsAttention, UncertainSend, SkippedCustomer, PrivateAccount, MissingAccount, detach_cdp_session
+from .browser import Browser, AccountNeedsAttention, SearchPageUnavailable, CommentPageUnavailable, VideoUnavailable, NeedsAttention, UncertainSend, SkippedCustomer, PrivateAccount, MissingAccount, detach_cdp_session
 from .classifier import classify_comments
 from .embedded_browser import MARKER_PREFIX, page_id, unregister_page
 
@@ -436,6 +436,8 @@ class Engine(QThread):
             except NeedsAttention as exc:
                 complete = False
                 self.log.emit(account['name']+f'：关键词“{keyword}”视频获取失败，已跳过并继续其他来源：{exc}')
+                browser = await self.maintain_browser_memory(account,browser)
+                browser.s = settings
                 continue
             except (PlaywrightError, asyncio.TimeoutError) as exc:
                 complete = False
@@ -447,27 +449,45 @@ class Engine(QThread):
                 self.db.add_video(video,'keyword',keyword,keyword)
             self.log.emit('关键词“'+keyword+'”：近 7 天已加入待分析视频 '+str(len(videos))+' 个')
             self.changed.emit()
+            browser = await self.maintain_browser_memory(account,browser)
+            browser.s = settings
         for row in searches:
             keyword = row['keyword']
-            self.status.emit(account['id'],'抖音搜索找视频：'+keyword)
-            try:
-                videos = await browser.search_videos(keyword)
-            except AccountNeedsAttention:
-                raise
-            except NeedsAttention as exc:
-                complete = False
-                self.log.emit(account['name']+f'：抖音搜索“{keyword}”视频获取失败，已跳过并继续其他来源：{exc}')
-                continue
-            except (PlaywrightError, asyncio.TimeoutError) as exc:
-                complete = False
-                self.log.emit(account['name']+f'：抖音搜索“{keyword}”页面操作超时，正在重建浏览器并继续其他来源：{exc or "超时"}')
-                browser = await self.rebuild_browser(account)
-                browser.s = settings
-                continue
-            for video in videos:
-                self.db.add_video(video,'search',keyword,keyword)
-            self.log.emit('抖音搜索“'+keyword+'”：已加入待分析视频 '+str(len(videos))+' 个')
-            self.changed.emit()
+            videos = None
+            for attempt in range(2):
+                self.status.emit(account['id'],'抖音搜索找视频：'+keyword+('（重建后重试）' if attempt else ''))
+                warning_count = len(getattr(browser,'warnings',[]))
+                try:
+                    videos = await browser.search_videos(keyword)
+                except AccountNeedsAttention:
+                    raise
+                except (SearchPageUnavailable, PlaywrightError, asyncio.TimeoutError) as exc:
+                    reason = str(exc) or '页面操作超时'
+                    if attempt == 0:
+                        self.log.emit(account['name']+f'：抖音搜索“{keyword}”加载异常，正在重建浏览器并重试当前词：{reason}')
+                        browser = await self.rebuild_browser(account)
+                        browser.s = settings
+                        continue
+                    complete = False
+                    self.log.emit(account['name']+f'：抖音搜索“{keyword}”重建后重试仍失败，已保留其他结果，下一轮重新获取：{reason}')
+                except NeedsAttention as exc:
+                    complete = False
+                    self.log.emit(account['name']+f'：抖音搜索“{keyword}”视频获取失败，已跳过并继续其他来源：{exc}')
+                else:
+                    # Partial feeds are useful now, but must not mark the
+                    # source list as fresh for the entire reset interval.
+                    if len(getattr(browser,'warnings',[])) > warning_count:
+                        complete = False
+                break
+            if videos is not None:
+                for video in videos:
+                    self.db.add_video(video,'search',keyword,keyword)
+                self.log.emit('抖音搜索“'+keyword+'”：已加入待分析视频 '+str(len(videos))+' 个')
+                self.changed.emit()
+            # Each query is a full SPA workflow. Counting only the whole batch
+            # allowed hundreds of searches to bypass the renderer recycle.
+            browser = await self.maintain_browser_memory(account,browser)
+            browser.s = settings
         for blogger in bloggers:
             self.status.emit(account['id'],'整理视频：'+blogger['name'])
             try:
@@ -477,6 +497,8 @@ class Engine(QThread):
             except NeedsAttention as exc:
                 complete = False
                 self.log.emit(account['name']+f'：博主“{blogger["name"]}”视频获取失败，已跳过并继续其他来源：{exc}')
+                browser = await self.maintain_browser_memory(account,browser)
+                browser.s = settings
                 continue
             except (PlaywrightError, asyncio.TimeoutError) as exc:
                 complete = False
@@ -488,13 +510,14 @@ class Engine(QThread):
                 self.db.add_video(video,'blogger',blogger['name'],blogger['id'])
             self.log.emit(blogger['name']+'：已加入待分析视频 '+str(len(videos))+' 个')
             self.changed.emit()
+            browser = await self.maintain_browser_memory(account,browser)
+            browser.s = settings
         for item in manual_videos:
             video = {'aweme_id':item['id'],'desc':item['title'],'author':{},'create_time':0,'url':item['url']}
             self.db.add_video(video,'manual','手动录入',item['url'])
         if manual_videos:
             self.log.emit('手动录入：已加入待分析视频 '+str(len(manual_videos))+' 个')
             self.changed.emit()
-        browser = await self.maintain_browser_memory(account,browser)
         return complete
 
     async def monitor_round(self, account, b, ai, s):

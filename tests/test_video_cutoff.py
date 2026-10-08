@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.browser import (Browser,NeedsAttention,creator_search_videos,human_scroll,is_douyin_host,
+from app.browser import (AccountNeedsAttention,Browser,NeedsAttention,SearchPageUnavailable,creator_search_videos,human_scroll,is_douyin_host,
                          reached_video_cutoff,search_result_videos)
 
 
@@ -175,6 +175,7 @@ def search_page(pages, end_after, hrefs=()):
     async def goto(*args,**kwargs):
         deliver(0)
     page.goto=goto
+    state['deliver']=deliver
     return page,state
 
 
@@ -238,14 +239,121 @@ def test_search_videos_url_and_incomplete_warning(monkeypatch):
 
 
 def test_search_videos_without_any_result_needs_attention(monkeypatch):
-    page,_=search_page([],end_after=10**9)
+    page,state=search_page([],end_after=10**9)
     browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
     browser.guard=AsyncMock()
     monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
     patch_scroll(monkeypatch,page)
-    with pytest.raises(NeedsAttention):
+    with pytest.raises(SearchPageUnavailable,match='未收到搜索接口响应'):
         asyncio.run(browser.search_videos('干细胞'))
+    assert state['wheels'] == 0
     assert asyncio.run(browser.search_videos('  ')) == []
+
+
+def test_search_waits_for_slow_initial_results_before_scrolling(monkeypatch):
+    page,state=search_page([search_payload({'aweme_id':'1234567890123456789'})],end_after=1)
+    page.goto=AsyncMock()
+    polls=[]
+    async def sleep(seconds):
+        assert state['wheels'] == 0
+        polls.append(seconds)
+        if len(polls) == 8:
+            state['deliver'](0)
+    monkeypatch.setattr('app.browser.asyncio.sleep',sleep)
+    patch_scroll(monkeypatch,page)
+    browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard=AsyncMock()
+
+    result=asyncio.run(browser.search_videos('慢加载'))
+
+    assert len(polls) == 8
+    assert state['wheels'] == 1
+    assert result[0]['aweme_id'] == '1234567890123456789'
+    assert not browser.warnings
+
+
+def test_api_only_search_keeps_scrolling_while_results_grow(monkeypatch):
+    pages=[search_payload({'aweme_id':str(1234567890123456789+i)}) for i in range(13)]
+    page,state=search_page(pages,end_after=12)
+    browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard=AsyncMock()
+    monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
+    patch_scroll(monkeypatch,page)
+
+    result=asyncio.run(browser.search_videos('连续分页'))
+
+    assert state['wheels'] == 12
+    assert len(result) == 13
+    assert not browser.warnings
+
+
+def test_explicit_empty_search_does_not_trigger_recovery(monkeypatch):
+    page,state=search_page([],end_after=0)
+    browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard=AsyncMock()
+    monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
+    patch_scroll(monkeypatch,page)
+
+    assert asyncio.run(browser.search_videos('无结果')) == []
+    assert state['wheels'] == 0
+    assert not browser.warnings
+
+
+def test_search_ready_deadline_handles_unresponsive_dom(monkeypatch):
+    page,state=search_page([],end_after=10**9)
+    removed=[]
+    page.remove_listener=lambda *args:removed.append(args)
+    async def hang():
+        await asyncio.Event().wait()
+    page.frames[0].locator=lambda selector:SimpleNamespace(all=hang)
+    browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard=AsyncMock()
+    monkeypatch.setattr('app.browser.SEARCH_READY_TIMEOUT',0.01)
+
+    with pytest.raises(SearchPageUnavailable,match='等待超时'):
+        asyncio.run(asyncio.wait_for(browser.search_videos('卡住'),timeout=1))
+    assert removed[0][0] == 'response'
+    assert state['wheels'] == 0
+
+
+def test_search_json_body_timeout_is_bounded_and_diagnostic(monkeypatch):
+    page,state=search_page([],end_after=10**9)
+    callbacks={}
+    cancelled=[]
+    page.on=lambda event,callback:callbacks.update({event:callback})
+    page.remove_listener=lambda event,callback:callbacks.pop(event)
+    async def hang():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
+    async def goto(*args,**kwargs):
+        callbacks['response'](SimpleNamespace(
+            url='https://www.douyin.com/aweme/v1/web/general/search/single/',json=hang))
+    page.goto=goto
+    browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard=AsyncMock()
+    monkeypatch.setattr('app.browser.SEARCH_RESPONSE_TIMEOUT',0.01)
+    monkeypatch.setattr('app.browser.SEARCH_READY_CHECKS',1)
+
+    with pytest.raises(SearchPageUnavailable,match='响应读取失败：TimeoutError'):
+        asyncio.run(asyncio.wait_for(browser.search_videos('响应卡住'),timeout=1))
+    assert cancelled == [True]
+    assert callbacks == {}
+
+
+@pytest.mark.parametrize('error',[AccountNeedsAttention('请完成安全验证'),asyncio.CancelledError()])
+def test_search_account_prompt_and_stop_propagate_without_scrolling(monkeypatch,error):
+    page,state=search_page([],end_after=10**9)
+    removed=[]
+    page.remove_listener=lambda *args:removed.append(args)
+    browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard=AsyncMock(side_effect=error)
+
+    with pytest.raises(type(error)):
+        asyncio.run(browser.search_videos('测试'))
+    assert state['wheels'] == 0
+    assert removed[0][0] == 'response'
 
 
 def test_human_scroll_varies_position_distance_and_timing(monkeypatch):

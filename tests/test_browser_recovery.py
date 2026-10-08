@@ -5,9 +5,111 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.browser import AccountNeedsAttention, Browser
+from app.browser import AccountNeedsAttention, Browser, SearchPageUnavailable
 from app.db import DB
 from app.engine import Engine, BROWSER_REBUILD_ATTEMPTS, PAGE_RECYCLE_OPERATIONS
+from playwright.async_api import Error as PlaywrightError
+
+
+@pytest.mark.parametrize('error',[SearchPageUnavailable('搜索持续加载'),
+                                  PlaywrightError('页面超时'),asyncio.TimeoutError()])
+def test_search_rebuild_retries_current_keyword_before_next(tmp_path,error):
+    db=DB(tmp_path/'test.sqlite3')
+    db.execute("INSERT INTO search_keywords(keyword) VALUES ('当前词'),('下一个词')")
+    account={'id':'main','name':'主号'}
+    settings={'days':7}
+    good={'aweme_id':'1234567890123456789','desc':'结果','author':{}}
+    frozen=SimpleNamespace(search_videos=AsyncMock(side_effect=error),warnings=[])
+    fresh=SimpleNamespace(search_videos=AsyncMock(side_effect=[[good],[]]),
+                          release_page_memory=AsyncMock(),warnings=[],s=None)
+    engine=Engine(db,tmp_path)
+    engine.rebuild_browser=AsyncMock(return_value=fresh)
+    logs=[];engine.log.connect(logs.append)
+
+    assert asyncio.run(engine.rebuild_video_list(account,frozen,settings)) is True
+
+    engine.rebuild_browser.assert_awaited_once_with(account)
+    assert [call.args for call in fresh.search_videos.await_args_list] == [('当前词',),('下一个词',)]
+    assert fresh.s is settings
+    assert fresh.release_page_memory.await_count == 2
+    assert [row['id'] for row in db.video_tasks()] == [good['aweme_id']]
+    assert any('重试当前词' in line for line in logs)
+
+
+def test_repeated_search_loading_failure_is_bounded_and_next_source_runs(tmp_path):
+    db=DB(tmp_path/'test.sqlite3')
+    db.execute("INSERT INTO search_keywords(keyword) VALUES ('坏词'),('好词')")
+    frozen=SimpleNamespace(search_videos=AsyncMock(side_effect=SearchPageUnavailable('卡住')))
+    good={'aweme_id':'1234567890123456789','desc':'结果','author':{}}
+    fresh=SimpleNamespace(search_videos=AsyncMock(side_effect=[SearchPageUnavailable('仍卡住'),[good]]),
+                          release_page_memory=AsyncMock(),s=None,warnings=[])
+    engine=Engine(db,tmp_path)
+    engine.rebuild_browser=AsyncMock(return_value=fresh)
+
+    assert asyncio.run(engine.rebuild_video_list({'id':'main','name':'主号'},frozen,{'days':7})) is False
+
+    engine.rebuild_browser.assert_awaited_once()
+    assert frozen.search_videos.await_count == 1
+    assert [call.args[0] for call in fresh.search_videos.await_args_list] == ['坏词','好词']
+    assert [row['id'] for row in db.video_tasks()] == [good['aweme_id']]
+    assert fresh.release_page_memory.await_count == 2
+
+
+@pytest.mark.parametrize('error',[AccountNeedsAttention('请完成安全验证'),asyncio.CancelledError()])
+def test_search_discovery_does_not_rebuild_on_account_prompt_or_user_stop(tmp_path,error):
+    db=DB(tmp_path/'test.sqlite3')
+    db.execute("INSERT INTO search_keywords(keyword) VALUES ('测试词')")
+    browser=SimpleNamespace(search_videos=AsyncMock(side_effect=error),release_page_memory=AsyncMock())
+    engine=Engine(db,tmp_path)
+    engine.rebuild_browser=AsyncMock()
+
+    with pytest.raises(type(error)):
+        asyncio.run(engine.rebuild_video_list({'id':'main','name':'主号'},browser,{'days':7}))
+
+    engine.rebuild_browser.assert_not_awaited()
+    browser.release_page_memory.assert_not_awaited()
+
+
+def test_search_batch_recycles_before_next_keyword_and_uses_new_browser(tmp_path):
+    db=DB(tmp_path/'test.sqlite3')
+    keywords=[f'词{i}' for i in range(PAGE_RECYCLE_OPERATIONS+2)]
+    for keyword in keywords:
+        db.execute('INSERT INTO search_keywords(keyword) VALUES (?)',(keyword,))
+    frozen=SimpleNamespace(search_videos=AsyncMock(return_value=[]),
+                           release_page_memory=AsyncMock(),warnings=[])
+    fresh=SimpleNamespace(search_videos=AsyncMock(return_value=[]),
+                          release_page_memory=AsyncMock(),warnings=[],s=None)
+    engine=Engine(db,tmp_path)
+    engine.contexts={'main':frozen}
+    boundaries=[]
+    async def rebuild(account,memory_cleanup=False):
+        boundaries.append((frozen.search_videos.await_count,memory_cleanup))
+        engine.page_operations[account['id']]=0
+        engine.contexts[account['id']]=fresh
+        return fresh
+    engine.rebuild_browser=AsyncMock(side_effect=rebuild)
+
+    assert asyncio.run(engine.rebuild_video_list({'id':'main','name':'主号'},frozen,{'days':7})) is True
+
+    assert boundaries == [(PAGE_RECYCLE_OPERATIONS,True)]
+    assert frozen.release_page_memory.await_count == PAGE_RECYCLE_OPERATIONS-1
+    assert [call.args[0] for call in fresh.search_videos.await_args_list] == keywords[-2:]
+    assert engine.contexts['main'] is fresh
+
+
+def test_partial_search_results_remain_usable_but_list_requires_retry(tmp_path):
+    db=DB(tmp_path/'test.sqlite3')
+    db.execute("INSERT INTO search_keywords(keyword) VALUES ('测试词')")
+    good={'aweme_id':'1234567890123456789','desc':'结果','author':{}}
+    browser=SimpleNamespace(warnings=[],release_page_memory=AsyncMock())
+    async def search(keyword):
+        browser.warnings.append('搜索未完成，本轮覆盖可能不完整')
+        return [good]
+    browser.search_videos=search
+    engine=Engine(db,tmp_path)
+
+    assert asyncio.run(engine.rebuild_video_list({'id':'main','name':'主号'},browser,{'days':7})) is False
+    assert [row['id'] for row in db.video_tasks()] == [good['aweme_id']]
 
 
 def test_hung_cleanup_is_cancelled_and_browser_rebuilt(tmp_path,monkeypatch):

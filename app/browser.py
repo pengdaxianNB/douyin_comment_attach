@@ -20,6 +20,11 @@ class AccountNeedsAttention(NeedsAttention):
     pass
 
 
+class SearchPageUnavailable(NeedsAttention):
+    """搜索结果未就绪；重建当前账号页面后可重试当前词。"""
+    pass
+
+
 class CommentPageUnavailable(NeedsAttention):
     """单个作品页暂时无法定位评论区。"""
     pass
@@ -197,6 +202,10 @@ SEARCH_END_TEXT = '暂时没有更多了'
 # Safety cap only: a search normally ends at the "no more" marker long before.
 SEARCH_MAX_SCROLLS = 600
 SEARCH_STALE_LIMIT = 6
+SEARCH_READY_CHECKS = 30
+SEARCH_READY_TIMEOUT = 45
+SEARCH_STEP_TIMEOUT = 60
+SEARCH_RESPONSE_TIMEOUT = 8
 # Every so often take a longer break, like someone stepping away for a moment.
 SEARCH_BREAK_EVERY = (12,25)
 SEARCH_BREAK_SECONDS = (8,20)
@@ -1248,16 +1257,28 @@ class Browser:
         url = 'https://www.douyin.com/search/'+quote(keyword)
         items = {}
         tasks = set()
+        response_state = '未收到搜索接口响应'
 
         async def consume(response):
+            nonlocal response_state
             parsed = urlparse(response.url)
             if not is_douyin_host(parsed.hostname) or '/aweme/v1/web/' not in parsed.path or 'search' not in parsed.path:
                 return
-            try:
-                payload = await response.json()
-            except Exception:
+            status = getattr(response,'status',200)
+            if status >= 400:
+                response_state = f'搜索接口 HTTP {status}'
                 return
-            for video in search_result_videos(payload):
+            try:
+                payload = await asyncio.wait_for(response.json(),timeout=SEARCH_RESPONSE_TIMEOUT)
+            except Exception as exc:
+                response_state = '搜索接口响应读取失败：'+type(exc).__name__
+                return
+            if isinstance(payload,dict) and payload.get('status_code',0) not in (0,'0',None):
+                response_state = '搜索接口状态异常：'+str(payload['status_code'])
+                return
+            videos = search_result_videos(payload)
+            response_state = '搜索接口已响应，未提取到作品' if not videos else '搜索接口已返回作品'
+            for video in videos:
                 items[str(video['aweme_id'])] = video
 
         def receive(response):
@@ -1294,23 +1315,52 @@ class Browser:
             except PlaywrightError:
                 return False
 
+        async def drain_responses():
+            if tasks:
+                await asyncio.gather(*list(tasks))
+
+        async def snapshot_results():
+            await self.guard()
+            await drain_responses()
+            await collect_links()
+            return await reached_end()
+
+        async def wait_for_results():
+            # DOMContentLoaded only means the SPA shell is ready. Do not
+            # scroll an empty/loading feed or treat it as an exhausted query.
+            for check in range(SEARCH_READY_CHECKS):
+                ended = await snapshot_results()
+                if items or ended:
+                    return ended
+                if check < SEARCH_READY_CHECKS-1:
+                    await asyncio.sleep(1)
+            raise SearchPageUnavailable('抖音搜索结果持续未就绪（'+response_state+'）')
+
+        async def scroll_results():
+            if await snapshot_results():
+                return True
+            await human_scroll(self.page)
+            # Count API results delivered during this scroll as progress.
+            # Previously they were drained BEFORE the baseline was recorded,
+            # so an API-only feed could be declared stale while still growing.
+            return await snapshot_results()
+
         self.page.on('response',receive)
         try:
-            await self.page.goto(url,wait_until='domcontentloaded')
-            await asyncio.sleep(3)
+            await asyncio.wait_for(self.page.goto(url,wait_until='domcontentloaded',timeout=30000),timeout=35)
+            try:
+                finished = await asyncio.wait_for(wait_for_results(),timeout=SEARCH_READY_TIMEOUT)
+            except asyncio.TimeoutError as exc:
+                raise SearchPageUnavailable('抖音搜索结果等待超时（'+response_state+'）') from exc
             stale = 0
-            finished = False
             until_break = random.randint(*SEARCH_BREAK_EVERY)
             for _ in range(SEARCH_MAX_SCROLLS):
-                await self.guard()
-                if tasks:
-                    await asyncio.gather(*list(tasks))
-                before = len(items)
-                await collect_links()
-                if await reached_end():
-                    finished = True
+                if finished:
                     break
-                await human_scroll(self.page)
+                before = len(items)
+                finished = await asyncio.wait_for(scroll_results(),timeout=SEARCH_STEP_TIMEOUT)
+                if finished:
+                    break
                 until_break -= 1
                 if until_break <= 0:
                     await asyncio.sleep(random.uniform(*SEARCH_BREAK_SECONDS))
@@ -1318,17 +1368,22 @@ class Browser:
                 stale = stale+1 if len(items)==before else 0
                 if stale >= SEARCH_STALE_LIMIT:
                     break
-            if tasks:
-                await asyncio.gather(*list(tasks))
-            await collect_links()
+            # Keep the last batch even if its response arrived alongside the
+            # terminal marker or during the final reading break.
+            ended = await asyncio.wait_for(snapshot_results(),timeout=SEARCH_STEP_TIMEOUT)
+            finished = finished or ended
         finally:
             self.page.remove_listener('response',receive)
-            if tasks:
-                await asyncio.gather(*list(tasks),return_exceptions=True)
+            # A pending JSON body must not keep a stopped/rebuilt page alive.
+            pending = list(tasks)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending,return_exceptions=True)
         if not items:
             if finished:
                 return []
-            raise NeedsAttention('抖音搜索页没有捕获到任何作品，请检查登录状态或页面结构')
+            raise SearchPageUnavailable('抖音搜索页没有捕获到任何作品（'+response_state+'）')
         if not finished:
             self.warnings.append(f'搜索“{keyword}”未出现“{SEARCH_END_TEXT}”就停止加载，本轮覆盖可能不完整')
         return list(items.values())
