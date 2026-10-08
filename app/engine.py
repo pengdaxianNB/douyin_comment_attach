@@ -7,7 +7,7 @@ from PySide6.QtCore import QThread, Signal
 from playwright.async_api import async_playwright, Error as PlaywrightError
 from playwright._impl._async_base import mapping as async_api_mapping
 from .ai import AI, get_key
-from .browser import Browser, AccountNeedsAttention, CommentPageUnavailable, VideoUnavailable, NeedsAttention, UncertainSend, SkippedCustomer, PrivateAccount, detach_cdp_session
+from .browser import Browser, AccountNeedsAttention, CommentPageUnavailable, VideoUnavailable, NeedsAttention, UncertainSend, SkippedCustomer, PrivateAccount, MissingAccount, detach_cdp_session
 from .classifier import classify_comments
 from .embedded_browser import MARKER_PREFIX, page_id, unregister_page
 
@@ -631,7 +631,7 @@ class Engine(QThread):
                     except SkippedCustomer as exc:
                         self.db.finish(customer['uid'],ident,'skipped',message,str(exc))
                         self.log.emit(account['name']+'：客户 '+customer['name']+' 已跳过：'+str(exc))
-                        skip_cooldown = isinstance(exc,PrivateAccount)
+                        skip_cooldown = isinstance(exc,(PrivateAccount,MissingAccount))
                     except UncertainSend as exc:
                         self.db.finish(customer['uid'],ident,'failed',message,str(exc))
                         self.log.emit(account['name']+'：'+str(exc))
@@ -660,7 +660,7 @@ class Engine(QThread):
                     customer = None
                     b = await self.maintain_browser_memory(account,b)
                     if skip_cooldown:
-                        self.status.emit(ident,'私密账号已跳过，继续处理')
+                        self.status.emit(ident,'客户已跳过，继续处理')
                         continue
                     row = self.db.rows('SELECT interval FROM accounts WHERE id=?',(ident,))
                     if not row:

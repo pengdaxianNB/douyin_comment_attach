@@ -43,6 +43,11 @@ class PrivateAccount(SkippedCustomer):
     pass
 
 
+class MissingAccount(SkippedCustomer):
+    """客户主页明确提示用户不存在或已注销。"""
+    pass
+
+
 async def detach_cdp_session(session):
     """Best-effort disposal must not prolong cancellation of a frozen page."""
     try:
@@ -52,7 +57,12 @@ async def detach_cdp_session(session):
 
 
 def customer_skip(reason):
-    error = PrivateAccount if reason.startswith('私密账号') else SkippedCustomer
+    if reason.startswith('私密账号'):
+        error = PrivateAccount
+    elif reason.startswith('用户不存在'):
+        error = MissingAccount
+    else:
+        error = SkippedCustomer
     raise error(reason)
 
 
@@ -1349,6 +1359,13 @@ class Browser:
     async def private_account_reason(self):
         # Only explicit site signals can mark a customer as unreachable.
         checks = (
+            ('用户不存在','用户不存在，无法私信'),
+            ('该用户不存在','用户不存在，无法私信'),
+            ('你访问的用户不存在','用户不存在，无法私信'),
+            ('用户不存在或已注销','用户不存在或已注销，无法私信'),
+            ('用户已注销','用户不存在：页面提示用户已注销，无法私信'),
+            ('该用户已注销','用户不存在：页面提示该用户已注销，无法私信'),
+            ('该账号已注销','用户不存在：页面提示该账号已注销，无法私信'),
             ('私密账号','私密账号，无法私信'),
             ('该账号为私密账号','私密账号，无法私信'),
             ('该用户设置为私密账号','私密账号，无法私信'),
