@@ -6,7 +6,7 @@ import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 from playwright.async_api import Error as PlaywrightError
 from .db import parse_work_url, work_url
 
@@ -212,34 +212,64 @@ SEARCH_BREAK_SECONDS = (8,20)
 
 
 def search_result_videos(payload):
-    """Extract works from a douyin.com search response (``data[].aweme_info``).
+    """Extract works from direct results and wrapped comprehensive-search cards.
 
-    Only the result list itself is read.  Related-user cards and other side
-    widgets in the same response are deliberately ignored so that unrelated
-    works never enter the video queue.
+    Text/medical advice cards can accompany nested work cards, sometimes with
+    JSON-encoded data. Follow only result/card containers, not arbitrary
+    metadata or related-user widgets, and require an explicit numeric aweme_id.
     """
     result = {}
-    entries = payload.get('data') if isinstance(payload,dict) else None
-    for entry in entries if isinstance(entries,list) else []:
-        if not isinstance(entry,dict):
-            continue
-        item = entry.get('aweme_info')
-        if not isinstance(item,dict):
-            item = entry if entry.get('aweme_id') else None
-        if not isinstance(item,dict):
-            continue
-        ident = str(item.get('aweme_id') or '')
-        if not re.fullmatch(r'\d{8,}',ident):
-            continue
-        try:
-            created = int(item.get('create_time') or 0)
-        except (TypeError,ValueError):
-            created = 0
-        author = item.get('author')
-        result[ident] = dict(aweme_id=ident,desc=str(item.get('desc') or ''),
-                             author=author if isinstance(author,dict) else {},
-                             create_time=created,kind='note' if is_note_post(item) else 'video')
+
+    def visit(value, depth=0):
+        if depth > 12:
+            return
+        if isinstance(value,str):
+            try:
+                value = json.loads(value)
+            except (ValueError,RecursionError):
+                return
+        if isinstance(value,list):
+            for item in value:
+                visit(item,depth+1)
+            return
+        if not isinstance(value,dict):
+            return
+        ident = str(value.get('aweme_id') or '')
+        if re.fullmatch(r'\d{8,}',ident):
+            try:
+                created = int(value.get('create_time') or 0)
+            except (TypeError,ValueError):
+                created = 0
+            author = value.get('author')
+            result[ident] = dict(aweme_id=ident,desc=str(value.get('desc') or ''),
+                                 author=author if isinstance(author,dict) else {},
+                                 create_time=created,kind='note' if is_note_post(value) else 'video')
+            return
+        for key in ('data','business_data','aweme_info','aweme_list','sub_card_list',
+                    'card_info','raw_data','items','item_list'):
+            visit(value.get(key),depth+1)
+
+    if isinstance(payload,dict):
+        for key in ('data','business_data','aweme_list'):
+            visit(payload.get(key))
     return list(result.values())
+
+
+def search_work_link(href):
+    """Read direct work links and Douyin's in-place modal work links."""
+    try:
+        parsed = urlparse(urljoin('https://www.douyin.com/',str(href or '')))
+    except ValueError:
+        return None
+    if parsed.scheme not in ('http','https') or not is_douyin_host(parsed.hostname):
+        return None
+    match = re.fullmatch(r'/(video|note)/(\d{8,})/?',parsed.path)
+    if match:
+        return match.group(2),match.group(1)
+    ids = parse_qs(parsed.query).get('modal_id',[])
+    if len(ids)==1 and re.fullmatch(r'\d{8,}',ids[0]):
+        return ids[0],'video'
+    return None
 
 
 async def human_scroll(page, rng=random):
@@ -1292,7 +1322,8 @@ class Browser:
             for frame in self.page.frames:
                 try:
                     anchors = await frame.locator(
-                        'a[href*="douyin.com/video/"], a[href*="douyin.com/note/"], a[href^="/video/"], a[href^="/note/"]').all()
+                        'a[href*="douyin.com/video/"], a[href*="douyin.com/note/"], '
+                        'a[href^="/video/"], a[href^="/note/"], a[href*="modal_id="]').all()
                 except PlaywrightError:
                     continue
                 for anchor in anchors:
@@ -1300,13 +1331,13 @@ class Browser:
                         href = await anchor.get_attribute('href') or ''
                     except PlaywrightError:
                         continue
-                    match = re.search(r'/(video|note)/(\d{8,})',href)
-                    if not match:
+                    work = search_work_link(href)
+                    if not work:
                         continue
-                    ident = match.group(2)
+                    ident,kind = work
                     if ident not in items:
                         items[ident] = dict(aweme_id=ident,desc='',author={},create_time=0,
-                                            kind='note' if match.group(1)=='note' else 'video')
+                                            kind=kind)
 
         async def reached_end():
             try:

@@ -1,11 +1,12 @@
 import asyncio
+import json
 from unittest.mock import AsyncMock
 from types import SimpleNamespace
 
 import pytest
 
 from app.browser import (AccountNeedsAttention,Browser,NeedsAttention,SearchPageUnavailable,creator_search_videos,human_scroll,is_douyin_host,
-                         reached_video_cutoff,search_result_videos)
+                         reached_video_cutoff,search_result_videos,search_work_link)
 
 
 def packet(*videos):
@@ -201,6 +202,90 @@ def test_search_result_videos_reads_only_result_list_and_marks_notes():
     assert result['1234567890123456789']['author']=={'nickname':'甲'}
     assert result['2234567890123456789']['kind']=='note'
     assert search_result_videos(None)==[] and search_result_videos({'data':None})==[]
+
+
+@pytest.mark.parametrize('encoded',[False,True])
+def test_search_result_videos_handles_advice_and_nested_work_cards(encoded):
+    video={'aweme_id':'1234567890123456789','desc':'视频','author':{'nickname':'甲'},
+           'create_time':'1700000000'}
+    note={'aweme_id':'2234567890123456789','desc':'图文','images':[{}]}
+    card={'sub_card_list':[{'data':{'aweme_info':video}},
+                           {'data':{'aweme_list':[None,note,{'aweme_id':'bad'}]}}]}
+    payload={'data':[
+        {'data':{'title':'专家建议','content':'内容来自小荷医典','id':'9234567890123456789',
+                 'user_info':{'aweme_list':[{'aweme_id':'8234567890123456789'}]}}},
+        {'data':json.dumps(card) if encoded else card},
+        {'aweme_info':video},
+        {'data':'invalid JSON'},
+    ],'related_search':{'aweme_info':{'aweme_id':'7234567890123456789'}}}
+
+    result=search_result_videos(payload)
+
+    assert [item['aweme_id'] for item in result]==[video['aweme_id'],note['aweme_id']]
+    assert result[0]['author']=={'nickname':'甲'} and result[0]['create_time']==1700000000
+    assert result[1]['kind']=='note'
+
+
+def test_search_videos_with_advice_card_collects_nested_results_and_paginates(monkeypatch):
+    pages=[{'data':[{'data':{'title':'专家建议','content':'内容来自小荷医典'}},
+                    {'data':{'aweme_info':{'aweme_id':'1234567890123456789','desc':'视频'}}}]},
+           {'business_data':[{'data':{'aweme_list':[
+               {'aweme_id':'2234567890123456789','images':[{}]}]}}]}]
+    page,state=search_page(pages,end_after=1)
+    browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard=AsyncMock()
+    monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
+    patch_scroll(monkeypatch,page)
+
+    result=asyncio.run(browser.search_videos('干细胞卵巢早衰'))
+
+    assert [item['aweme_id'] for item in result]==['1234567890123456789','2234567890123456789']
+    assert result[1]['kind']=='note'
+    assert state['wheels']==1 and not browser.warnings
+
+
+def test_search_videos_with_advice_only_response_uses_modal_links(monkeypatch):
+    page,state=search_page([{'data':[{'data':{'title':'专家建议'}}]}],end_after=1,
+        hrefs=['/jingxuan?modal_id=1234567890123456789',
+               '/jingxuan/search/干细胞卵巢早衰?type=general&modal_id=2234567890123456789',
+               'https://example.com/?modal_id=3234567890123456789',
+               '/search/相关搜索?modal_id=bad'])
+    browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard=AsyncMock()
+    monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
+    patch_scroll(monkeypatch,page)
+
+    result=asyncio.run(browser.search_videos('干细胞卵巢早衰'))
+
+    assert [item['aweme_id'] for item in result]==['1234567890123456789','2234567890123456789']
+    assert state['wheels']==1 and not browser.warnings
+
+
+@pytest.mark.parametrize('href,expected',[
+    ('/video/1234567890123456789?x=1',('1234567890123456789','video')),
+    ('https://www.douyin.com/note/1234567890123456789',('1234567890123456789','note')),
+    ('?modal_id=1234567890123456789',('1234567890123456789','video')),
+    ('/jingxuan?modal_id=%31%32%33%34%35%36%37%38%39',('123456789','video')),
+    ('https://douyin.com.evil.example/?modal_id=1234567890123456789',None),
+    ('https://[invalid/?modal_id=1234567890123456789',None),
+    ('/search/相关搜索?modal_id=bad',None),
+    ('/jingxuan?modal_id=123456789&modal_id=223456789',None),
+])
+def test_search_work_links_validate_origin_and_work_id(href,expected):
+    assert search_work_link(href)==expected
+
+
+def test_search_advice_without_works_is_not_treated_as_ready(monkeypatch):
+    page,state=search_page([{'data':[{'data':{'title':'专家建议','id':'1234567890123456789'}}]}],
+                           end_after=10**9)
+    browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard=AsyncMock()
+    monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
+    patch_scroll(monkeypatch,page)
+
+    with pytest.raises(SearchPageUnavailable,match='搜索接口已响应，未提取到作品'):
+        asyncio.run(browser.search_videos('干细胞卵巢早衰'))
+    assert state['wheels']==0
 
 
 def test_search_videos_scrolls_until_no_more_marker(monkeypatch):
