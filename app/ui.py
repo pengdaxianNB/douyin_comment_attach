@@ -12,6 +12,7 @@ from .ai import SERVICE
 from .db import user_id
 from .engine import Engine, DEFAULTS
 from .embedded_browser import EmbeddedBrowser,keep_tab_pages_mounted
+from .keyword_csv import read_keyword_csv,write_keyword_template
 
 STATUS = dict(pending='等待私信',processing='处理中',sent='已私信',failed='失败',skipped='已跳过')
 VIDEO_STATUS = dict(pending='等待扫描',scanning='扫描中',done='已完成',failed='失败')
@@ -330,11 +331,13 @@ class Window(QMainWindow):
 
         keywords_page = QWidget(); keywords_page.setObjectName('subPage')
         keywords_layout = QVBoxLayout(keywords_page); keywords_layout.setContentsMargins(18,18,18,18); keywords_layout.setSpacing(14)
-        self.video_source_tabs.addTab(keywords_page,'关键词找视频')
+        self.video_source_tabs.addTab(keywords_page,'抖音指数找视频')
         keyword_bar = QHBoxLayout(); keyword_bar.setSpacing(12); keywords_layout.addLayout(keyword_bar)
-        keyword_title = QLabel('关键词找视频'); keyword_title.setObjectName('sectionTitle'); keyword_bar.addWidget(keyword_title)
+        keyword_title = QLabel('抖音指数找视频'); keyword_title.setObjectName('sectionTitle'); keyword_bar.addWidget(keyword_title)
         keyword_bar.addStretch()
         keyword_bar.addWidget(button('新增关键词',self.add_keyword))
+        keyword_bar.addWidget(button('批量导入 CSV',lambda:self.import_keywords_csv()))
+        keyword_bar.addWidget(button('下载 CSV 模板',self.download_keyword_template))
         self.delete_keyword_button = button('删除关键词',self.delete_keyword); keyword_bar.addWidget(self.delete_keyword_button)
         keyword_hint = QLabel('每次重建清单时优先扫描全部关键词，固定打开创作者中心并选择“近7天”。')
         keyword_hint.setObjectName('muted'); keyword_hint.setWordWrap(True); keywords_layout.addWidget(keyword_hint)
@@ -350,6 +353,8 @@ class Window(QMainWindow):
         search_title = QLabel('抖音搜索找视频'); search_title.setObjectName('sectionTitle'); search_bar.addWidget(search_title)
         search_bar.addStretch()
         search_bar.addWidget(button('新增搜索词',self.add_search_keyword))
+        search_bar.addWidget(button('批量导入 CSV',lambda:self.import_keywords_csv(search=True)))
+        search_bar.addWidget(button('下载 CSV 模板',self.download_keyword_template))
         self.delete_search_button = button('删除搜索词',self.delete_search_keyword); search_bar.addWidget(self.delete_search_button)
         search_hint = QLabel('打开抖音网页版搜索页（douyin.com/search/关键词），不限发布时间，一直向下滑动加载，直到出现“暂时没有更多了”才结束；视频和图文笔记都会收集。视频较多时耗时较长。')
         search_hint.setObjectName('muted'); search_hint.setWordWrap(True); search_layout.addWidget(search_hint)
@@ -749,6 +754,31 @@ class Window(QMainWindow):
             if not inserted: raise ValueError('该关键词已存在')
             self.refresh_keywords()
             self.statusBar().showMessage('关键词已添加；下次视频清单重建时生效',5000)
+        self.report(action)
+
+    def import_keywords_csv(self, search=False):
+        def action():
+            label = '搜索词' if search else '关键词'
+            path,_ = QFileDialog.getOpenFileName(self,'批量导入'+label,'','CSV 文件 (*.csv)')
+            if not path: return
+            values = read_keyword_csv(path)
+            result = self.db.import_keywords(values,search=search)
+            if search:
+                self.refresh_search_keywords()
+            else:
+                self.refresh_keywords()
+            summary = f'新增 {result["added"]} 个{label}，跳过 {result["duplicates"]} 个重复词；下次视频清单重建时生效'
+            self.statusBar().showMessage(summary,10000)
+            QMessageBox.information(self,'批量导入完成',summary)
+        self.report(action)
+
+    def download_keyword_template(self):
+        def action():
+            path,_ = QFileDialog.getSaveFileName(self,'保存通用批量导入模板','关键词搜索词批量导入模板.csv','CSV 文件 (*.csv)')
+            if not path: return
+            if not path.lower().endswith('.csv'): path += '.csv'
+            write_keyword_template(path)
+            self.statusBar().showMessage('模板已保存；保留“关键词”表头，替换示例词，每行一个词，两种来源均可导入',10000)
         self.report(action)
 
     def delete_keyword(self):

@@ -321,6 +321,20 @@ class DB:
             )
             return len(failed)
 
+    def import_keywords(self, values, search=False):
+        """Insert a fully checked batch atomically; duplicates keep existing IDs."""
+        checked = []
+        for value in values:
+            if not isinstance(value,str) or not value.strip() or any(c in value for c in ('\n','\r','\x00')):
+                raise ValueError('每行必须是一个非空关键词或搜索词，不能包含换行或无效字符')
+            checked.append((value.strip(),))
+        table = 'search_keywords' if search else 'keywords'
+        with self.connect() as c:
+            before = c.total_changes
+            c.executemany(f'INSERT OR IGNORE INTO {table}(keyword) VALUES (?)',checked)
+            added = c.total_changes-before
+        return {'added':added,'duplicates':len(checked)-added}
+
     def import_customers(self, rows):
         checked = []
         for r in rows:

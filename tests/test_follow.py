@@ -134,6 +134,62 @@ def test_message_button_uses_button_and_safe_retry():
     assert any('正在重试' in line for line in logs)
 
 
+def test_message_button_uses_live_mouse_point_after_two_preclick_timeouts():
+    from app.browser import click_profile_message_button
+    button=Mock(is_visible=AsyncMock(return_value=True),is_enabled=AsyncMock(return_value=True),
+                click=AsyncMock(side_effect=TimeoutError('element is not stable')),
+                evaluate=AsyncMock(return_value={'point':{'x':140,'y':85},'reason':'按钮中心可点击'}))
+    page=Mock()
+    page.get_by_role.return_value.all=AsyncMock(return_value=[button])
+    page.get_by_text.return_value.all=AsyncMock(return_value=[])
+    page.mouse.click=AsyncMock()
+    logs=[]
+
+    asyncio.run(click_profile_message_button(page,AsyncMock(),logs.append))
+
+    assert button.click.await_count==2
+    page.mouse.click.assert_awaited_once_with(140,85)
+    assert any('element is not stable' in line for line in logs)
+
+
+def test_message_button_never_clicks_through_an_unknown_overlay():
+    from app.browser import click_profile_message_button
+    button=Mock(is_visible=AsyncMock(return_value=True),is_enabled=AsyncMock(return_value=True),
+                click=AsyncMock(side_effect=TimeoutError('div.modal intercepts pointer events')),
+                evaluate=AsyncMock(return_value={'reason':'按钮被遮挡：div.modal'}))
+    page=Mock()
+    page.get_by_role.return_value.all=AsyncMock(return_value=[button])
+    page.get_by_text.return_value.all=AsyncMock(return_value=[])
+    page.mouse.click=AsyncMock()
+
+    with pytest.raises(NeedsAttention,match='按钮被遮挡：div.modal') as error:
+        asyncio.run(click_profile_message_button(page,AsyncMock(),lambda _:None))
+
+    assert 'intercepts pointer events' in str(error.value)
+    page.mouse.click.assert_not_awaited()
+
+
+def test_message_button_does_not_repeat_a_click_followed_by_navigation_timeout():
+    from app.browser import click_profile_message_button,click_blocked_before_dispatch
+    error=TimeoutError('waiting for element to be visible, enabled and stable\n'
+                       'performing click action\nclick action done\n'
+                       'waiting for scheduled navigations to finish')
+    button=Mock(is_visible=AsyncMock(return_value=True),is_enabled=AsyncMock(return_value=True),
+                click=AsyncMock(side_effect=error),evaluate=AsyncMock())
+    page=Mock()
+    page.get_by_role.return_value.all=AsyncMock(return_value=[button])
+    page.get_by_text.return_value.all=AsyncMock(return_value=[])
+    page.mouse.click=AsyncMock()
+
+    assert not click_blocked_before_dispatch(error)
+    with pytest.raises(NeedsAttention,match='waiting for scheduled navigations'):
+        asyncio.run(click_profile_message_button(page,AsyncMock(),lambda _:None))
+
+    button.click.assert_awaited_once()
+    button.evaluate.assert_not_awaited()
+    page.mouse.click.assert_not_awaited()
+
+
 def test_wait_for_message_editor_prefers_douyin_composer():
     from app.browser import wait_for_message_editor
     other=Mock(is_visible=AsyncMock(return_value=True),get_attribute=AsyncMock(return_value='search-editor'))

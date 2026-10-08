@@ -428,7 +428,7 @@ class Engine(QThread):
         complete = True
         for row in keywords:
             keyword = row['keyword']
-            self.status.emit(account['id'],'关键词找视频：'+keyword)
+            self.status.emit(account['id'],'抖音指数找视频：'+keyword)
             try:
                 videos = await browser.keyword_videos(keyword,7)
             except AccountNeedsAttention:
@@ -626,7 +626,7 @@ class Engine(QThread):
                             self.db.start_send(customer['uid'],ident,message)
                             clicked = True
                         self.status.emit(ident,'打开会话并发送：'+customer['name'])
-                        await asyncio.wait_for(b.send(customer,message,before_click),timeout=90)
+                        await asyncio.wait_for(b.send(customer,message,before_click),timeout=120)
                         self.db.finish(customer['uid'],ident,'sent',message)
                     except SkippedCustomer as exc:
                         self.db.finish(customer['uid'],ident,'skipped',message,str(exc))

@@ -2,10 +2,72 @@ import os
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 import tempfile
 from pathlib import Path
+import pytest
 from PySide6.QtTest import QSignalSpy,QTest
-from PySide6.QtWidgets import QApplication,QInputDialog,QMessageBox
+from PySide6.QtWidgets import QApplication,QInputDialog,QMessageBox,QFileDialog,QPushButton
 from app.db import DB
 from app.ui import Window,STYLE,format_beijing_time
+
+
+@pytest.mark.parametrize('search',[False,True])
+def test_csv_import_button_uses_the_selected_source_and_reports_duplicates(tmp_path,monkeypatch,search):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    db.import_keywords(['旧词'],search=search)
+    path=tmp_path/'words.csv'
+    path.write_text('关键词\n旧词\n新词\n新词\n\n',encoding='utf-8-sig')
+    w=Window(db,tmp_path,start_engine=False)
+    messages=[]
+    monkeypatch.setattr(QFileDialog,'getOpenFileName',lambda *args:(str(path),''))
+    monkeypatch.setattr(QMessageBox,'information',lambda *args:messages.append(args[2]))
+    page=w.video_source_tabs.widget(1 if search else 0)
+    control=next(b for b in page.findChildren(QPushButton) if b.text()=='批量导入 CSV')
+    control.click()
+
+    target=w.search_keywords if search else w.keywords
+    other=w.keywords if search else w.search_keywords
+    assert target.rowCount()==2
+    assert other.rowCount()==0
+    assert messages and '新增 1 个' in messages[0] and '跳过 2 个重复词' in messages[0]
+    assert '下次视频清单重建时生效' in w.statusBar().currentMessage()
+    w.close();app.processEvents()
+
+
+def test_invalid_csv_import_is_atomic_and_warns_without_refreshing_partial_data(tmp_path,monkeypatch):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    path=tmp_path/'invalid.csv'
+    path.write_text('关键词\n有效词\n错误,多列\n',encoding='utf-8')
+    w=Window(db,tmp_path,start_engine=False)
+    warnings=[]
+    monkeypatch.setattr(QFileDialog,'getOpenFileName',lambda *args:(str(path),''))
+    monkeypatch.setattr(QMessageBox,'warning',lambda *args:warnings.append(args[2]))
+    w.import_keywords_csv()
+
+    assert db.rows('SELECT * FROM keywords')==[]
+    assert w.keywords.rowCount()==0
+    assert warnings and '第 3 行' in warnings[0]
+    w.close();app.processEvents()
+
+
+@pytest.mark.parametrize('tab',[0,1])
+def test_both_sources_can_download_the_universal_csv_template(tmp_path,monkeypatch,tab):
+    from app.keyword_csv import read_keyword_csv,KEYWORD_CSV_EXAMPLES
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    w=Window(db,tmp_path,start_engine=False)
+    path=tmp_path/f'template-{tab}'
+    monkeypatch.setattr(QFileDialog,'getSaveFileName',lambda *args:(str(path),''))
+    page=w.video_source_tabs.widget(tab)
+    control=next(b for b in page.findChildren(QPushButton) if b.text()=='下载 CSV 模板')
+    control.click()
+
+    saved=path.with_suffix('.csv')
+    assert read_keyword_csv(saved)==list(KEYWORD_CSV_EXAMPLES)
+    assert saved.read_bytes().startswith(b'\xef\xbb\xbf')
+    assert db.rows('SELECT * FROM keywords')==[]
+    assert db.rows('SELECT * FROM search_keywords')==[]
+    w.close();app.processEvents()
 
 
 def test_comment_time_is_displayed_in_beijing_time():
@@ -26,7 +88,7 @@ def test_window():
         assert w.tabs.count()==7
         assert any(w.tabs.tabText(i)=='内嵌浏览器' for i in range(w.tabs.count()))
         assert w.video_source_tabs.count()==4
-        assert w.video_source_tabs.tabText(0)=='关键词找视频'
+        assert w.video_source_tabs.tabText(0)=='抖音指数找视频'
         assert w.video_source_tabs.tabText(1)=='抖音搜索找视频'
         assert w.video_source_tabs.tabText(2)=='指定博主找视频'
         assert w.video_source_tabs.tabText(3)=='待分析视频（0）'

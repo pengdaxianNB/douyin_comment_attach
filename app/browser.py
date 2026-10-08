@@ -357,6 +357,7 @@ COMMENT_READY_CHECKS = 20
 COMMENT_READY_INTERVAL = 0.5
 COMMENT_CAPTURE_ATTEMPTS = 3
 PROFILE_CLICK_TIMEOUT = 4000
+PROFILE_MESSAGE_CLICK_TIMEOUT = 10000
 MESSAGE_EDITOR_ATTEMPTS = 30
 MESSAGE_EDITOR_INTERVAL = 0.5
 PROFILE_READY_ATTEMPTS = 30
@@ -417,6 +418,29 @@ EDITOR_UNOBSCURED = r"""el => {
     const hit=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);
     return !!hit&&(hit===el||el.contains(hit));
 }"""
+
+
+PROFILE_MESSAGE_HIT_TARGET = r"""el => {
+    const r=el.getBoundingClientRect(),s=getComputedStyle(el);
+    const info={rect:{x:r.x,y:r.y,width:r.width,height:r.height}};
+    if(!el.isConnected)return {...info,reason:'按钮已从页面移除'};
+    if(el.disabled||el.getAttribute('aria-disabled')==='true')return {...info,reason:'按钮已禁用'};
+    if(r.width<=0||r.height<=0||s.display==='none'||s.visibility==='hidden'||Number(s.opacity)===0)
+        return {...info,reason:'按钮不可见'};
+    const x=r.x+r.width/2,y=r.y+r.height/2;
+    if(x<0||y<0||x>=innerWidth||y>=innerHeight)return {...info,reason:'按钮中心位于可视区域外'};
+    const hit=document.elementFromPoint(x,y);
+    if(!hit||!(hit===el||el.contains(hit))){
+        const blocker=hit?hit.tagName.toLowerCase()+'.'+[...hit.classList].join('.').slice(0,160):'未知元素';
+        return {...info,reason:'按钮被遮挡：'+blocker};
+    }
+    return {...info,point:{x,y},reason:'按钮中心可点击'};
+}"""
+
+
+def page_action_error(exc):
+    """Keep the call log that distinguishes overlays, animation and stale pages."""
+    return type(exc).__name__+'：'+(' '.join(str(exc).split())[:1800] or '页面操作异常')
 
 
 async def unique_visible(locator):
@@ -583,22 +607,46 @@ async def click_profile_message_button(page, guard, log):
     if len(buttons)!=1:
         raise NeedsAttention('客户主页未找到唯一的私信按钮')
     await guard()
-    log('正在打开当前客户私信窗口')
+    log(f'正在打开当前客户私信窗口（点击等待最长 {PROFILE_MESSAGE_CLICK_TIMEOUT//1000} 秒）')
     try:
-        await buttons[0].click(timeout=PROFILE_CLICK_TIMEOUT)
+        await buttons[0].click(timeout=PROFILE_MESSAGE_CLICK_TIMEOUT)
     except Exception as exc:
+        log('私信按钮首次点击异常：'+page_action_error(exc))
         if not click_blocked_before_dispatch(exc):
-            raise NeedsAttention('客户主页私信按钮点击失败') from exc
+            raise NeedsAttention('客户主页私信按钮点击失败，尚未发送私信：'+page_action_error(exc)) from exc
         await close_open_message_panel(page,guard,log)
         buttons = await profile_message_buttons(page)
         if len(buttons)!=1:
             raise NeedsAttention('私信按钮状态已变化，无法安全重试') from exc
         await guard()
-        log('私信按钮常规点击受阻，正在重试')
+        log(f'私信按钮常规点击受阻，正在重试（点击等待最长 {PROFILE_MESSAGE_CLICK_TIMEOUT//1000} 秒）')
         try:
-            await buttons[0].click(timeout=PROFILE_CLICK_TIMEOUT)
+            await buttons[0].click(timeout=PROFILE_MESSAGE_CLICK_TIMEOUT)
         except Exception as retry_error:
-            raise NeedsAttention('私信按钮重试失败') from retry_error
+            log('私信按钮常规重试异常：'+page_action_error(retry_error))
+            if not click_blocked_before_dispatch(retry_error):
+                raise NeedsAttention('私信按钮重试失败，尚未发送私信：'+page_action_error(retry_error)) from retry_error
+            # A second identical locator.click() cannot recover an endlessly
+            # animating Qt/SPA layout. Use a trusted mouse click only when the
+            # current unique button itself occupies the live hit-test point.
+            await close_open_message_panel(page,guard,log)
+            buttons = await profile_message_buttons(page)
+            if len(buttons)!=1:
+                raise NeedsAttention('私信按钮重试失败，按钮状态已变化，尚未发送私信：'+page_action_error(retry_error)) from retry_error
+            await guard()
+            try:
+                hit = await buttons[0].evaluate(PROFILE_MESSAGE_HIT_TARGET)
+            except Exception as hit_error:
+                raise NeedsAttention('私信按钮重试失败，无法检查按钮位置，尚未发送私信：'+page_action_error(hit_error)) from hit_error
+            if not hit.get('point'):
+                raise NeedsAttention('私信按钮重试失败，'+hit.get('reason','无法确认点击位置')+
+                                     '，尚未发送私信：'+page_action_error(retry_error)) from retry_error
+            log('私信按钮常规点击连续受阻，已确认按钮中心无遮挡，正在按当前位置点击')
+            point = hit['point']
+            try:
+                await page.mouse.click(point['x'],point['y'])
+            except Exception as mouse_error:
+                raise NeedsAttention('私信按钮当前位置点击失败，尚未发送私信：'+page_action_error(mouse_error)) from mouse_error
 
 
 async def visible_message_editor(page, selector):
@@ -638,6 +686,12 @@ async def wait_for_message_editor(page, selector, guard, log=None):
 def click_blocked_before_dispatch(exc):
     """Recognize Playwright failures where no click was delivered."""
     detail = str(exc).lower()
+    # Every normal click log starts with the actionability check. Its presence
+    # alone does not prove the click was never dispatched: a later navigation
+    # timeout can include that same line. Avoid clicking a toggling entry again.
+    if any(marker in detail for marker in (
+            'performing click action','click action done','waiting for scheduled navigations')):
+        return False
     return ('waiting for element to be visible, enabled and stable' in detail
             or 'element is not stable' in detail
             or 'intercepts pointer events' in detail

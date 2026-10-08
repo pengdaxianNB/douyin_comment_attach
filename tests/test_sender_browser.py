@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock
 import pytest
 from playwright.async_api import async_playwright
 
-from app.browser import Browser, NeedsAttention, close_open_message_panel, wait_for_message_editor
+from app.browser import (Browser, NeedsAttention, close_open_message_panel,
+                         wait_for_message_editor, click_profile_message_button)
 
 
 HTML = """
@@ -91,6 +92,57 @@ def test_profile_slow_load_is_polled_without_repeated_navigation(monkeypatch):
     monkeypatch.setattr('app.browser.asyncio.sleep',AsyncMock())
     asyncio.run(browser.check_reachable({'url':'https://www.douyin.com/user/MS4testcustomer'}))
     assert page.goto.await_count==1
+
+
+@pytest.mark.parametrize('state',['moving','covered'])
+def test_real_message_button_recovers_animation_but_reports_overlay(state,monkeypatch):
+    async def run():
+        async with async_playwright() as pw:
+            executable=os.environ.get('PLAYWRIGHT_TEST_EXECUTABLE',pw.chromium.executable_path)
+            if not Path(executable).exists():
+                pytest.skip('Playwright Chromium is not installed')
+            chromium=await pw.chromium.launch(executable_path=executable)
+            try:
+                page=await chromium.new_page(viewport={'width':1000,'height':700})
+                await page.set_content('''
+                    <meta charset="utf-8">
+                    <style>
+                    #message{position:absolute;left:100px;top:100px;width:160px;height:50px}
+                    #cover{position:absolute;left:90px;top:90px;width:200px;height:80px;z-index:10}
+                    </style>
+                    <button id="message">私信</button>
+                    <script>window.clicks=[];
+                    document.querySelector('#message').onclick=e=>clicks.push(e.isTrusted);
+                    </script>
+                ''')
+                if state=='moving':
+                    # requestAnimationFrame changes layout every frame, so
+                    # Playwright can never see two consecutive stable boxes.
+                    await page.evaluate('''() => {
+                        let x=0;function move(){
+                            document.querySelector('#message').style.left=(100+(++x%3)*4)+'px';
+                            requestAnimationFrame(move);
+                        }move();
+                    }''')
+                else:
+                    await page.evaluate('''() => {
+                        const cover=document.createElement('div');cover.id='cover';
+                        cover.className='modal-shield';document.body.appendChild(cover);
+                    }''')
+                logs=[]
+                if state=='moving':
+                    await click_profile_message_button(page,AsyncMock(),logs.append)
+                    assert await page.evaluate('clicks') == [True]
+                    assert any('element is not stable' in line for line in logs)
+                else:
+                    with pytest.raises(NeedsAttention,match='按钮被遮挡：div.modal-shield'):
+                        await click_profile_message_button(page,AsyncMock(),logs.append)
+                    assert await page.evaluate('clicks') == []
+                    assert any('intercepts pointer events' in line for line in logs)
+            finally:
+                await chromium.close()
+    monkeypatch.setattr('app.browser.PROFILE_MESSAGE_CLICK_TIMEOUT',500)
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize('layout', ['chat-with-message-title','delayed-composer','wide-navigation'])
