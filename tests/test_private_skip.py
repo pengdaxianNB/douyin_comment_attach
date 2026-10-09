@@ -85,7 +85,7 @@ def test_unreachable_account_immediately_processes_next_customer(error):
     second_uid='MS4wLjABAAAAsecond_customer_123456'
     with TemporaryDirectory() as folder:
         db=DB(Path(folder)/'db.sqlite3')
-        account_id=db.account('sender','从号')
+        account_id=db.account('从号')
         db.save_settings({'base_url':'https://example.com/v1','model':'test'})
         for index,(uid,name) in enumerate(((UID,'不可达客户'),(second_uid,'普通客户')),1):
             db.ingest(dict(id=str(index),uid=uid,name=name,text='咨询',comment_time='',

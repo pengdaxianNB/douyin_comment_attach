@@ -15,7 +15,7 @@ def test_completed_send_is_marked_sent():
     uid = 'MS4wLjABAAAAexample_customer_123456'
     with TemporaryDirectory() as folder:
         db = DB(Path(folder) / 'test.sqlite3')
-        account_id = db.account('sender', '从号')
+        account_id = db.account('从号')
         db.save_settings({'base_url': 'https://example.com/v1', 'model': 'test'})
         db.ingest(dict(id='1', uid=uid, name='客户', text='咨询价格',
                        comment_time='', video_id='v1', video_title='', blogger=''), True, '')
@@ -47,7 +47,7 @@ def test_requeued_failure_reuses_existing_message_without_ai_request():
     uid = 'MS4wLjABAAAArequeued_customer_123456'
     with TemporaryDirectory() as folder:
         db = DB(Path(folder) / 'test.sqlite3')
-        account_id = db.account('sender', '从号')
+        account_id = db.account('从号')
         db.save_settings({'base_url': 'https://example.com/v1', 'model': 'test'})
         db.import_customers([dict(uid=uid, name='客户', status='failed', message='保留的私信文案')])
         assert db.requeue_failed() == 1
@@ -75,7 +75,7 @@ def test_sender_at_daily_limit_does_not_claim_or_request_ai():
     sent_uid = 'MS4wLjABAAAAtoday_sent_customer_12345'
     with TemporaryDirectory() as folder:
         db = DB(Path(folder) / 'test.sqlite3')
-        account_id = db.account('sender','从号',daily_limit=1)
+        account_id = db.account('从号',daily_limit=1)
         db.save_settings({'base_url':'https://example.com/v1','model':'test'})
         db.import_customers([dict(uid=pending_uid,name='待发客户')])
         db.execute("INSERT INTO events(account_id,uid,kind) VALUES (?,?,'sent')",(account_id,sent_uid))
@@ -107,7 +107,7 @@ def test_customer_page_error_does_not_stop_sender(error):
     second_uid = 'MS4wLjABAAAAsecond_customer_123456'
     with TemporaryDirectory() as folder:
         db = DB(Path(folder) / 'test.sqlite3')
-        account_id = db.account('sender', '从号')
+        account_id = db.account('从号')
         db.save_settings({'base_url': 'https://example.com/v1', 'model': 'test'})
         for index, uid in enumerate((first_uid, second_uid), 1):
             db.ingest(dict(id=str(index), uid=uid, name=f'客户{index}', text='咨询',
@@ -150,4 +150,4 @@ def test_customer_page_error_does_not_stop_sender(error):
                 assert any('浏览器已重建' in line for line in logs)
             else:
                 assert resets==[]
-                assert any('从号将继续运行' in line for line in logs)
+                assert any('账号将继续运行' in line for line in logs)

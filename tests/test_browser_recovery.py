@@ -256,7 +256,7 @@ def test_page_binding_waits_for_gui_to_register_new_target(tmp_path):
 @pytest.mark.parametrize('recovery_error',[AccountNeedsAttention('重建失败'),asyncio.CancelledError()])
 def test_completed_send_is_preserved_when_periodic_rebuild_fails(tmp_path,recovery_error):
     db = DB(tmp_path/'test.sqlite3')
-    ident = db.account('sender','从号')
+    ident = db.account('从号')
     uid = 'MS4wLjABAAAArecovery_customer_123456'
     db.save_settings({'base_url':'https://example.com/v1','model':'test'})
     db.import_customers([{'uid':uid,'name':'客户'}])
@@ -287,7 +287,7 @@ def test_completed_send_is_preserved_when_periodic_rebuild_fails(tmp_path,recove
 
 def test_sender_processes_next_customer_after_cleanup_recovery(tmp_path,monkeypatch):
     db = DB(tmp_path/'test.sqlite3')
-    ident = db.account('sender','从号')
+    ident = db.account('从号')
     uids = ['MS4wLjABAAAArecovery_customer_123456','MS4wLjABAAAAnext_customer_1234567890']
     db.save_settings({'base_url':'https://example.com/v1','model':'test'})
     db.import_customers([{'uid':uid,'name':str(index)} for index,uid in enumerate(uids)])

@@ -1,6 +1,7 @@
 import asyncio
 import os
 import threading
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from PySide6.QtCore import QThread, Signal
@@ -11,7 +12,7 @@ from .browser import Browser, AccountNeedsAttention, SearchPageUnavailable, Comm
 from .classifier import classify_comments
 from .embedded_browser import MARKER_PREFIX, page_id, unregister_page
 
-DEFAULTS = dict(days=7,comment_days=7,video_list_reset_hours=24,ai_concurrency=5,poll_seconds=300,scroll_limit=80,base_url='',model='',thinking_mode='default',thinking_effort='high',
+DEFAULTS = dict(collection_accounts=1,days=7,comment_days=7,video_list_reset_hours=24,ai_concurrency=5,poll_seconds=300,scroll_limit=80,base_url='',model='',thinking_mode='default',thinking_effort='high',
     filter_prompt='识别评论中是否明确表达了对我提供的产品或服务的购买或咨询需求。产品和目标客户：请填写。不要把普通互动识别为需求。',
     message_prompt='根据客户评论写一条自然、简短的咨询回复。我的产品或服务：请填写。尊重对方，不夸大，不使用虚假承诺。',
     comment_panel='[data-e2e="comment-list"]',message_editor='[contenteditable="true"]')
@@ -65,22 +66,40 @@ class Engine(QThread):
         self.loop = None
         self.commands = None
         self.running_accounts = set()
+        self.cluster_mode = None
+        self.cluster_task = None
+        self.cluster_stopping = False
         self.page_operations = {}
         self.lock = threading.Lock()
         self.ready = threading.Event()
 
     def command(self, op, account=None):
         if self.loop and self.commands:
-            if op == 'start':
+            if op == 'start_cluster':
+                mode = account['mode']
+                accounts = self.cluster_accounts(mode)
                 with self.lock:
-                    if account['id'] in self.running_accounts:
-                        return
-                    self.running_accounts.add(account['id'])
+                    if self.cluster_mode or self.cluster_stopping or self.running_accounts:
+                        raise ValueError('请先停止当前集群任务，再切换模式')
+                    self.cluster_mode = mode
+                    self.running_accounts.update(row['id'] for row in accounts)
+                account = dict(mode=mode,accounts=accounts)
             self.loop.call_soon_threadsafe(self.commands.put_nowait,(op,account))
+
+    def cluster_accounts(self, mode):
+        if mode not in ('comments','messages'):
+            raise ValueError('不支持的集群模式')
+        accounts = self.db.rows('SELECT * FROM accounts ORDER BY rowid')
+        if not accounts:
+            raise ValueError('请先添加账号')
+        if mode == 'comments':
+            count = max(1,min(len(accounts),int(self.db.setting('collection_accounts',1))))
+            accounts = accounts[:count]
+        return accounts
 
     def busy(self):
         with self.lock:
-            return bool(self.running_accounts)
+            return bool(self.cluster_mode or self.cluster_stopping or self.running_accounts)
 
     def run(self):
         try:
@@ -92,6 +111,8 @@ class Engine(QThread):
             self.log.emit('后台引擎异常退出，请重启应用：'+type(exc).__name__+'：'+str(exc))
             with self.lock:
                 self.running_accounts.clear()
+                self.cluster_mode = None
+                self.cluster_stopping = False
             self.changed.emit()
 
     async def main(self):
@@ -107,6 +128,12 @@ class Engine(QThread):
                 try:
                     if op == 'shutdown':
                         break
+                    if op == 'start_cluster':
+                        self.cluster_task = asyncio.create_task(self.run_cluster(account['accounts'],account['mode']))
+                        continue
+                    if op == 'stop_cluster':
+                        await self.stop_cluster()
+                        continue
                     ident = account['id']
                     if op == 'stop':
                         await self.stop_job(ident)
@@ -125,17 +152,9 @@ class Engine(QThread):
                         b = await self.open(account)
                         await b.page.bring_to_front()
                         self.status.emit(ident,'内嵌浏览器已打开 · 请本人登录')
-                    elif op == 'start' and ident not in self.jobs:
-                        with self.lock:
-                            self.running_accounts.add(ident)
-                        self.jobs[ident] = asyncio.create_task(self.work(account))
                 except Exception as exc:
-                    if account:
-                        with self.lock:
-                            self.running_accounts.discard(account['id'])
                     self.log.emit('账号操作失败：'+str(exc))
-            for ident in list(self.jobs):
-                await self.stop_job(ident)
+            await self.stop_cluster()
             self.contexts.clear()
         self.loop = None
 
@@ -290,7 +309,182 @@ class Engine(QThread):
             await asyncio.gather(task,return_exceptions=True)
         with self.lock:
             self.running_accounts.discard(ident)
+            empty = not self.running_accounts
         self.status.emit(ident,'已停止')
+        if empty and self.cluster_task and asyncio.current_task() is not self.cluster_task:
+            await self.stop_cluster()
+
+    async def stop_cluster(self):
+        with self.lock:
+            self.cluster_stopping = True
+            stopped = set(self.running_accounts)
+        task = self.cluster_task
+        if task:
+            task.cancel()
+            await asyncio.gather(task,return_exceptions=True)
+        for ident in list(self.jobs):
+            await self.stop_job(ident)
+        with self.lock:
+            self.running_accounts.clear()
+            self.cluster_mode = None
+            self.cluster_stopping = False
+        self.cluster_task = None
+        for ident in stopped:
+            self.status.emit(ident,'已停止')
+        self.changed.emit()
+
+    async def run_cluster(self, accounts, mode):
+        """Own the mode until every account has stopped, including cancellation."""
+        try:
+            if mode == 'messages':
+                tasks = []
+                for account in accounts:
+                    task = asyncio.create_task(self.work(account,mode))
+                    self.jobs[account['id']] = task
+                    tasks.append(task)
+                await asyncio.gather(*tasks,return_exceptions=True)
+            else:
+                await self.collect_cluster(accounts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.log.emit('集群任务已停止：'+str(exc))
+            for account in accounts:
+                self.status.emit(account['id'],'需处理：'+str(exc))
+        finally:
+            # Gather cancellation alone is insufficient when the coordinator
+            # is between stages. Await all page work before releasing the mode.
+            for ident in list(self.jobs):
+                await self.stop_job(ident)
+            with self.lock:
+                self.running_accounts.clear()
+                if not self.cluster_stopping:
+                    self.cluster_mode = None
+            self.cluster_task = None
+            self.changed.emit()
+
+    def collection_sources(self):
+        return [(kind,row) for kind,table,order in (
+            ('keyword','keywords','id'),('search','search_keywords','id'),
+            ('blogger','bloggers','name,id'),('manual','manual_videos','added_at,id'))
+            for row in self.db.rows(f'SELECT * FROM {table} ORDER BY {order}')]
+
+    async def collect_cluster(self, accounts):
+        s = self.settings()
+        if not s['base_url'] or not s['model'] or not get_key():
+            raise ValueError('请先配置 AI 接口、模型及 API Key')
+        sessions = {}
+
+        async def initialize(account):
+            ident = account['id']
+            try:
+                browser = await self.open(account)
+                browser.s = s
+                ai = AI(s,log=lambda text:self.log.emit(account['name']+'：'+text))
+                sessions[ident] = [account,browser,ai]
+                self.status.emit(ident,'集群采集已就绪')
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                with self.lock:
+                    self.running_accounts.discard(ident)
+                self.status.emit(ident,'需处理：'+str(exc))
+                self.log.emit(account['name']+'：'+str(exc))
+
+        tasks = [asyncio.create_task(initialize(account)) for account in accounts]
+        self.jobs.update({account['id']:task for account,task in zip(accounts,tasks)})
+        await asyncio.gather(*tasks,return_exceptions=True)
+        self.jobs.clear()
+        while sessions:
+            with self.lock:
+                active = set(self.running_accounts)
+            sessions = {ident:session for ident,session in sessions.items() if ident in active}
+            if not sessions:
+                break
+            sources = self.collection_sources()
+            if not sources and not self.db.video_tasks():
+                raise ValueError('请先添加关键词、抖音搜索词、监控博主或手动视频链接')
+            rebuild = self.db.prepare_video_scan(s['video_list_reset_hours'])
+            if rebuild:
+                queue = deque(sources)
+                complete = [True]
+                try:
+                    await self.collection_stage(sessions,queue,s,True,complete)
+                except BaseException:
+                    self.db.save_settings({'video_list_built_at':0})
+                    raise
+                if queue or not complete[0]:
+                    self.db.save_settings({'video_list_built_at':0})
+                    self.log.emit('集群：部分来源未完成，已保留成功结果，下轮重新获取')
+            videos = deque(self.db.video_tasks('pending'))
+            self.log.emit(f'集群：本轮待分析视频 {len(videos)} 个，采集账号 {len(sessions)} 个')
+            await self.collection_stage(sessions,videos,s,False,[True])
+            self.changed.emit()
+            for ident in sessions:
+                self.status.emit(ident,'等待下一轮集群采集')
+            if not sessions:
+                break
+            await asyncio.sleep(s['poll_seconds'])
+
+    async def collection_stage(self, sessions, queue, settings, discovery, complete):
+        """Claim each source/video once on the engine loop; no account owns a list."""
+        async def worker(ident, session):
+            account,browser,ai = session
+            failures = 0
+            try:
+                while queue:
+                    item = queue.popleft()
+                    try:
+                        if discovery:
+                            result = await self.rebuild_video_list(account,browser,settings,sources=[item])
+                            complete[0] = complete[0] and result
+                            browser = self.contexts.get(ident,browser)
+                        else:
+                            self.status.emit(ident,'集群扫描评论：'+item['title'])
+                            browser = await self.scan_videos(account,browser,ai,[item],settings)
+                        session[1] = browser
+                        for warning in browser.warnings:
+                            self.log.emit(account['name']+'：'+warning)
+                        browser.warnings.clear()
+                        failures = 0
+                    except (asyncio.CancelledError,AccountNeedsAttention,ValueError):
+                        queue.appendleft(item)
+                        raise
+                    except Exception as exc:
+                        if discovery:
+                            queue.append(item)
+                        failures += 1
+                        if failures >= MAX_TRANSIENT_FAILURES:
+                            raise RuntimeError(f'连续 {failures} 次采集异常：{exc}') from exc
+                        delay = min(120,15*failures)
+                        self.log.emit(account['name']+f'：采集异常，{delay} 秒后继续：{exc}')
+                        if isinstance(exc,(PlaywrightError,asyncio.TimeoutError)):
+                            browser = await self.rebuild_browser(account)
+                            browser.s = settings
+                            session[1] = browser
+                        await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                sessions.pop(ident,None)
+                raise
+            except Exception as exc:
+                sessions.pop(ident,None)
+                with self.lock:
+                    self.running_accounts.discard(ident)
+                self.status.emit(ident,'需处理：'+str(exc))
+                self.log.emit(account['name']+'：已停止该账号，其余账号继续领取任务：'+str(exc))
+            finally:
+                self.jobs.pop(ident,None)
+                self.changed.emit()
+
+        # A failing account can return its item after other workers emptied the
+        # queue. Run survivors again so that item is not stranded until tomorrow.
+        while queue and sessions:
+            tasks = []
+            for ident,session in list(sessions.items()):
+                task = asyncio.create_task(worker(ident,session))
+                self.jobs[ident] = task
+                tasks.append(task)
+            await asyncio.gather(*tasks,return_exceptions=True)
 
     async def scan_videos(self, account, browser, ai, videos, settings):
         """跳过单视频异常，页面卡死时重建浏览器后继续队列。"""
@@ -417,12 +611,12 @@ class Engine(QThread):
             self.log.emit(f'{account["name"]}：本轮发现 {unavailable_videos} 个已失效视频，当前列表不再重试')
         return browser
 
-    async def rebuild_video_list(self, account, browser, settings):
+    async def rebuild_video_list(self, account, browser, settings, sources=None):
         """Discover videos from every configured source before comment scans."""
-        bloggers = self.db.rows('SELECT * FROM bloggers ORDER BY name,id')
-        keywords = self.db.rows('SELECT * FROM keywords ORDER BY id')
-        searches = self.db.rows('SELECT * FROM search_keywords ORDER BY id')
-        manual_videos = self.db.rows('SELECT * FROM manual_videos ORDER BY added_at,id')
+        bloggers = self.db.rows('SELECT * FROM bloggers ORDER BY name,id') if sources is None else [r for kind,r in sources if kind=='blogger']
+        keywords = self.db.rows('SELECT * FROM keywords ORDER BY id') if sources is None else [r for kind,r in sources if kind=='keyword']
+        searches = self.db.rows('SELECT * FROM search_keywords ORDER BY id') if sources is None else [r for kind,r in sources if kind=='search']
+        manual_videos = self.db.rows('SELECT * FROM manual_videos ORDER BY added_at,id') if sources is None else [r for kind,r in sources if kind=='manual']
         if not bloggers and not keywords and not searches and not manual_videos:
             raise ValueError('请先添加关键词、抖音搜索词、监控博主或手动视频链接')
         complete = True
@@ -521,7 +715,7 @@ class Engine(QThread):
         return complete
 
     async def monitor_round(self, account, b, ai, s):
-        """One main-account pass: refresh the video list if due, then scan it."""
+        """Standalone monitoring pass, also useful for browser recovery checks."""
         ident = account['id']
         resume = bool(self.db.video_tasks('pending') or
                       self.db.rows("SELECT 1 FROM videos WHERE status='scanning' LIMIT 1"))
@@ -567,7 +761,7 @@ class Engine(QThread):
         await asyncio.sleep(s['poll_seconds'])
         return b
 
-    async def work(self, account):
+    async def work(self, account, mode='messages'):
         ident = account['id']
         customer = None
         message = ''
@@ -583,7 +777,7 @@ class Engine(QThread):
             b.s = s
             self.status.emit(ident,'运行中')
             while True:
-                if account['role']=='main':
+                if mode=='comments':
                     try:
                         b = await self.monitor_round(account,b,ai,s)
                         monitor_failures = 0
@@ -667,7 +861,7 @@ class Engine(QThread):
                         # Fail only this customer instead of stopping the sender.
                         self.db.finish(customer['uid'],ident,'failed',message,str(exc))
                         self.log.emit(account['name']+'：客户 '+customer['name']+
-                                      ' 处理失败，从号将继续运行：'+str(exc))
+                                      ' 处理失败，账号将继续运行：'+str(exc))
                     except (PlaywrightError, asyncio.TimeoutError) as exc:
                         # A stalled locator must not end the whole sender job.
                         # Never requeue a customer once submission has started.

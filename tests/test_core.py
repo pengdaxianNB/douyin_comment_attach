@@ -13,11 +13,27 @@ class CoreTests(unittest.TestCase):
     def tearDown(self):self.tmp.cleanup()
     def comment(self,cid='1'):
         return dict(id=cid,uid=UID,name='客户',text='咨询产品价格',comment_time='2026-09-14',video_id='v1',video_title='产品',blogger='博主')
-    def test_one_main(self):
+    def test_accounts_have_no_role(self):
+        self.db.account('账号一')
+        self.db.account('账号二')
+        self.assertEqual(len(self.db.rows('SELECT * FROM accounts')),2)
+        self.assertNotIn('role',self.db.rows('SELECT * FROM accounts')[0])
+
+    def test_legacy_roles_migrate_preserving_identity_and_quota(self):
         import sqlite3
-        self.db.account('main','主号')
-        with self.assertRaises(sqlite3.IntegrityError):self.db.account('main','另一个')
-        self.db.account('sender','从号一'); self.db.account('sender','从号二')
+        path=Path(self.tmp.name)/'roles.sqlite3'
+        with sqlite3.connect(path) as c:
+            c.execute("CREATE TABLE accounts(id TEXT PRIMARY KEY,role TEXT CHECK(role IN ('main','sender')),name TEXT,interval INTEGER,daily_limit INTEGER)")
+            c.execute("CREATE UNIQUE INDEX one_main ON accounts(role) WHERE role='main'")
+            c.execute("INSERT INTO accounts VALUES ('old-main','main','采集账号',130,10)")
+            c.execute("INSERT INTO accounts VALUES ('old-sender','sender','发送账号',240,20)")
+        migrated=DB(path)
+        self.assertEqual(migrated.rows("SELECT * FROM accounts WHERE id='old-main'"),
+                         [dict(id='old-main',name='采集账号',interval=130,daily_limit=10)])
+        self.assertEqual(migrated.sender_quota('old-main')['limit'],10)
+        migrated.account('新账号')
+        self.assertEqual(len(DB(path).rows('SELECT * FROM accounts')),3)
+
     def test_legacy_accounts_gain_unlimited_daily_limit(self):
         import sqlite3
         path=Path(self.tmp.name)/'legacy.sqlite3'
@@ -26,6 +42,19 @@ class CoreTests(unittest.TestCase):
             connection.execute("INSERT INTO accounts VALUES ('sender','sender','旧从号',120)")
         migrated=DB(path)
         self.assertEqual(migrated.rows("SELECT daily_limit FROM accounts WHERE id='sender'"),[{'daily_limit':0}])
+
+    def test_account_migration_failure_rolls_back_original_table(self):
+        import sqlite3
+        path=Path(self.tmp.name)/'invalid-legacy.sqlite3'
+        with sqlite3.connect(path) as c:
+            c.execute('CREATE TABLE accounts(id TEXT PRIMARY KEY,role TEXT,name TEXT,interval INTEGER,daily_limit INTEGER)')
+            c.execute("CREATE UNIQUE INDEX one_main ON accounts(role) WHERE role='main'")
+            c.execute("INSERT INTO accounts VALUES ('old','main',NULL,120,10)")
+        with self.assertRaises(sqlite3.IntegrityError): DB(path)
+        with sqlite3.connect(path) as c:
+            self.assertEqual(c.execute('SELECT * FROM accounts').fetchall(),[('old','main',None,120,10)])
+            self.assertIsNotNone(c.execute("SELECT 1 FROM sqlite_master WHERE name='one_main'").fetchone())
+            self.assertIsNone(c.execute("SELECT 1 FROM sqlite_master WHERE name='accounts_before_cluster'").fetchone())
 
     def test_legacy_video_table_gains_manual_source_support(self):
         import sqlite3
@@ -70,7 +99,7 @@ class CoreTests(unittest.TestCase):
             results=list(pool.map(self.db.claim,[str(n) for n in range(8)]))
         self.assertEqual(sum(r is not None for r in results),1)
     def test_sender_daily_limit_resets_on_beijing_date(self):
-        sender=self.db.account('sender','从号',daily_limit=1)
+        sender=self.db.account('从号',daily_limit=1)
         second=UID+'second'
         self.db.import_customers([dict(uid=UID),dict(uid=second)])
         first=self.db.claim(sender)
@@ -83,7 +112,7 @@ class CoreTests(unittest.TestCase):
         remaining = second if first['uid']==UID else UID
         self.assertEqual(self.db.claim(sender)['uid'],remaining)
     def test_uncertain_send_attempt_counts_toward_daily_limit(self):
-        sender=self.db.account('sender','从号',daily_limit=1)
+        sender=self.db.account('从号',daily_limit=1)
         self.db.import_customers([dict(uid=UID)])
         self.db.claim(sender)
         self.db.start_send(UID,sender,'你好')

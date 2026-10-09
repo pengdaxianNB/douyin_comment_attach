@@ -201,21 +201,23 @@ class Window(QMainWindow):
         hint = QLabel('双击查看客户主页  ·  发送异常不会自动重发  ·  列表显示最近 1,000 条，导出包含全部数据'); hint.setObjectName('muted'); hint.setWordWrap(True); l.addWidget(hint)
 
     def build_accounts(self):
-        l = self.page('主号 / 从号')
-        l.addWidget(QLabel('仅允许一个主号；每个账号使用独立内嵌浏览器和登录目录，可在“内嵌浏览器”页随时切换查看。'))
+        l = self.page('账号集群')
+        hint = QLabel('所有账号平等参与，使用独立浏览器和登录目录。集群同时只能运行一种模式；采集账号数量在设置中调整，私信模式使用全部账号。')
+        hint.setWordWrap(True); l.addWidget(hint)
         controls = QHBoxLayout(); l.addLayout(controls)
-        self.role_switches = {}
-        for role,title,description in [('main','主号 · 评论监控','仅控制主号采集和 AI 筛选'),('sender','从号 · 私信任务','控制全部已添加从号，按各自间隔运行')]:
+        self.mode_switches = {}
+        for mode,title,description in [('comments','找评论模式','分配视频来源和评论扫描，AI 筛选目标客户'),('messages','私信模式','全部账号领取客户，按各自间隔和每日上限发送')]:
             group = QGroupBox(title); box = QVBoxLayout(group)
             box.addWidget(QLabel(description))
             switch = QPushButton('开启'); switch.setCheckable(True); switch.setCursor(Qt.CursorShape.PointingHandCursor)
-            switch.clicked.connect(lambda checked,role=role:self.toggle_role(role,checked))
+            switch.clicked.connect(lambda checked,mode=mode:self.toggle_cluster(mode,checked))
             box.addWidget(switch); controls.addWidget(group)
-            self.role_switches[role] = switch
-        self.accounts = table(['备注名','角色','发送间隔（秒）','今日已私信 / 上限','当前状态']); self.accounts.setColumnWidth(0,220); self.accounts.setColumnWidth(1,110); self.accounts.setColumnWidth(2,170); self.accounts.setColumnWidth(3,180); l.addWidget(self.accounts)
+            self.mode_switches[mode] = switch
+        self.accounts = table(['备注名','发送间隔（秒）','今日已私信 / 上限','当前状态'])
+        self.accounts.setColumnWidth(0,220); self.accounts.setColumnWidth(1,170); self.accounts.setColumnWidth(2,180); l.addWidget(self.accounts)
         bar = QHBoxLayout(); l.addLayout(bar)
-        for label,fn in [('新增主号',lambda:self.add_account('main')),('新增从号',lambda:self.add_account('sender')),('修改备注 / 间隔 / 上限',self.edit_account),('登录 / 查看内嵌浏览器',lambda:self.account_command('login')),('重启选中浏览器',self.restart_account_browser),('启动选中账号',lambda:self.account_command('start')),('停止选中账号',lambda:self.account_command('stop')),('采集发送诊断',lambda:self.account_command('diagnose')),('删除账号',self.delete_account)]: bar.addWidget(button(label,fn))
-        l.addWidget(QLabel('停止按钮在当前异步操作取消后生效；删除账号会保留登录目录。连续发送前请先核验一条真实私信。'))
+        for label,fn in [('新增账号',self.add_account),('修改备注 / 间隔 / 上限',self.edit_account),('登录 / 查看内嵌浏览器',lambda:self.account_command('login')),('重启选中浏览器',self.restart_account_browser),('停止选中账号',lambda:self.account_command('stop')),('采集发送诊断',lambda:self.account_command('diagnose')),('删除账号',self.delete_account)]: bar.addWidget(button(label,fn))
+        l.addWidget(QLabel('切换模式前请先关闭当前模式。遇到登录或验证提示时，该账号停止，其余账号继续；请本人处理验证。'))
 
     def build_browser_workspace(self):
         page = QWidget(); page.setObjectName('page')
@@ -230,7 +232,7 @@ class Window(QMainWindow):
         self.browser_tabs.tabBar().setDrawBase(False)
         self.browser_tabs.tabBar().setExpanding(False)
         layout.addWidget(self.browser_tabs,1)
-        empty = QLabel('尚未打开账号页面。请在“主号 / 从号”中选中账号，点击“登录 / 查看内嵌浏览器”。')
+        empty = QLabel('尚未打开账号页面。请在“账号集群”中选中账号，点击“登录 / 查看内嵌浏览器”。')
         empty.setAlignment(Qt.AlignmentFlag.AlignCenter); empty.setObjectName('muted')
         self.browser_empty = empty; self.browser_tabs.addTab(empty,'使用提示')
         self.tabs.addTab(page,'内嵌浏览器')
@@ -296,29 +298,30 @@ class Window(QMainWindow):
         widget = self.ensure_browser(account,True)
         widget.navigate(url)
 
-    def sync_role_switches(self):
+    def sync_cluster_switches(self):
         with self.engine.lock:
-            running = set(self.engine.running_accounts)
-        for role,switch in self.role_switches.items():
-            accounts = self.db.rows('SELECT id FROM accounts WHERE role=?',(role,))
-            count = sum(r['id'] in running for r in accounts)
-            switch.setChecked(count>0)
-            name = '主号监控' if role=='main' else '全部从号私信'
-            switch.setText(f'关闭{name}（{count}/{len(accounts)} 运行中）' if count else f'开启{name}')
+            running = len(self.engine.running_accounts)
+            current = self.engine.cluster_mode
+        for mode,switch in self.mode_switches.items():
+            active = mode==current
+            switch.setChecked(active)
+            switch.setEnabled(current is None or active)
+            name = '找评论' if mode=='comments' else '私信'
+            switch.setText(f'关闭{name}模式（{running} 个账号运行中）' if active else f'开启{name}模式')
 
-    def toggle_role(self,role,enabled):
+    def toggle_cluster(self,mode,enabled):
         def action():
             if not self.engine.ready.is_set(): raise ValueError('后台正在初始化，请稍后重试')
-            accounts = self.db.rows('SELECT * FROM accounts WHERE role=?',(role,))
-            if not accounts: raise ValueError('请先添加主号' if role=='main' else '请先添加从号')
-            if enabled and (not self.db.setting('base_url','') or not self.db.setting('model','')):
-                raise ValueError('请先保存 AI 设置')
-            for account in accounts:
-                if enabled: self.ensure_browser(account,False)
-                self.engine.command('start' if enabled else 'stop',account)
-            self.add_log(('主号监控' if role=='main' else '全部从号私信')+('：已请求开启' if enabled else '：已请求停止'))
+            if enabled:
+                if self.engine.busy(): raise ValueError('请先停止当前集群任务，再切换模式')
+                if not self.db.setting('base_url','') or not self.db.setting('model',''):
+                    raise ValueError('请先保存 AI 设置')
+                accounts = self.engine.cluster_accounts(mode)
+                for account in accounts: self.ensure_browser(account,False)
+            self.engine.command('start_cluster' if enabled else 'stop_cluster',{'mode':mode})
+            self.add_log(('找评论' if mode=='comments' else '私信')+('模式：已请求开启' if enabled else '模式：已请求停止'))
         self.report(action)
-        self.sync_role_switches()
+        self.sync_cluster_switches()
 
     def build_bloggers(self):
         l = self.page('视频来源 / 扫描进度')
@@ -430,7 +433,7 @@ class Window(QMainWindow):
             form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
             forms[name] = form; l.addWidget(group)
         self.fields = {}
-        labels = dict(thinking_mode='DeepSeek 思考模式',thinking_effort='DeepSeek 思考强度',ai_concurrency='评论 AI 并发数（1–20）',days='博主近期视频：最近 N 天',comment_days='近期评论：最近 N 天',video_list_reset_hours='视频列表清空重建周期（小时）',poll_seconds='监控轮询间隔（秒）',scroll_limit='每页最大滚动次数',base_url='AI 接口根地址（含 /v1）',model='模型名称',filter_prompt='目标客户筛选提示词',message_prompt='个性化私信提示词',comment_panel='评论滚动区域 CSS（需实页校准）',message_editor='私信输入框 CSS（需实页校准）')
+        labels = dict(collection_accounts='同时采集账号数（不超过账号总数）',thinking_mode='DeepSeek 思考模式',thinking_effort='DeepSeek 思考强度',ai_concurrency='每个账号评论 AI 并发数（1–20）',days='博主近期视频：最近 N 天',comment_days='近期评论：最近 N 天',video_list_reset_hours='视频列表清空重建周期（小时）',poll_seconds='监控轮询间隔（秒）',scroll_limit='每页最大滚动次数',base_url='AI 接口根地址（含 /v1）',model='模型名称',filter_prompt='目标客户筛选提示词',message_prompt='个性化私信提示词',comment_panel='评论滚动区域 CSS（需实页校准）',message_editor='私信输入框 CSS（需实页校准）')
         for k,v in DEFAULTS.items():
             val = self.db.setting(k,v)
             if k in ('thinking_mode','thinking_effort'):
@@ -439,7 +442,7 @@ class Window(QMainWindow):
                 for label,value in options: field.addItem(label,value)
                 field.setCurrentIndex(max(0,field.findData(val)))
             elif isinstance(v,int):
-                field = NoWheelSpinBox(); field.setRange(1,20 if k=='ai_concurrency' else 86400 if k=='poll_seconds' else 1000); field.setValue(val)
+                field = NoWheelSpinBox(); field.setRange(1,max(1,len(self.db.rows('SELECT id FROM accounts'))) if k=='collection_accounts' else 20 if k=='ai_concurrency' else 86400 if k=='poll_seconds' else 1000); field.setValue(val)
             elif k.endswith('prompt'):
                 field = QPlainTextEdit(val); field.setMinimumHeight(300)
             else: field = QLineEdit(val)
@@ -450,6 +453,7 @@ class Window(QMainWindow):
                 forms[section].addRow(field)
             else:
                 forms[section].addRow(labels[k],field)
+        self.fields['collection_accounts'].setToolTip('按账号列表顺序使用前 N 个账号；设置保存后，下次开启找评论模式生效。私信模式使用全部账号。')
         self.fields['thinking_mode'].currentIndexChanged.connect(self.update_thinking_controls)
         self.update_thinking_controls()
         self.api_key = QLineEdit(); self.api_key.setEchoMode(QLineEdit.EchoMode.Password); self.api_key.setPlaceholderText('留空保留已有密钥；保存到系统钥匙串，不导出')
@@ -599,20 +603,26 @@ class Window(QMainWindow):
         self.refresh_videos()
 
     def refresh_accounts(self):
-        self.account_rows = self.db.rows('SELECT * FROM accounts ORDER BY role,id')
+        self.account_rows = self.db.rows('SELECT * FROM accounts ORDER BY rowid')
         selected = self.accounts.currentRow()
         def quota_text(account):
-            if account['role']!='sender': return '—'
             quota = self.db.sender_quota(account['id'])
             limit = quota['limit'] if quota['limit'] else '不限'
             return f'{quota["used"]} / {limit}'
-        populate(self.accounts,[[r['name'],'主号' if r['role']=='main' else '从号',r['interval'],quota_text(r),self.states.get(r['id'],'未启动')] for r in self.account_rows])
+        populate(self.accounts,[[r['name'],r['interval'],quota_text(r),self.states.get(r['id'],'未启动')] for r in self.account_rows])
         if 0<=selected<len(self.account_rows): self.accounts.selectRow(selected)
         names = {r['id']:r['name'] for r in self.account_rows}
         for ident,widget in self.browser_widgets.items():
             index = self.browser_tabs.indexOf(widget)
             if index >= 0 and ident in names: self.browser_tabs.setTabText(index,names[ident])
-        self.sync_role_switches()
+        self.sync_cluster_switches()
+        if hasattr(self,'fields'):
+            count = len(self.account_rows)
+            self.fields['collection_accounts'].setMaximum(max(1,count))
+            self.fields['collection_accounts'].setEnabled(count>0)
+            saved = self.db.setting('collection_accounts',1)
+            if count and saved>count:
+                self.db.save_settings({'collection_accounts':count})
 
     def refresh_bloggers(self):
         self.blogger_rows = self.db.rows('SELECT * FROM bloggers')
@@ -672,15 +682,13 @@ class Window(QMainWindow):
             self.customers.item(i,1).setForeground(QColor(colors.get(r['status'],'#dbe5f3')))
             if r['uid']==selected_uid: self.customers.selectRow(i)
 
-    def add_account(self,role):
+    def add_account(self):
         def action():
             name,ok=QInputDialog.getText(self,'新增账号','账号备注：')
             if not ok or not name.strip(): return
-            daily_limit = 0
-            if role=='sender':
-                daily_limit,ok=QInputDialog.getInt(self,'每日私信上限','每天最多私信人数（0 表示不限）：',0,0,100000)
-                if not ok:return
-            self.db.account(role,name.strip(),daily_limit); self.refresh_accounts()
+            daily_limit,ok=QInputDialog.getInt(self,'每日私信上限','每天最多私信人数（0 表示不限）：',0,0,100000)
+            if not ok:return
+            self.db.account(name.strip(),daily_limit); self.refresh_accounts()
         self.report(action)
 
     def edit_account(self):
@@ -691,9 +699,8 @@ class Window(QMainWindow):
             interval,ok=QInputDialog.getInt(self,'发送间隔','秒：',r['interval'],1,86400)
             if not ok:return
             daily_limit = r.get('daily_limit',0)
-            if r['role']=='sender':
-                daily_limit,ok=QInputDialog.getInt(self,'每日私信上限','每天最多私信人数（0 表示不限）：',daily_limit,0,100000)
-                if not ok:return
+            daily_limit,ok=QInputDialog.getInt(self,'每日私信上限','每天最多私信人数（0 表示不限）：',daily_limit,0,100000)
+            if not ok:return
             self.db.execute('UPDATE accounts SET name=?,interval=?,daily_limit=? WHERE id=?',(name.strip(),interval,daily_limit,r['id'])); self.refresh_accounts()
         self.report(action)
 
@@ -701,11 +708,9 @@ class Window(QMainWindow):
         def action():
             r=self.selected(self.accounts,self.account_rows)
             if not self.engine.ready.is_set(): raise ValueError('后台正在初始化，请稍后重试')
-            if op=='start':
-                if not self.db.setting('base_url','') or not self.db.setting('model',''): raise ValueError('请先保存 AI 设置')
-                self.states[r['id']]='正在启动'
-            if op in ('login','start'):
-                self.ensure_browser(r,op=='login')
+            if op=='login':
+                if r['id'] in self.engine.running_accounts: raise ValueError('请先停止该账号任务，再打开登录页面')
+                self.ensure_browser(r,True)
             self.engine.command(op,r)
         self.report(action)
 
@@ -843,15 +848,15 @@ class Window(QMainWindow):
         def action():
             count = len(self.db.video_tasks())
             if not count:
-                self.statusBar().showMessage('待分析视频列表已经为空；主号下一轮会重新找视频',5000)
+                self.statusBar().showMessage('待分析视频列表已经为空；集群下一轮会重新找视频',5000)
                 return
             text = (f'确认清空全部 {count} 个待分析视频？\n\n'
-                    '清空后，主号检测到列表为空时会重新从全部搜索词、关键词和博主来源找视频。')
+                    '清空后，集群检测到列表为空时会重新从全部搜索词、关键词和博主来源找视频。')
             if QMessageBox.question(self,'清空待分析视频',text)!=QMessageBox.StandardButton.Yes:
                 return
             removed = self.db.clear_videos()
             self.refresh_videos()
-            self.statusBar().showMessage(f'已清空 {removed} 个视频；主号下一轮将重新找视频',8000)
+            self.statusBar().showMessage(f'已清空 {removed} 个视频；集群下一轮将重新找视频',8000)
         self.report(action)
 
     def save_settings(self):
@@ -885,7 +890,7 @@ class Window(QMainWindow):
                 self.statusBar().showMessage('当前没有失败客户',5000)
                 return
             warning = (f'确认将全部 {count} 位失败客户重新排队？\n\n'
-                       '其中可能包含发送结果不明的客户。请先在对应从号的聊天记录中核对，避免重复私信。')
+                       '其中可能包含发送结果不明的客户。请先在对应账号的聊天记录中核对，避免重复私信。')
             if QMessageBox.question(self,'批量重新排队',warning)!=QMessageBox.StandardButton.Yes:return
             queued = self.db.requeue_failed()
             self.refresh_customers()

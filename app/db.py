@@ -53,8 +53,7 @@ class DB:
             c.executescript('''
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,role TEXT NOT NULL CHECK(role IN ('main','sender')),name TEXT NOT NULL,interval INTEGER NOT NULL DEFAULT 120,daily_limit INTEGER NOT NULL DEFAULT 0);
-            CREATE UNIQUE INDEX IF NOT EXISTS one_main ON accounts(role) WHERE role='main';
+            CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,name TEXT NOT NULL,interval INTEGER NOT NULL DEFAULT 120,daily_limit INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS bloggers(id TEXT PRIMARY KEY,name TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS keywords(id INTEGER PRIMARY KEY AUTOINCREMENT,keyword TEXT NOT NULL UNIQUE);
             CREATE TABLE IF NOT EXISTS search_keywords(id INTEGER PRIMARY KEY AUTOINCREMENT,keyword TEXT NOT NULL UNIQUE);
@@ -80,6 +79,18 @@ class DB:
             account_columns = {row['name'] for row in c.execute('PRAGMA table_info(accounts)')}
             if 'daily_limit' not in account_columns:
                 c.execute('ALTER TABLE accounts ADD COLUMN daily_limit INTEGER NOT NULL DEFAULT 0')
+            if 'role' in account_columns:
+                # Preserve UUIDs: browser profiles and sending history use them.
+                # SQLite's Python driver does not begin a transaction for DDL.
+                # Keep the rename/copy/drop atomic if migration is interrupted.
+                c.execute('BEGIN IMMEDIATE')
+                c.execute('DROP INDEX IF EXISTS one_main')
+                c.execute('ALTER TABLE accounts RENAME TO accounts_before_cluster')
+                c.execute('''CREATE TABLE accounts(id TEXT PRIMARY KEY,name TEXT NOT NULL,
+                    interval INTEGER NOT NULL DEFAULT 120,daily_limit INTEGER NOT NULL DEFAULT 0)''')
+                c.execute('''INSERT INTO accounts SELECT id,name,interval,daily_limit
+                    FROM accounts_before_cluster''')
+                c.execute('DROP TABLE accounts_before_cluster')
             video_schema = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='videos'").fetchone()['sql']
             if "'manual'" not in video_schema or "'search'" not in video_schema:
                 c.executescript('''
@@ -241,16 +252,16 @@ class DB:
         self.execute('UPDATE videos SET status=?,error=?,scanned_at=? WHERE id=?',
                      (status,str(error),scanned_at,str(ident)))
 
-    def account(self, role, name, daily_limit=0):
+    def account(self, name, daily_limit=0):
         ident = uuid.uuid4().hex
-        self.execute('INSERT INTO accounts(id,role,name,daily_limit) VALUES (?,?,?,?)',
-                     (ident,role,name,max(0,int(daily_limit))))
+        self.execute('INSERT INTO accounts(id,name,daily_limit) VALUES (?,?,?)',
+                     (ident,name,max(0,int(daily_limit))))
         return ident
 
     def sender_quota(self, account):
-        """返回从号北京时间今日已私信人数和每日上限。"""
+        """返回账号北京时间今日已私信人数和每日上限。"""
         rows = self.rows('''
-            SELECT COALESCE((SELECT daily_limit FROM accounts WHERE id=? AND role='sender'),0) daily_limit,
+            SELECT COALESCE((SELECT daily_limit FROM accounts WHERE id=?),0) daily_limit,
                    count(DISTINCT uid) used
               FROM events
              WHERE account_id=? AND kind IN ('send_attempt','sent')
@@ -270,7 +281,7 @@ class DB:
     def claim(self, account):
         with self.connect() as c:
             c.execute('BEGIN IMMEDIATE')
-            sender = c.execute("SELECT daily_limit FROM accounts WHERE id=? AND role='sender'",(account,)).fetchone()
+            sender = c.execute("SELECT daily_limit FROM accounts WHERE id=?",(account,)).fetchone()
             if sender is not None and int(sender['daily_limit'] or 0)>0:
                 used = c.execute('''SELECT count(DISTINCT uid) FROM events
                     WHERE account_id=? AND kind IN ('send_attempt','sent')

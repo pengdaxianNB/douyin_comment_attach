@@ -165,7 +165,7 @@ def test_clear_video_list_button_forces_source_rebuild(tmp_path,monkeypatch):
     assert db.video_tasks()==[]
     assert db.setting('video_list_built_at') is None
     assert w.videos.rowCount()==0
-    assert '主号下一轮将重新找视频' in w.statusBar().currentMessage()
+    assert '集群下一轮将重新找视频' in w.statusBar().currentMessage()
     w.close();app.processEvents()
 
 
@@ -211,7 +211,7 @@ def test_send_attempt_remains_in_processing_metric(tmp_path):
     app=QApplication.instance() or QApplication([])
     db=DB(tmp_path/'test.sqlite3')
     uid='MS4wLjABAAAAprocessing_customer_12345'
-    account_id=db.account('sender','从号')
+    account_id=db.account('从号')
     db.import_customers([dict(uid=uid,name='处理中客户')])
     db.claim(account_id)
     db.start_send(uid,account_id,'你好')
@@ -226,7 +226,7 @@ def test_send_attempt_remains_in_processing_metric(tmp_path):
 def test_stopped_account_browser_can_be_manually_restarted(tmp_path):
     app=QApplication.instance() or QApplication([])
     db=DB(tmp_path/'test.sqlite3')
-    account_id=db.account('sender','从号')
+    account_id=db.account('从号')
     w=Window(db,tmp_path,start_engine=False)
     w.engine.ready.set()
     account=w.account_rows[0]
@@ -246,13 +246,13 @@ def test_stopped_account_browser_can_be_manually_restarted(tmp_path):
 def test_account_table_shows_today_sent_count_and_limit(tmp_path):
     app=QApplication.instance() or QApplication([])
     db=DB(tmp_path/'test.sqlite3')
-    account_id=db.account('sender','从号',daily_limit=10)
+    account_id=db.account('从号',daily_limit=10)
     db.execute("INSERT INTO events(account_id,uid,kind) VALUES (?,?,'sent')",
                (account_id,'MS4wLjABAAAAtoday_customer_1234567'))
     w=Window(db,tmp_path,start_engine=False)
 
-    assert w.accounts.item(0,3).text()=='1 / 10'
+    assert w.accounts.item(0,2).text()=='1 / 10'
     db.execute("UPDATE events SET at=datetime('now','-1 day') WHERE account_id=?",(account_id,))
     w.refresh_accounts()
-    assert w.accounts.item(0,3).text()=='0 / 10'
+    assert w.accounts.item(0,2).text()=='0 / 10'
     w.close();app.processEvents()

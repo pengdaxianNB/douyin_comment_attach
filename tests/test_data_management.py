@@ -4,7 +4,7 @@ from app.db import DB
 
 def seed(tmp_path):
     db=DB(tmp_path/'db.sqlite3')
-    db.account('main','主号')
+    db.account('主号')
     db.save_settings({'model':'test'})
     for i in range(105):
         db.ingest(dict(id=str(i),uid='MS4wLjABAAAAcustomer_'+str(i),name='客户',text='需求',comment_time='',video_id='v',video_title='',blogger=''),True,'需求')

@@ -149,7 +149,7 @@ def test_rebuild_survives_playwright_timeout_on_one_source(tmp_path):
 
 def test_monitor_retries_transient_failure_then_stops_after_limit(tmp_path):
     db = DB(tmp_path/'test.sqlite3')
-    account_id = db.account('main','主号')
+    account_id = db.account('主号')
     db.save_settings({'base_url':'https://example.com/v1','model':'test'})
     engine = Engine(db,tmp_path)
     engine.jobs = {}
@@ -165,7 +165,7 @@ def test_monitor_retries_transient_failure_then_stops_after_limit(tmp_path):
     engine.monitor_round = flaky
     with patch('app.engine.get_key',return_value='key'), patch('app.engine.AI'), \
          patch('app.engine.asyncio.sleep',new=AsyncMock()) as sleep:
-        asyncio.run(engine.work({'id':account_id,'role':'main','name':'主号'}))
+        asyncio.run(engine.work({'id':account_id,'role':'main','name':'主号'},mode='comments'))
 
     assert len(calls) == MAX_TRANSIENT_FAILURES
     assert sleep.await_count == MAX_TRANSIENT_FAILURES-1
@@ -174,7 +174,7 @@ def test_monitor_retries_transient_failure_then_stops_after_limit(tmp_path):
 
 def test_monitor_recovers_after_one_transient_failure(tmp_path):
     db = DB(tmp_path/'test.sqlite3')
-    account_id = db.account('main','主号')
+    account_id = db.account('主号')
     db.save_settings({'base_url':'https://example.com/v1','model':'test'})
     engine = Engine(db,tmp_path)
     engine.jobs = {}
@@ -191,14 +191,14 @@ def test_monitor_recovers_after_one_transient_failure(tmp_path):
     with patch('app.engine.get_key',return_value='key'), patch('app.engine.AI'), \
          patch('app.engine.asyncio.sleep',new=AsyncMock()):
         with pytest.raises(asyncio.CancelledError):
-            asyncio.run(engine.work({'id':account_id,'role':'main','name':'主号'}))
+            asyncio.run(engine.work({'id':account_id,'role':'main','name':'主号'},mode='comments'))
 
     assert len(rounds) == 2
 
 
 def test_ai_failure_returns_customer_to_queue_and_sender_keeps_running(tmp_path):
     db = DB(tmp_path/'test.sqlite3')
-    account_id = db.account('sender','从号')
+    account_id = db.account('从号')
     db.save_settings({'base_url':'https://example.com/v1','model':'test'})
     db.import_customers([dict(uid=UID,name='客户')])
     engine = Engine(db,tmp_path)
@@ -221,7 +221,7 @@ def test_ai_failure_returns_customer_to_queue_and_sender_keeps_running(tmp_path)
 
 def test_persistent_ai_outage_stops_sender_without_losing_customer(tmp_path):
     db = DB(tmp_path/'test.sqlite3')
-    account_id = db.account('sender','从号')
+    account_id = db.account('从号')
     db.save_settings({'base_url':'https://example.com/v1','model':'test'})
     db.import_customers([dict(uid=UID,name='客户')])
     engine = Engine(db,tmp_path)
