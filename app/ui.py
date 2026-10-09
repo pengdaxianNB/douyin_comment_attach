@@ -7,7 +7,7 @@ from pathlib import Path
 import keyring
 from PySide6.QtCore import Qt, QTimer, QItemSelectionModel
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QTabWidget,QTableWidget,QTableWidgetItem,QHeaderView,QLineEdit,QPlainTextEdit,QSpinBox,QFormLayout,QMessageBox,QFileDialog,QInputDialog,QComboBox,QGroupBox,QAbstractItemView,QScrollArea,QDialog)
+from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QTabWidget,QTableWidget,QTableWidgetItem,QHeaderView,QLineEdit,QPlainTextEdit,QSpinBox,QFormLayout,QMessageBox,QFileDialog,QInputDialog,QComboBox,QGroupBox,QAbstractItemView,QScrollArea,QDialog,QCheckBox)
 from .ai import SERVICE
 from .db import user_id
 from .engine import Engine, DEFAULTS
@@ -390,23 +390,28 @@ class Window(QMainWindow):
         self.video_search = QLineEdit(); self.video_search.setPlaceholderText('按视频标题模糊搜索…')
         self.video_search.setClearButtonEnabled(True); self.video_search.setMinimumWidth(260)
         self.video_search.textChanged.connect(self.refresh_videos); video_bar.addWidget(self.video_search)
+        self._checked_video_ids = set()
+        self.video_select_all = QCheckBox('全选当前列表')
+        self.video_select_all.stateChanged.connect(self.toggle_all_videos)
+        video_bar.addWidget(self.video_select_all)
         video_bar.addStretch()
         self.add_manual_video_button = button('录入视频/笔记链接',self.add_manual_video)
         self.add_manual_video_button.setProperty('variant','primary'); video_bar.addWidget(self.add_manual_video_button)
         self.remove_manual_video_button = button('移除手动视频',self.remove_manual_video)
         video_bar.addWidget(self.remove_manual_video_button)
-        self.delete_videos_button = button('删除选中视频',self.delete_selected_videos)
+        self.delete_videos_button = button('删除勾选视频',self.delete_selected_videos)
         self.delete_videos_button.setProperty('variant','danger'); video_bar.addWidget(self.delete_videos_button)
         self.clear_videos_button = button('一键清空',self.clear_videos)
         self.clear_videos_button.setProperty('variant','danger'); video_bar.addWidget(self.clear_videos_button)
         self.video_summary = QLabel('共 0 个'); self.video_summary.setObjectName('muted'); video_bar.addWidget(self.video_summary)
-        self.videos = table(['状态','来源','视频标题','作者','发布时间','作品 ID','异常说明'])
+        self.videos = table(['选择','状态','来源','视频标题','作者','发布时间','作品 ID','异常说明'])
         self.videos.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        for col,width in enumerate([100,160,360,140,160,200,280]): self.videos.setColumnWidth(col,width)
+        for col,width in enumerate([58,100,160,360,140,160,200,280]): self.videos.setColumnWidth(col,width)
         self.videos.itemSelectionChanged.connect(self.update_manual_video_action)
+        self.videos.itemChanged.connect(self.video_checkbox_changed)
         self.update_manual_video_action()
         videos_layout.addWidget(self.videos,1)
-        video_hint = QLabel('找视频中断后会继续未完成的来源，全部完成后再分析评论。Ctrl/Shift 可多选视频，停止任务后可删除选中项；自动来源的视频在下次列表重建时可能重新发现。')
+        video_hint = QLabel('勾选视频前的选择框，或全选当前列表，停止任务后可批量删除勾选项。找视频中断后会继续未完成的来源；自动来源的视频在下次列表重建时可能重新发现。')
         video_hint.setObjectName('muted'); video_hint.setWordWrap(True); videos_layout.addWidget(video_hint)
 
     def update_blogger_actions(self):
@@ -426,7 +431,44 @@ class Window(QMainWindow):
         manual = (len(selected)==1 and hasattr(self,'video_rows') and 0 <= row < len(self.video_rows)
                   and self.video_rows[row].get('source_type')=='manual')
         self.remove_manual_video_button.setEnabled(manual)
-        self.delete_videos_button.setEnabled(bool(selected))
+        checked = len(self.checked_video_rows())
+        self.delete_videos_button.setEnabled(bool(checked))
+        self.delete_videos_button.setText('删除勾选视频'+(f'（{checked}）' if checked else ''))
+        total = self.videos.rowCount()
+        state = (Qt.CheckState.Checked if total and checked==total else
+                 Qt.CheckState.PartiallyChecked if checked else Qt.CheckState.Unchecked)
+        self.video_select_all.blockSignals(True)
+        self.video_select_all.setTristate(state==Qt.CheckState.PartiallyChecked)
+        self.video_select_all.setCheckState(state)
+        self.video_select_all.setEnabled(bool(total))
+        self.video_select_all.blockSignals(False)
+
+    def checked_video_rows(self):
+        return [row for row in getattr(self,'video_rows',[]) if row['id'] in self._checked_video_ids]
+
+    def video_checkbox_changed(self, item):
+        if item.column()!=0:
+            return
+        ident = item.data(Qt.ItemDataRole.UserRole)
+        if not ident:
+            return
+        if item.checkState()==Qt.CheckState.Checked:
+            self._checked_video_ids.add(ident)
+        else:
+            self._checked_video_ids.discard(ident)
+        self.update_manual_video_action()
+
+    def toggle_all_videos(self, state):
+        checked = state==Qt.CheckState.Checked.value
+        self.videos.blockSignals(True)
+        for i,row in enumerate(getattr(self,'video_rows',[])):
+            if checked:
+                self._checked_video_ids.add(row['id'])
+            else:
+                self._checked_video_ids.discard(row['id'])
+            self.videos.item(i,0).setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self.videos.blockSignals(False)
+        self.update_manual_video_action()
 
     def build_settings(self):
         l = self.page('AI 与任务设置'); forms = {}
@@ -646,10 +688,11 @@ class Window(QMainWindow):
         selected_ids = {old_rows[index.row()]['id'] for index in self.videos.selectionModel().selectedRows()
                         if index.row()<len(old_rows)}
         all_rows = self.db.video_tasks() if hasattr(self.db,'video_tasks') else []
+        self._checked_video_ids.intersection_update(row['id'] for row in all_rows)
         query = self.video_search.text().strip().casefold()
         rows = [row for row in all_rows if query in str(row.get('title','')).casefold()]
         self.video_rows = rows
-        view = [[VIDEO_STATUS.get(r['status'],r['status']),
+        view = [['',VIDEO_STATUS.get(r['status'],r['status']),
             ({'blogger':'博主：','keyword':'关键词：','search':'抖音搜索：','manual':''}.get(r['source_type'],'')+r['source_name']),
             r['title'],r['author'],
             (datetime.fromtimestamp(r['create_time'],BEIJING_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S') if r['create_time'] else ''),
@@ -664,6 +707,10 @@ class Window(QMainWindow):
             populate(self.videos,view)
             selection = self.videos.selectionModel()
             for i,row in enumerate(rows):
+                checkbox = self.videos.item(i,0)
+                checkbox.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+                checkbox.setData(Qt.ItemDataRole.UserRole,row['id'])
+                checkbox.setCheckState(Qt.CheckState.Checked if row['id'] in self._checked_video_ids else Qt.CheckState.Unchecked)
                 if row['id'] in selected_ids:
                     selection.select(self.videos.model().index(i,0),
                         QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
@@ -677,7 +724,7 @@ class Window(QMainWindow):
         self.video_source_tabs.setTabText(self.video_source_tabs.indexOf(self.videos_page),'待分析视频（'+str(len(all_rows))+'）')
         colors = {'pending':'#80baff','scanning':'#b7a2ff','done':'#62d7b0','failed':'#f48b96'}
         for i,row in enumerate(rows if changed else ()):
-            self.videos.item(i,0).setForeground(QColor(colors.get(row['status'],'#dbe5f3')))
+            self.videos.item(i,1).setForeground(QColor(colors.get(row['status'],'#dbe5f3')))
         self.update_manual_video_action()
 
     def refresh_customers(self):
@@ -865,18 +912,18 @@ class Window(QMainWindow):
 
     def delete_selected_videos(self):
         def action():
-            rows = [self.video_rows[index.row()] for index in self.videos.selectionModel().selectedRows()]
+            rows = self.checked_video_rows()
             if not rows:
-                raise ValueError('请先选择要删除的视频')
+                raise ValueError('请先勾选要删除的视频')
             if self.engine.busy():
                 raise ValueError('请先停止任务，再删除选中视频')
-            text = (f'确认删除选中的 {len(rows)} 个视频？\n\n'
+            text = (f'确认删除当前列表中勾选的 {len(rows)} 个视频？\n\n'
                     '手动录入的视频会同时移除手动来源；自动找到的视频本轮不再分析，下次列表重建时可能重新发现。已保存的评论和客户会保留。')
-            if QMessageBox.question(self,'删除选中视频',text)!=QMessageBox.StandardButton.Yes:
+            if QMessageBox.question(self,'删除勾选视频',text)!=QMessageBox.StandardButton.Yes:
                 return
             removed = self.db.delete_videos([row['id'] for row in rows])
             self.refresh_videos()
-            self.statusBar().showMessage(f'已删除 {removed} 个选中视频',5000)
+            self.statusBar().showMessage(f'已删除 {removed} 个勾选视频',5000)
         self.report(action)
 
     def clear_videos(self):

@@ -182,8 +182,8 @@ def test_manual_video_can_be_added_and_removed_from_video_page(tmp_path,monkeypa
     w.add_manual_video()
 
     assert w.videos.rowCount()==1
-    assert w.videos.item(0,1).text()=='手动录入'
-    assert w.videos.item(0,2).text()=='手动录入标题'
+    assert w.videos.item(0,2).text()=='手动录入'
+    assert w.videos.item(0,3).text()=='手动录入标题'
     assert w.remove_manual_video_button.isEnabled()
     monkeypatch.setattr(QMessageBox,'question',lambda *args:QMessageBox.StandardButton.Yes)
     w.remove_manual_video()
@@ -202,13 +202,14 @@ def test_manual_note_link_can_be_added(tmp_path,monkeypatch):
     w.add_manual_video()
 
     assert w.videos.rowCount()==1
-    assert w.videos.item(0,5).text()=='7690537643185017257'
+    assert w.videos.item(0,6).text()=='7690537643185017257'
     assert db.video_tasks()[0]['url']=='https://www.douyin.com/note/7690537643185017257'
     w.close();app.processEvents()
 
 
 @pytest.mark.parametrize('confirm',[True,False])
 def test_video_multiselect_delete_uses_filtered_ids_and_preserves_selection(tmp_path,monkeypatch,confirm):
+    from PySide6.QtCore import Qt
     from PySide6.QtCore import QItemSelectionModel
     from PySide6.QtWidgets import QAbstractItemView
     app=QApplication.instance() or QApplication([])
@@ -223,11 +224,14 @@ def test_video_multiselect_delete_uses_filtered_ids_and_preserves_selection(tmp_
     flags=QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
     for i in range(2):
         selection.select(w.videos.model().index(i,0),flags)
+        w.videos.item(i,0).setCheckState(Qt.CheckState.Checked)
     assert w.delete_videos_button.isEnabled()
     # A refresh inserts a new row before the selected rows: selection follows IDs.
     db.add_video({'aweme_id':'4','desc':'选中但保留视频','create_time':100},'search','词')
     w.refresh_videos()
     assert {w.video_rows[index.row()]['id'] for index in selection.selectedRows()}=={manual,'2'}
+    assert {r['id'] for r in w.checked_video_rows()}=={manual,'2'}
+    assert w.video_select_all.checkState()==Qt.CheckState.PartiallyChecked
     questions=[]
     def question(*args):
         questions.append(args[2])
@@ -241,17 +245,54 @@ def test_video_multiselect_delete_uses_filtered_ids_and_preserves_selection(tmp_
 
 
 def test_selected_video_delete_requires_stopped_tasks(tmp_path,monkeypatch):
+    from PySide6.QtCore import Qt
     app=QApplication.instance() or QApplication([])
     db=DB(tmp_path/'test.sqlite3')
     db.add_video({'aweme_id':'1'},'search','词')
     w=Window(db,tmp_path,start_engine=False)
     w.videos.selectRow(0)
+    w.videos.item(0,0).setCheckState(Qt.CheckState.Checked)
     w.engine.running_accounts.add('busy')
     warnings=[]
     monkeypatch.setattr(QMessageBox,'warning',lambda *args:warnings.append(args[2]))
     w.delete_selected_videos()
     assert len(db.video_tasks())==1 and warnings and '停止任务' in warnings[0]
     w.engine.running_accounts.clear()
+    w.close();app.processEvents()
+
+
+def test_video_checkbox_select_all_respects_filter_and_keeps_hidden_checks(tmp_path,monkeypatch):
+    from PySide6.QtCore import Qt
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    for ident,title in [('1','目标一'),('2','目标二'),('3','其他视频')]:
+        db.add_video({'aweme_id':ident,'desc':title},'search','词')
+    w=Window(db,tmp_path,start_engine=False)
+    assert not w.delete_videos_button.isEnabled()
+    # Highlighting a row alone never queues it for deletion.
+    w.videos.selectRow(0)
+    assert not w.delete_videos_button.isEnabled()
+    assert w.videos.item(0,0).flags() & Qt.ItemFlag.ItemIsUserCheckable
+    w.videos.item(0,0).setCheckState(Qt.CheckState.Checked)
+    assert w.video_select_all.checkState()==Qt.CheckState.PartiallyChecked
+    w.video_select_all.click()
+    assert len(w.checked_video_rows())==3
+    assert w.video_select_all.checkState()==Qt.CheckState.Checked
+    w.video_search.setText('目标')
+    assert len(w.checked_video_rows())==2
+    w.video_select_all.click()
+    assert w.checked_video_rows()==[]
+    assert not w.delete_videos_button.isEnabled()
+    w.video_select_all.click()
+    assert {row['id'] for row in w.checked_video_rows()}=={'1','2'}
+    monkeypatch.setattr(QMessageBox,'question',lambda *args:QMessageBox.StandardButton.Yes)
+    w.delete_selected_videos()
+    assert {row['id'] for row in db.video_tasks()}=={'3'}
+    assert not w.video_select_all.isEnabled()
+    w.video_search.clear()
+    assert {row['id'] for row in w.checked_video_rows()}=={'3'}
+    assert w.videos.item(0,0).checkState()==Qt.CheckState.Checked
+    assert '（1）' in w.delete_videos_button.text()
     w.close();app.processEvents()
 
 
