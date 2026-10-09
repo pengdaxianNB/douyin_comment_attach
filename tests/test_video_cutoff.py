@@ -427,6 +427,29 @@ def test_search_json_body_timeout_is_bounded_and_diagnostic(monkeypatch):
     assert callbacks == {}
 
 
+def test_search_auxiliary_responses_do_not_hide_stream_failure(monkeypatch):
+    page,state=search_page([],end_after=10**9)
+    callbacks={}
+    page.on=lambda event,callback:callbacks.update({event:callback})
+    async def goto(*args,**kwargs):
+        callbacks['response'](SimpleNamespace(
+            url='https://www.douyin.com/aweme/v1/web/general/search/stream/',
+            body=AsyncMock(return_value=b'bad stream')))
+        # This was the last response and used to replace the real error with
+        # "搜索接口已响应，未提取到作品", hiding the unsupported stream format.
+        callbacks['response'](SimpleNamespace(
+            url='https://www.douyin.com/aweme/v1/web/hot/search/list/',
+            json=AsyncMock(return_value={'data':[]})))
+    page.goto=goto
+    browser=Browser(SimpleNamespace(pages=[page]),{},page=page)
+    browser.guard=AsyncMock()
+    monkeypatch.setattr('app.browser.SEARCH_READY_CHECKS',1)
+
+    with pytest.raises(SearchPageUnavailable,match=r'ValueError（/aweme/v1/web/general/search/stream/）'):
+        asyncio.run(browser.search_videos('干细胞回输多少钱一次'))
+    assert state['wheels']==0
+
+
 @pytest.mark.parametrize('error',[AccountNeedsAttention('请完成安全验证'),asyncio.CancelledError()])
 def test_search_account_prompt_and_stop_propagate_without_scrolling(monkeypatch,error):
     page,state=search_page([],end_after=10**9)

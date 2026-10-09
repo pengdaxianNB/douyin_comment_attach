@@ -10,7 +10,7 @@ from playwright.async_api import async_playwright
 from app.browser import Browser
 
 
-@pytest.mark.parametrize('source',['nested_api','modal_links'])
+@pytest.mark.parametrize('source',['nested_api','modal_links','chunked_stream'])
 def test_advice_above_search_works_does_not_trigger_loading_recovery(monkeypatch,source):
     monkeypatch.setattr('app.browser.SEARCH_READY_TIMEOUT',5)
     video_id='1234567890123456789'
@@ -22,6 +22,18 @@ def test_advice_above_search_works_does_not_trigger_loading_recovery(monkeypatch
             {'aweme_info':{'aweme_id':video_id,'desc':'视频'}},
             {'aweme_info':{'aweme_id':note_id,'desc':'图文','aweme_type':68}}]})}]}
         if source=='nested_api' else advice)
+    stream_body=None
+    if source=='chunked_stream':
+        # Captured from the provided medical query: three JSON records framed
+        # with hexadecimal UTF-8 BYTE lengths despite application/json MIME.
+        packets=[{'status_code':0,'data':[{'type':83,'common_aladdin':{
+                     'display':json.dumps({'title':'专家建议','text':'内容来自小荷医典'},ensure_ascii=False)}}]},
+                 {'time_cost':{'1st_screen_state':'hit_predict'},'ack':1},
+                 {'status_code':0,'data':[
+                     {'type':1,'aweme_info':{'aweme_id':video_id,'desc':'视频'}},
+                     {'type':1,'aweme_info':{'aweme_id':note_id,'desc':'图文','aweme_type':68}}]}]
+        chunks=[json.dumps(packet,ensure_ascii=False).encode() for packet in packets]
+        stream_body=b''.join(f'{len(chunk):x}\r\n'.encode()+chunk+b'\r\n' for chunk in chunks)+b'0\r\n\r\n'
     html=f"""
         <meta charset="utf-8">
         <section style="height:1200px">专家建议：内容来自小荷医典</section>
@@ -33,8 +45,10 @@ def test_advice_above_search_works_does_not_trigger_loading_recovery(monkeypatch
         <script>fetch('/aweme/v1/web/general/search/single/?keyword=测试')</script>
     """
     # The API case has no work links; the DOM case has no API work records.
-    if source=='nested_api':
+    if source in ('nested_api','chunked_stream'):
         html=html[:html.index('<main>')]+html[html.index('<script>'):]
+    if source=='chunked_stream':
+        html=html.replace('search/single/','search/stream/')
 
     async def run():
         async with async_playwright() as pw:
@@ -49,6 +63,9 @@ def test_advice_above_search_works_does_not_trigger_loading_recovery(monkeypatch
                     url=request.request.url
                     requests.append(url)
                     if '/aweme/v1/web/' in url:
+                        if '/search/stream/' in url:
+                            await request.fulfill(body=stream_body,content_type='application/json')
+                            return
                         payload=(initial if 'page=2' not in url else
                                  {'business_data':[{'data':{'aweme_list':[
                                      {'aweme_id':later_id,'desc':'下一页'}]}}]})

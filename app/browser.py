@@ -206,9 +206,60 @@ SEARCH_READY_CHECKS = 30
 SEARCH_READY_TIMEOUT = 45
 SEARCH_STEP_TIMEOUT = 60
 SEARCH_RESPONSE_TIMEOUT = 8
+SEARCH_RESULT_PATHS = {
+    '/aweme/v1/web/general/search/single',
+    '/aweme/v1/web/general/search/stream',
+    '/aweme/v1/web/search/item',
+}
 # Every so often take a longer break, like someone stepping away for a moment.
 SEARCH_BREAK_EVERY = (12,25)
 SEARCH_BREAK_SECONDS = (8,20)
+
+
+def search_response_payloads(body):
+    """Read normal JSON or the search/stream endpoint's framed JSON records.
+
+    The medical query's stream first returns advice, then an ack, then works.
+    Its application/json body retains hex chunk lengths and a zero terminator;
+    lengths count UTF-8 bytes, and chunks may split or concatenate JSON records.
+    """
+    raw = body.encode('utf-8') if isinstance(body,str) else body
+    try:
+        return [json.loads(raw)]
+    except (json.JSONDecodeError,UnicodeDecodeError):
+        pass
+
+    chunks = []
+    position = 0
+    while True:
+        end = raw.find(b'\r\n',position)
+        if end < 0 or not re.fullmatch(rb'[0-9a-fA-F]+',raw[position:end]):
+            raise ValueError('搜索流式响应缺少有效分块长度')
+        size = int(raw[position:end],16)
+        position = end+2
+        if size == 0:
+            if raw[position:] != b'\r\n':
+                raise ValueError('搜索流式响应结束标记不完整')
+            break
+        end = position+size
+        if raw[end:end+2] != b'\r\n':
+            raise ValueError('搜索流式响应分块长度不匹配')
+        chunks.append(raw[position:end])
+        position = end+2
+
+    # A transport chunk is not necessarily one JSON record. Join the bytes
+    # before UTF-8 decoding, then read every complete JSON object in order.
+    text = b''.join(chunks).decode('utf-8')
+    decoder = json.JSONDecoder()
+    payloads = []
+    position = 0
+    while position < len(text):
+        if text[position].isspace():
+            position += 1
+            continue
+        payload,position = decoder.raw_decode(text,position)
+        payloads.append(payload)
+    return payloads
 
 
 def search_result_videos(payload):
@@ -1292,24 +1343,34 @@ class Browser:
         async def consume(response):
             nonlocal response_state
             parsed = urlparse(response.url)
-            if not is_douyin_host(parsed.hostname) or '/aweme/v1/web/' not in parsed.path or 'search' not in parsed.path:
+            # Hot words/suggestions also contain "search" in their URL. They
+            # have no result works and must not overwrite stream diagnostics.
+            if not is_douyin_host(parsed.hostname) or parsed.path.rstrip('/') not in SEARCH_RESULT_PATHS:
                 return
             status = getattr(response,'status',200)
             if status >= 400:
                 response_state = f'搜索接口 HTTP {status}'
                 return
             try:
-                payload = await asyncio.wait_for(response.json(),timeout=SEARCH_RESPONSE_TIMEOUT)
+                if parsed.path.rstrip('/').endswith('/search/stream'):
+                    body = await asyncio.wait_for(response.body(),timeout=SEARCH_RESPONSE_TIMEOUT)
+                    payloads = search_response_payloads(body)
+                else:
+                    payloads = [await asyncio.wait_for(response.json(),timeout=SEARCH_RESPONSE_TIMEOUT)]
             except Exception as exc:
-                response_state = '搜索接口响应读取失败：'+type(exc).__name__
+                response_state = '搜索接口响应读取失败：'+type(exc).__name__+'（'+parsed.path+'）'
                 return
-            if isinstance(payload,dict) and payload.get('status_code',0) not in (0,'0',None):
-                response_state = '搜索接口状态异常：'+str(payload['status_code'])
-                return
-            videos = search_result_videos(payload)
-            response_state = '搜索接口已响应，未提取到作品' if not videos else '搜索接口已返回作品'
-            for video in videos:
-                items[str(video['aweme_id'])] = video
+            for payload in payloads:
+                if isinstance(payload,dict) and payload.get('status_code',0) not in (0,'0',None):
+                    response_state = '搜索接口状态异常：'+str(payload['status_code'])
+                    continue
+                videos = search_result_videos(payload)
+                if videos:
+                    response_state = '搜索接口已返回作品'
+                elif not items:
+                    response_state = '搜索接口已响应，未提取到作品'
+                for video in videos:
+                    items[str(video['aweme_id'])] = video
 
         def receive(response):
             task = asyncio.create_task(consume(response))
