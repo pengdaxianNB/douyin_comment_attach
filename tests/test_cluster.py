@@ -102,8 +102,8 @@ def test_prepares_shared_list_once_per_round_and_waits_for_discovery(tmp_path):
     engine.open=AsyncMock(side_effect=lambda a:SimpleNamespace(warnings=[],s=None))
     discovered=[]; scanned=[]; prepares=[]
     prepare=db.prepare_video_scan
-    def track(hours):
-        prepares.append(1); return prepare(hours)
+    def track(hours,**kwargs):
+        prepares.append(1); return prepare(hours,**kwargs)
     db.prepare_video_scan=track
     async def discover(account,browser,settings,sources=None):
         await asyncio.sleep(0)

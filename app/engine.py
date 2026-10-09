@@ -404,18 +404,21 @@ class Engine(QThread):
             sources = self.collection_sources()
             if not sources and not self.db.video_tasks():
                 raise ValueError('请先添加关键词、抖音搜索词、监控博主或手动视频链接')
-            rebuild = self.db.prepare_video_scan(s['video_list_reset_hours'])
+            rebuild = self.db.prepare_video_scan(s['video_list_reset_hours'],sources=sources)
             if rebuild:
-                queue = deque(sources)
+                pending_sources = self.db.pending_discovery_sources(sources)
+                self.log.emit(f'集群：找视频进度 {len(sources)-len(pending_sources)}/{len(sources)}，继续未完成来源 {len(pending_sources)} 个')
+                queue = deque(pending_sources)
                 complete = [True]
-                try:
-                    await self.collection_stage(sessions,queue,s,True,complete)
-                except BaseException:
-                    self.db.save_settings({'video_list_built_at':0})
-                    raise
-                if queue or not complete[0]:
-                    self.db.save_settings({'video_list_built_at':0})
-                    self.log.emit('集群：部分来源未完成，已保留成功结果，下轮重新获取')
+                await self.collection_stage(sessions,queue,s,True,complete)
+                if not self.db.finish_video_discovery():
+                    self.log.emit('集群：找视频尚未完成，已保存来源断点，下轮继续找视频后再分析评论')
+                    for ident in sessions:
+                        self.status.emit(ident,'找视频未完成，等待断点续跑')
+                    if sessions:
+                        await asyncio.sleep(s['poll_seconds'])
+                    continue
+                self.log.emit('集群：全部来源找视频已完成，开始分析评论')
             videos = deque(self.db.video_tasks('pending'))
             self.log.emit(f'集群：本轮待分析视频 {len(videos)} 个，采集账号 {len(sessions)} 个')
             await self.collection_stage(sessions,videos,s,False,[True])
@@ -425,6 +428,16 @@ class Engine(QThread):
             if not sessions:
                 break
             await asyncio.sleep(s['poll_seconds'])
+
+    async def discover_source(self, account, browser, settings, source):
+        """Checkpoint only completed sources; partial results safely deduplicate."""
+        self.db.set_discovery_status(source,'running')
+        completed = False
+        try:
+            completed = await self.rebuild_video_list(account,browser,settings,sources=[source])
+            return completed
+        finally:
+            self.db.set_discovery_status(source,'done' if completed else 'pending')
 
     async def collection_stage(self, sessions, queue, settings, discovery, complete):
         """Claim each source/video once on the engine loop; no account owns a list."""
@@ -436,7 +449,7 @@ class Engine(QThread):
                     item = queue.popleft()
                     try:
                         if discovery:
-                            result = await self.rebuild_video_list(account,browser,settings,sources=[item])
+                            result = await self.discover_source(account,browser,settings,item)
                             complete[0] = complete[0] and result
                             browser = self.contexts.get(ident,browser)
                         else:
@@ -719,24 +732,18 @@ class Engine(QThread):
         ident = account['id']
         resume = bool(self.db.video_tasks('pending') or
                       self.db.rows("SELECT 1 FROM videos WHERE status='scanning' LIMIT 1"))
-        rebuild = self.db.prepare_video_scan(s['video_list_reset_hours'])
+        sources = self.collection_sources()
+        rebuild = self.db.prepare_video_scan(s['video_list_reset_hours'],sources=sources)
         if rebuild:
-            self.status.emit(ident,'正在重建待分析视频列表')
-            try:
-                complete = await self.rebuild_video_list(account,b,s)
-                # A periodic memory cycle inside source discovery
-                # replaces the account Browser in this registry.
-                b = self.contexts.get(ident,b)
-                if not complete:
-                    # Keep the successfully discovered subset for
-                    # this pass, but retry all sources next round.
-                    self.db.save_settings({'video_list_built_at':0})
-                    self.log.emit(account['name']+'：本次视频列表获取不完整，已保留成功结果，下一轮会自动重新获取')
-            except BaseException:
-                # A partial list must not be treated as fresh for a
-                # full reset interval. The next run rebuilds it.
-                self.db.save_settings({'video_list_built_at':0})
-                raise
+            pending_sources = self.db.pending_discovery_sources(sources)
+            self.status.emit(ident,f'断点续跑找视频：剩余 {len(pending_sources)} 个来源')
+            for source in pending_sources:
+                await self.discover_source(account,b,s,source)
+                b = getattr(self,'contexts',{}).get(ident,b)
+            if not self.db.finish_video_discovery():
+                self.log.emit(account['name']+'：找视频未完成，已保存来源断点，下轮继续后再分析评论')
+                await asyncio.sleep(s['poll_seconds'])
+                return b
         else:
             if resume:
                 self.log.emit(account['name']+'：视频列表未到重建时间，从上次断点继续扫描未完成视频')

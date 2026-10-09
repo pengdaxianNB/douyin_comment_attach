@@ -58,6 +58,10 @@ class DB:
             CREATE TABLE IF NOT EXISTS keywords(id INTEGER PRIMARY KEY AUTOINCREMENT,keyword TEXT NOT NULL UNIQUE);
             CREATE TABLE IF NOT EXISTS search_keywords(id INTEGER PRIMARY KEY AUTOINCREMENT,keyword TEXT NOT NULL UNIQUE);
             CREATE TABLE IF NOT EXISTS manual_videos(id TEXT PRIMARY KEY,url TEXT NOT NULL,title TEXT NOT NULL DEFAULT '',added_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS discovery_sources(
+                kind TEXT NOT NULL,source_ref TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',
+                PRIMARY KEY(kind,source_ref));
+            CREATE TABLE IF NOT EXISTS video_exclusions(id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS videos(
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL DEFAULT '',
@@ -137,29 +141,82 @@ class DB:
         with self.connect() as c:
             c.executemany('INSERT OR REPLACE INTO settings VALUES (?,?)', [(k,json.dumps(v,ensure_ascii=False)) for k,v in values.items()])
 
-    def prepare_video_scan(self, reset_hours, now=None):
+    @staticmethod
+    def discovery_key(source):
+        kind,row = source
+        return kind,str(row['keyword'] if kind in ('keyword','search') else row['id'])
+
+    def pending_discovery_sources(self, sources):
+        completed = {(r['kind'],r['source_ref']) for r in self.rows(
+            "SELECT kind,source_ref FROM discovery_sources WHERE status='done'")}
+        return [source for source in sources if self.discovery_key(source) not in completed]
+
+    def set_discovery_status(self, source, status):
+        if status not in ('pending','running','done'):
+            raise ValueError('不支持的找视频状态')
+        self.execute('UPDATE discovery_sources SET status=? WHERE kind=? AND source_ref=?',
+                     (status,*self.discovery_key(source)))
+
+    def finish_video_discovery(self, now=None):
+        """Publish a complete list only after every persisted source finished."""
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            active = c.execute("SELECT value FROM settings WHERE key='video_discovery_active'").fetchone()
+            if not active or not json.loads(active['value']):
+                return False
+            if c.execute("SELECT 1 FROM discovery_sources WHERE status<>'done' LIMIT 1").fetchone():
+                return False
+            c.executemany('INSERT OR REPLACE INTO settings VALUES (?,?)',[
+                ('video_discovery_active','false'),
+                ('video_list_built_at',json.dumps(float(time.time() if now is None else now)))])
+        return True
+
+    def prepare_video_scan(self, reset_hours, now=None, sources=None):
         """Prepare one monitoring pass and report whether sources must be rebuilt.
 
         A fresh list is rebuilt after ``reset_hours``.  Inside that window the
         same videos are retained.  An interrupted pass keeps its completed and
         pending statuses for resume; only a fully finished pass is reset for a
-        new comment polling round.
+        new comment polling round. With ``sources``, discovery is checkpointed
+        and the rebuild clock starts only after all sources have completed.
         """
         current = float(time.time() if now is None else now)
         reset_after = max(1, int(reset_hours)) * 3600
         with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            active = c.execute("SELECT value FROM settings WHERE key='video_discovery_active'").fetchone()
+            discovering = bool(active and json.loads(active['value']))
             row = c.execute("SELECT value FROM settings WHERE key='video_list_built_at'").fetchone()
             has_videos = c.execute('SELECT 1 FROM videos LIMIT 1').fetchone() is not None
+            has_exclusions = c.execute('SELECT 1 FROM video_exclusions LIMIT 1').fetchone() is not None
             try:
                 built_at = float(json.loads(row['value'])) if row else 0.0
             except (TypeError, ValueError, json.JSONDecodeError):
                 built_at = 0.0
-            rebuild = not has_videos or not built_at or current - built_at >= reset_after
-            if rebuild:
+            # Older versions wrote built_at before discovery completed. On the
+            # first upgrade we cannot prove which sources finished, so retain
+            # the existing results and rediscover sources once, with deduping.
+            legacy_resume = (active is None and sources is not None and bool(sources)
+                             and has_videos and (not built_at or current-built_at<reset_after))
+            if legacy_resume:
+                discovering = True
+                c.execute("INSERT OR REPLACE INTO settings VALUES ('video_list_built_at','0')")
+            rebuild = discovering or (not has_videos and not has_exclusions) or not built_at or current - built_at >= reset_after
+            if rebuild and not discovering:
                 c.execute('DELETE FROM videos')
+                c.execute('DELETE FROM video_exclusions')
+                c.execute('DELETE FROM discovery_sources')
                 c.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)',
-                          ('video_list_built_at',json.dumps(current)))
-            else:
+                          ('video_list_built_at',json.dumps(0 if sources is not None else current)))
+            if rebuild and sources is not None:
+                c.execute("INSERT OR REPLACE INTO settings VALUES ('video_discovery_active','true')")
+                keys = {self.discovery_key(source) for source in sources}
+                for old in c.execute('SELECT kind,source_ref FROM discovery_sources').fetchall():
+                    if (old['kind'],old['source_ref']) not in keys:
+                        c.execute('DELETE FROM discovery_sources WHERE kind=? AND source_ref=?',tuple(old))
+                c.executemany('INSERT OR IGNORE INTO discovery_sources(kind,source_ref) VALUES (?,?)',keys)
+                c.execute("UPDATE discovery_sources SET status='pending' WHERE status='running'")
+            if not rebuild:
                 # A task can be interrupted between marking a video as
                 # scanning and restoring it to pending. Recover that one item
                 # before deciding whether this is a resume or a new pass.
@@ -179,8 +236,27 @@ class DB:
         with self.connect() as c:
             count = c.execute('SELECT count(*) FROM videos').fetchone()[0]
             c.execute('DELETE FROM videos')
-            c.execute("DELETE FROM settings WHERE key='video_list_built_at'")
+            c.execute('DELETE FROM discovery_sources')
+            c.execute('DELETE FROM video_exclusions')
+            c.execute("DELETE FROM settings WHERE key IN ('video_list_built_at','video_discovery_active')")
         return int(count)
+
+    def delete_videos(self, ids):
+        """Remove selected works, including manual sources, for this list cycle."""
+        keys = [(str(ident),) for ident in set(ids)]
+        if not keys:
+            return 0
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            if any(c.execute("SELECT 1 FROM videos WHERE id=? AND status='scanning'",key).fetchone()
+                   for key in keys):
+                raise ValueError('选中视频正在扫描，请先停止任务')
+            removed = 0
+            for key in keys:
+                removed += c.execute('DELETE FROM videos WHERE id=?',key).rowcount
+            c.executemany('DELETE FROM manual_videos WHERE id=?',keys)
+            c.executemany('INSERT OR IGNORE INTO video_exclusions VALUES (?)',keys)
+        return removed
 
     def add_manual_video(self, url, title=''):
         ident,kind = parse_work_url(url)
@@ -188,6 +264,7 @@ class DB:
         clean_title = ' '.join(str(title or '').split()) or ('手动录入笔记 ' if kind=='note' else '手动录入视频 ')+ident
         now = time.time()
         with self.connect() as c:
+            c.execute('DELETE FROM video_exclusions WHERE id=?',(ident,))
             if c.execute('SELECT 1 FROM videos WHERE id=?',(ident,)).fetchone():
                 raise ValueError('该视频已在待分析列表中，无需重复录入')
             if c.execute('SELECT 1 FROM manual_videos WHERE id=?',(ident,)).fetchone():
@@ -229,6 +306,8 @@ class DB:
         except ValueError:
             pass
         with self.connect() as c:
+            if c.execute('SELECT 1 FROM video_exclusions WHERE id=?',(ident,)).fetchone():
+                return False
             return bool(c.execute('''
                 INSERT INTO videos(id,title,author,source_type,source_name,source_ref,create_time,url,discovered_at)
                 VALUES (?,?,?,?,?,?,?,?,?)
@@ -399,7 +478,9 @@ class DB:
                 for name in keys:
                     c.execute(f'DELETE FROM {name}')
                 c.execute('DELETE FROM videos')
-                c.execute("DELETE FROM settings WHERE key='video_list_built_at'")
+                c.execute('DELETE FROM discovery_sources')
+                c.execute('DELETE FROM video_exclusions')
+                c.execute("DELETE FROM settings WHERE key IN ('video_list_built_at','video_discovery_active')")
             elif ids is None:
                 c.execute(f'DELETE FROM {table}')
             else:

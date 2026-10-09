@@ -207,6 +207,54 @@ def test_manual_note_link_can_be_added(tmp_path,monkeypatch):
     w.close();app.processEvents()
 
 
+@pytest.mark.parametrize('confirm',[True,False])
+def test_video_multiselect_delete_uses_filtered_ids_and_preserves_selection(tmp_path,monkeypatch,confirm):
+    from PySide6.QtCore import QItemSelectionModel
+    from PySide6.QtWidgets import QAbstractItemView
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    manual=db.add_manual_video('https://www.douyin.com/video/1234567890123456789','选中手动视频')
+    db.add_video({'aweme_id':'2','desc':'选中自动视频'},'search','词')
+    db.add_video({'aweme_id':'3','desc':'保留视频'},'blogger','博主')
+    w=Window(db,tmp_path,start_engine=False)
+    w.video_search.setText('选中')
+    assert w.videos.selectionMode()==QAbstractItemView.SelectionMode.ExtendedSelection
+    selection=w.videos.selectionModel()
+    flags=QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+    for i in range(2):
+        selection.select(w.videos.model().index(i,0),flags)
+    assert w.delete_videos_button.isEnabled()
+    # A refresh inserts a new row before the selected rows: selection follows IDs.
+    db.add_video({'aweme_id':'4','desc':'选中但保留视频','create_time':100},'search','词')
+    w.refresh_videos()
+    assert {w.video_rows[index.row()]['id'] for index in selection.selectedRows()}=={manual,'2'}
+    questions=[]
+    def question(*args):
+        questions.append(args[2])
+        return QMessageBox.StandardButton.Yes if confirm else QMessageBox.StandardButton.No
+    monkeypatch.setattr(QMessageBox,'question',question)
+    w.delete_selected_videos()
+    assert questions and '2 个视频' in questions[0]
+    assert {r['id'] for r in db.video_tasks()}==({'3','4'} if confirm else {manual,'2','3','4'})
+    assert bool(db.rows('SELECT * FROM manual_videos')) is not confirm
+    w.close();app.processEvents()
+
+
+def test_selected_video_delete_requires_stopped_tasks(tmp_path,monkeypatch):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    db.add_video({'aweme_id':'1'},'search','词')
+    w=Window(db,tmp_path,start_engine=False)
+    w.videos.selectRow(0)
+    w.engine.running_accounts.add('busy')
+    warnings=[]
+    monkeypatch.setattr(QMessageBox,'warning',lambda *args:warnings.append(args[2]))
+    w.delete_selected_videos()
+    assert len(db.video_tasks())==1 and warnings and '停止任务' in warnings[0]
+    w.engine.running_accounts.clear()
+    w.close();app.processEvents()
+
+
 def test_send_attempt_remains_in_processing_metric(tmp_path):
     app=QApplication.instance() or QApplication([])
     db=DB(tmp_path/'test.sqlite3')
