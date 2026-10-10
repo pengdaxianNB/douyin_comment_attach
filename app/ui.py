@@ -7,7 +7,7 @@ from pathlib import Path
 import keyring
 from PySide6.QtCore import Qt, QTimer, QItemSelectionModel
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QTabWidget,QTableWidget,QTableWidgetItem,QHeaderView,QLineEdit,QPlainTextEdit,QSpinBox,QFormLayout,QMessageBox,QFileDialog,QInputDialog,QComboBox,QGroupBox,QAbstractItemView,QScrollArea,QDialog,QCheckBox)
+from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QGridLayout,QLabel,QPushButton,QTabWidget,QTableWidget,QTableWidgetItem,QHeaderView,QLineEdit,QPlainTextEdit,QSpinBox,QFormLayout,QMessageBox,QFileDialog,QInputDialog,QComboBox,QGroupBox,QAbstractItemView,QScrollArea,QDialog,QCheckBox,QSizePolicy)
 from .ai import SERVICE
 from .db import user_id
 from .engine import Engine, DEFAULTS
@@ -144,34 +144,74 @@ class Window(QMainWindow):
         self.engine.changed.connect(self.schedule_runtime_refresh)
         self.engine.browser_reset.connect(self.reset_browser_page)
         root = QWidget(); self.setCentralWidget(root)
-        layout = QVBoxLayout(root); layout.setContentsMargins(26,22,26,20); layout.setSpacing(16)
-        heading = QHBoxLayout(); layout.addLayout(heading)
-        brand = QVBoxLayout(); brand.setSpacing(6); heading.addLayout(brand)
+        layout = QHBoxLayout(root); layout.setContentsMargins(8,8,8,4); layout.setSpacing(8)
+        self.sidebar = QScrollArea(); self.sidebar.setObjectName('sidebar'); self.sidebar.setFixedWidth(236)
+        self.sidebar.setWidgetResizable(True); self.sidebar.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        panel = QWidget(); panel.setObjectName('sidebarPanel'); self.sidebar.setWidget(panel)
+        side = QVBoxLayout(panel); side.setContentsMargins(12,14,12,14); side.setSpacing(14)
+        layout.addWidget(self.sidebar)
+        brand = QVBoxLayout(); brand.setSpacing(6); side.addLayout(brand)
         eyebrow = QLabel('熊猫领航  /  客户运营'); eyebrow.setObjectName('eyebrow'); brand.addWidget(eyebrow)
-        title = QLabel('评论客户工作台'); title.setObjectName('title'); brand.addWidget(title)
+        title = QLabel('评论客户工作台'); title.setObjectName('sidebarTitle'); brand.addWidget(title)
         subtitle = QLabel('发现需求 · 语义筛选 · 个性化触达'); subtitle.setObjectName('muted'); brand.addWidget(subtitle)
-        heading.addStretch()
-        badge = QLabel('●  本地工作台'); badge.setObjectName('badge'); badge.setFixedHeight(34); heading.addWidget(badge,0,Qt.AlignmentFlag.AlignVCenter)
-        metrics_row = QHBoxLayout(); metrics_row.setSpacing(12); layout.addLayout(metrics_row)
+        self.navigation = QVBoxLayout(); self.navigation.setSpacing(6); side.addLayout(self.navigation)
+        self.navigation_buttons = []
+        dashboard_title = QLabel('客户仪表盘'); dashboard_title.setObjectName('sectionTitle'); side.addWidget(dashboard_title)
+        metrics_row = QGridLayout(); metrics_row.setSpacing(8); side.addLayout(metrics_row)
         self.metric_values = {}
-        for key,label in [('total','客户总数'),*STATUS.items()]:
+        for index,(key,label) in enumerate([('total','客户总数'),*STATUS.items()]):
             card = QWidget(); card.setObjectName('statCard')
-            card_layout = QVBoxLayout(card); card_layout.setContentsMargins(18,14,18,14); card_layout.setSpacing(8)
+            card_layout = QVBoxLayout(card); card_layout.setContentsMargins(10,10,10,10); card_layout.setSpacing(4)
             caption = QLabel(label); caption.setObjectName('muted'); card_layout.addWidget(caption)
             value = QLabel('0'); value.setObjectName('statValue'); value.setProperty('status',key); card_layout.addWidget(value)
-            self.metric_values[key] = value; metrics_row.addWidget(card,1)
-        self.tabs = QTabWidget(); keep_tab_pages_mounted(self.tabs); self.tabs.tabBar().setExpanding(False); self.tabs.tabBar().setCursor(Qt.CursorShape.PointingHandCursor); self.tabs.tabBar().setDrawBase(False); self.tabs.setDocumentMode(False); layout.addWidget(self.tabs,1)
+            self.metric_values[key] = value; metrics_row.addWidget(card,index//2,index%2)
+        side.addStretch()
+        main = QVBoxLayout(); main.setSpacing(6); layout.addLayout(main,1)
+        toolbar = QHBoxLayout(); toolbar.setSpacing(10); main.addLayout(toolbar)
+        self.sidebar_toggle = button('隐藏左栏',self.toggle_sidebar); self.sidebar_toggle.setObjectName('workspaceControl'); toolbar.addWidget(self.sidebar_toggle)
+        self.workspace_title = QLabel(); self.workspace_title.setObjectName('sectionTitle'); toolbar.addWidget(self.workspace_title)
+        toolbar.addStretch()
+        self.browser_focus = button('浏览器铺满',self.focus_browser); self.browser_focus.setObjectName('workspaceControl'); toolbar.addWidget(self.browser_focus)
+        self.tabs = QTabWidget(); self.tabs.setObjectName('workspaceTabs'); keep_tab_pages_mounted(self.tabs)
+        self.tabs.tabBar().hide(); self.tabs.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Ignored)
+        main.addWidget(self.tabs,1)
         self.browser_widgets = {}
         self.build_customers(); self.build_accounts(); self.build_bloggers(); self.build_browser_workspace(); self.build_settings()
         self.logs = QPlainTextEdit(); self.logs.setReadOnly(True); self.logs.setMaximumBlockCount(1000)
         self.tabs.addTab(self.logs,'运行日志')
         self.build_database()
         self.tabs.currentChanged.connect(lambda: self.refresh_database() if self.tabs.currentWidget() is self.database_page else None)
+        self.build_navigation()
+        self.tabs.currentChanged.connect(self.sync_navigation)
+        self.tabs.setCurrentWidget(self.browser_page)
+        self.sync_navigation()
         self.statusBar().showMessage('站点适配待实号验证 · 登录和验证码请在内嵌浏览器中处理')
         self.refresh_accounts(); self.refresh_bloggers(); self.refresh_keywords(); self.refresh_search_keywords(); self.refresh_videos(); self.refresh_customers()
         self.timer = QTimer(self); self.timer.timeout.connect(self.refresh_runtime_views); self.timer.start(4000)
         if start_engine:
             self.engine.start()
+
+    def build_navigation(self):
+        for index in range(self.tabs.count()):
+            control = button(self.tabs.tabText(index),lambda checked=False,index=index:self.tabs.setCurrentIndex(index))
+            control.setObjectName('navigationButton'); control.setCheckable(True); control.setAutoExclusive(True)
+            self.navigation.addWidget(control); self.navigation_buttons.append(control)
+
+    def sync_navigation(self,*args):
+        current = self.tabs.currentIndex()
+        for index,control in enumerate(self.navigation_buttons):
+            control.setChecked(index==current)
+        self.workspace_title.setText(self.tabs.tabText(current))
+
+    def toggle_sidebar(self):
+        self.sidebar.setVisible(self.sidebar.isHidden())
+        self.sidebar_toggle.setText('显示左栏' if self.sidebar.isHidden() else '隐藏左栏')
+
+    def focus_browser(self):
+        self.tabs.setCurrentWidget(self.browser_page)
+        self.sidebar.hide()
+        self.sidebar_toggle.setText('显示左栏')
 
     def page(self,name):
         widget = QWidget(); widget.setObjectName('page'); layout = QVBoxLayout(widget); layout.setContentsMargins(22,22,22,20); layout.setSpacing(16)
@@ -202,17 +242,20 @@ class Window(QMainWindow):
 
     def build_accounts(self):
         l = self.page('账号集群')
-        hint = QLabel('所有账号平等参与，使用独立浏览器和登录目录。集群同时只能运行一种模式；采集账号数量在设置中调整，私信模式使用全部账号。')
+        hint = QLabel('所有账号使用独立浏览器和登录目录。集群同时只能运行一种模式；采集账号数量在设置中调整，私信可开启全部账号或仅开启选中账号。')
         hint.setWordWrap(True); l.addWidget(hint)
         controls = QHBoxLayout(); l.addLayout(controls)
         self.mode_switches = {}
-        for mode,title,description in [('comments','找评论模式','分配视频来源和评论扫描，AI 筛选目标客户'),('messages','私信模式','全部账号领取客户，按各自间隔和每日上限发送')]:
+        for mode,title,description in [('comments','找评论模式','分配视频来源和评论扫描，AI 筛选目标客户'),('messages','私信模式','使用全部账号或选中账号，按各自间隔和每日上限发送')]:
             group = QGroupBox(title); box = QVBoxLayout(group)
             box.addWidget(QLabel(description))
             switch = QPushButton('开启'); switch.setCheckable(True); switch.setCursor(Qt.CursorShape.PointingHandCursor)
             switch.clicked.connect(lambda checked,mode=mode:self.toggle_cluster(mode,checked))
             box.addWidget(switch); controls.addWidget(group)
             self.mode_switches[mode] = switch
+            if mode=='messages':
+                self.single_message_button = button('开启选中账号私信',self.start_selected_messages)
+                box.addWidget(self.single_message_button)
         self.accounts = table(['备注名','发送间隔（秒）','今日已私信 / 上限','当前状态'])
         self.accounts.setColumnWidth(0,220); self.accounts.setColumnWidth(1,170); self.accounts.setColumnWidth(2,180); l.addWidget(self.accounts)
         bar = QHBoxLayout(); l.addLayout(bar)
@@ -221,9 +264,7 @@ class Window(QMainWindow):
 
     def build_browser_workspace(self):
         page = QWidget(); page.setObjectName('page')
-        layout = QVBoxLayout(page); layout.setContentsMargins(14,14,14,14); layout.setSpacing(10)
-        hint = QLabel('每个账号的页面会保持在独立标签中；任务运行时也可切换查看，请勿在自动操作时手动跳转该页。')
-        hint.setObjectName('muted'); hint.setWordWrap(True); layout.addWidget(hint)
+        layout = QVBoxLayout(page); layout.setContentsMargins(0,0,0,0); layout.setSpacing(0)
         self.browser_tabs = QTabWidget(); keep_tab_pages_mounted(self.browser_tabs); self.browser_tabs.setObjectName('browserTabs')
         # macOS paints a light native strip behind document-mode tabs even when
         # the rest of the application uses a dark stylesheet. Use the regular
@@ -231,6 +272,7 @@ class Window(QMainWindow):
         self.browser_tabs.setDocumentMode(False)
         self.browser_tabs.tabBar().setDrawBase(False)
         self.browser_tabs.tabBar().setExpanding(False)
+        self.browser_tabs.setToolTip('每个账号保持独立页面；任务运行时可切换查看，请勿手动操作正在执行任务的账号。')
         layout.addWidget(self.browser_tabs,1)
         empty = QLabel('尚未打开账号页面。请在“账号集群”中选中账号，点击“登录 / 查看内嵌浏览器”。')
         empty.setAlignment(Qt.AlignmentFlag.AlignCenter); empty.setObjectName('muted')
@@ -302,24 +344,37 @@ class Window(QMainWindow):
         with self.engine.lock:
             running = len(self.engine.running_accounts)
             current = self.engine.cluster_mode
+            stopping = self.engine.cluster_stopping
         for mode,switch in self.mode_switches.items():
             active = mode==current
             switch.setChecked(active)
-            switch.setEnabled(current is None or active)
+            switch.setEnabled(not stopping and (current is None or active))
             name = '找评论' if mode=='comments' else '私信'
-            switch.setText(f'关闭{name}模式（{running} 个账号运行中）' if active else f'开启{name}模式')
+            switch.setText(f'关闭{name}模式（{running} 个账号运行中）' if active else '开启全部账号私信' if mode=='messages' else f'开启{name}模式')
+        self.single_message_button.setEnabled(not self.engine.busy() and bool(self.account_rows))
 
-    def toggle_cluster(self,mode,enabled):
+    def start_selected_messages(self):
+        self.toggle_cluster('messages',True,selected_only=True)
+
+    def toggle_cluster(self,mode,enabled,selected_only=False):
         def action():
             if not self.engine.ready.is_set(): raise ValueError('后台正在初始化，请稍后重试')
+            payload = {'mode':mode}
             if enabled:
                 if self.engine.busy(): raise ValueError('请先停止当前集群任务，再切换模式')
                 if not self.db.setting('base_url','') or not self.db.setting('model',''):
                     raise ValueError('请先保存 AI 设置')
-                accounts = self.engine.cluster_accounts(mode)
+                if selected_only:
+                    account = self.selected(self.accounts,self.account_rows)
+                    payload['account_ids'] = [account['id']]
+                accounts = self.engine.cluster_accounts(mode,payload.get('account_ids'))
                 for account in accounts: self.ensure_browser(account,False)
-            self.engine.command('start_cluster' if enabled else 'stop_cluster',{'mode':mode})
-            self.add_log(('找评论' if mode=='comments' else '私信')+('模式：已请求开启' if enabled else '模式：已请求停止'))
+            self.engine.command('start_cluster' if enabled else 'stop_cluster',payload)
+            if enabled:
+                self.tabs.setCurrentWidget(self.browser_page)
+                widget = self.browser_widgets.get(accounts[0]['id'])
+                if widget is not None: self.browser_tabs.setCurrentWidget(widget)
+            self.add_log(('找评论' if mode=='comments' else '私信')+('模式：已请求开启（'+ '、'.join(a['name'] for a in accounts)+'）' if enabled else '模式：已请求停止'))
         self.report(action)
         self.sync_cluster_switches()
 
@@ -500,7 +555,7 @@ class Window(QMainWindow):
                 forms[section].addRow(field)
             else:
                 forms[section].addRow(labels[k],field)
-        self.fields['collection_accounts'].setToolTip('按账号列表顺序使用前 N 个账号；设置保存后，下次开启找评论模式生效。私信模式使用全部账号。')
+        self.fields['collection_accounts'].setToolTip('按账号列表顺序使用前 N 个账号；设置保存后，下次开启找评论模式生效。私信可使用全部账号或仅选中账号。')
         self.fields['thinking_mode'].currentIndexChanged.connect(self.update_thinking_controls)
         self.update_thinking_controls()
         self.api_key = QLineEdit(); self.api_key.setEchoMode(QLineEdit.EchoMode.Password); self.api_key.setPlaceholderText('留空保留已有密钥；保存到系统钥匙串，不导出')
@@ -1120,4 +1175,16 @@ QPushButton:disabled,QPushButton[variant="primary"]:disabled,QPushButton[variant
 STYLE += '''
 QPushButton:checked {background:#196149;color:#edfff8;border:1px solid #58c99e;}
 QPushButton:checked:hover {background:#237a5d;}
+QScrollArea#sidebar,QWidget#sidebarPanel {background:#182233;border:0;border-radius:10px;}
+QLabel#sidebarTitle {font-size:19px;font-weight:700;color:#f1f5fb;}
+QPushButton#navigationButton {text-align:left;padding:10px 12px;background:transparent;border:1px solid transparent;color:#aebfd6;}
+QPushButton#navigationButton:hover {background:#223754;color:#ffffff;}
+QPushButton#navigationButton:checked {background:#286ed4;border-color:#4c8be7;color:#ffffff;}
+QPushButton#workspaceControl {padding:6px 12px;}
+QTabWidget#workspaceTabs::pane {border:0;}
+QTabWidget#browserTabs::pane {border:0;}
+QTabWidget#browserTabs QTabBar::tab {padding:7px 14px;margin:0 4px 4px 0;border-radius:5px;}
+QWidget#embeddedBrowser QPushButton {padding:5px 10px;}
+QWidget#embeddedBrowser QLineEdit {padding:5px;}
+QLabel#statValue {font-size:24px;}
 '''

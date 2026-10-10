@@ -55,6 +55,7 @@ class EmbeddedBrowser(QWidget):
 
     def __init__(self, profile_dir, marker, parent=None):
         super().__init__(parent)
+        self.setObjectName('embeddedBrowser')
         self.marker = marker
         self.closed = False
         profile_dir = Path(profile_dir)
@@ -88,7 +89,7 @@ class EmbeddedBrowser(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(8)
+        root.setSpacing(4)
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
         root.addLayout(toolbar)

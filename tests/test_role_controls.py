@@ -56,3 +56,51 @@ def test_collection_count_tracks_account_count(tmp_path):
     assert w.fields['collection_accounts'].value()==2
     assert db.setting('collection_accounts')==2
     w.close(); app.processEvents()
+
+
+def test_selected_account_can_start_messages_without_other_accounts(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'db.sqlite3')
+    ids=[db.account(f'账号{i}') for i in range(3)]
+    db.save_settings({'base_url':'https://example.com/v1','model':'test'})
+    w=Window(db,tmp_path,start_engine=False); w.engine.ready.set()
+    opened=[]; calls=[]
+    w.ensure_browser=lambda account,focus=False:opened.append(account['id'])
+    def command(op,payload):
+        calls.append((op,payload))
+        w.engine.cluster_mode=payload['mode']
+        w.engine.running_accounts.update(a['id'] for a in
+            w.engine.cluster_accounts(payload['mode'],payload.get('account_ids')))
+    w.engine.command=command
+    w.accounts.selectRow(1)
+    w.tabs.setCurrentIndex(1)
+
+    w.single_message_button.click()
+
+    assert opened==[ids[1]]
+    assert calls==[('start_cluster',{'mode':'messages','account_ids':[ids[1]]})]
+    assert w.engine.running_accounts=={ids[1]}
+    assert w.tabs.currentWidget() is w.browser_page
+    assert w.mode_switches['messages'].isChecked()
+    assert '1 个账号运行中' in w.mode_switches['messages'].text()
+    assert not w.single_message_button.isEnabled()
+    assert not w.mode_switches['comments'].isEnabled()
+    w.close(); app.processEvents()
+
+
+def test_single_account_start_requires_selection(tmp_path,monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'db.sqlite3'); db.account('账号')
+    db.save_settings({'base_url':'https://example.com/v1','model':'test'})
+    w=Window(db,tmp_path,start_engine=False); w.engine.ready.set()
+    commands=[]; warnings=[]
+    w.engine.command=lambda *args:commands.append(args)
+    monkeypatch.setattr(QMessageBox,'warning',lambda *args:warnings.append(args[2]))
+
+    w.single_message_button.click()
+
+    assert not commands
+    assert not w.browser_widgets
+    assert warnings and '请先选择' in warnings[0]
+    w.close(); app.processEvents()

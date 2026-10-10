@@ -117,6 +117,45 @@ def test_window():
         w.close(); app.processEvents()
 
 
+def test_browser_workspace_uses_full_height_and_sidebar_can_be_restored(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    app.setStyleSheet(STYLE)
+    db=DB(tmp_path/'test.sqlite3'); db.account('测试账号')
+    w=Window(db,tmp_path,start_engine=False)
+    widget=w.ensure_browser(w.account_rows[0])
+    w.show(); app.processEvents()
+
+    assert w.tabs.currentWidget() is w.browser_page
+    assert not w.tabs.tabBar().isVisible()
+    assert w.sidebar.isVisible()
+    assert widget.view.height()>w.centralWidget().height()*0.8
+    initial_width=widget.view.width()
+    assert w.sidebar.geometry().right()<w.tabs.geometry().left()
+    w.sidebar_toggle.click(); app.processEvents()
+    assert w.sidebar.isHidden()
+    assert widget.view.width()>initial_width+200
+    assert widget.view.width()>w.centralWidget().width()*0.95
+    assert w.sidebar_toggle.text()=='显示左栏'
+    w.sidebar_toggle.click(); app.processEvents()
+    assert w.sidebar.isVisible()
+    assert abs(widget.view.width()-initial_width)<5
+    w.navigation_buttons[w.tabs.currentIndex()].click()
+    assert w.navigation_buttons[w.tabs.currentIndex()].isChecked()
+
+    # Function pages remain available from the left; focusing the browser
+    # restores the same page/profile and expands it without restarting it.
+    w.navigation_buttons[1].click(); app.processEvents()
+    assert w.tabs.currentIndex()==1
+    original_page=widget.view.page()
+    w.browser_focus.click(); app.processEvents()
+    assert w.sidebar.isHidden()
+    assert w.tabs.currentWidget() is w.browser_page
+    assert widget.view.page() is original_page
+    assert widget.view.page().isVisible()
+    assert w.navigation_buttons[w.tabs.currentIndex()].isChecked()
+    w.close(); app.processEvents()
+
+
 def test_runtime_change_bursts_are_coalesced(tmp_path):
     app=QApplication.instance() or QApplication([])
     db=DB(tmp_path/'test.sqlite3')

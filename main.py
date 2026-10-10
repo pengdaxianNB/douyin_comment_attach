@@ -65,7 +65,7 @@ def main():
         return 1
     db=DB(data/'customers.sqlite3'); db.recover()
     app.setStyleSheet(STYLE)
-    window=Window(db,data); window.show()
+    window=Window(db,data); window.showMaximized()
     return app.exec()
 
 

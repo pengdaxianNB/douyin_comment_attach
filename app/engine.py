@@ -77,7 +77,7 @@ class Engine(QThread):
         if self.loop and self.commands:
             if op == 'start_cluster':
                 mode = account['mode']
-                accounts = self.cluster_accounts(mode)
+                accounts = self.cluster_accounts(mode,account.get('account_ids'))
                 with self.lock:
                     if self.cluster_mode or self.cluster_stopping or self.running_accounts:
                         raise ValueError('请先停止当前集群任务，再切换模式')
@@ -86,12 +86,20 @@ class Engine(QThread):
                 account = dict(mode=mode,accounts=accounts)
             self.loop.call_soon_threadsafe(self.commands.put_nowait,(op,account))
 
-    def cluster_accounts(self, mode):
+    def cluster_accounts(self, mode, account_ids=None):
         if mode not in ('comments','messages'):
             raise ValueError('不支持的集群模式')
         accounts = self.db.rows('SELECT * FROM accounts ORDER BY rowid')
         if not accounts:
             raise ValueError('请先添加账号')
+        if account_ids is not None:
+            if mode != 'messages':
+                raise ValueError('仅私信模式支持指定账号')
+            ids = set(account_ids)
+            known = {row['id'] for row in accounts}
+            if not ids or not ids.issubset(known):
+                raise ValueError('请选择有效的私信账号')
+            accounts = [row for row in accounts if row['id'] in ids]
         if mode == 'comments':
             count = max(1,min(len(accounts),int(self.db.setting('collection_accounts',1))))
             accounts = accounts[:count]

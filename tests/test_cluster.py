@@ -141,6 +141,38 @@ def test_engine_reserves_mode_before_dispatch_and_clamps_stale_count(tmp_path):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('count',[1,3])
+def test_message_dispatch_reserves_only_the_requested_account(tmp_path,count):
+    db,engine,accounts,sessions=cluster(tmp_path,count)
+    engine.running_accounts.clear()
+    chosen=accounts[-1]['id']
+    async def run():
+        engine.loop=asyncio.get_running_loop(); engine.commands=asyncio.Queue()
+        engine.command('start_cluster',{'mode':'messages','account_ids':[chosen]})
+        assert engine.running_accounts=={chosen}
+        assert engine.cluster_mode=='messages'
+        with pytest.raises(ValueError,match='停止当前集群'):
+            engine.command('start_cluster',{'mode':'comments'})
+        await asyncio.sleep(0)
+        op,payload=engine.commands.get_nowait()
+        assert op=='start_cluster' and payload['mode']=='messages'
+        assert [a['id'] for a in payload['accounts']]==[chosen]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('ids',[[],['missing']])
+def test_invalid_message_account_selection_does_not_reserve_mode(tmp_path,ids):
+    db,engine,accounts,sessions=cluster(tmp_path)
+    engine.running_accounts.clear()
+    async def run():
+        engine.loop=asyncio.get_running_loop(); engine.commands=asyncio.Queue()
+        with pytest.raises(ValueError,match='有效的私信账号'):
+            engine.command('start_cluster',{'mode':'messages','account_ids':ids})
+        assert not engine.running_accounts and engine.cluster_mode is None
+        assert engine.commands.empty()
+    asyncio.run(run())
+
+
 def test_stop_one_collector_leaves_other_collectors_running(tmp_path):
     db,engine,accounts,sessions=cluster(tmp_path,2)
     stopped=accounts[0]['id']; entered=asyncio.Event(); completed=[]
