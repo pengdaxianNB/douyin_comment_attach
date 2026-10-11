@@ -1,6 +1,8 @@
 import asyncio
 import os
 import threading
+import uuid
+from contextlib import asynccontextmanager
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,7 +14,7 @@ from .browser import Browser, AccountNeedsAttention, SearchPageUnavailable, Comm
 from .classifier import classify_comments
 from .embedded_browser import MARKER_PREFIX, page_id, unregister_page
 
-DEFAULTS = dict(collection_accounts=1,days=7,comment_days=7,video_list_reset_hours=24,ai_concurrency=5,poll_seconds=300,scroll_limit=80,base_url='',model='',thinking_mode='default',thinking_effort='high',
+DEFAULTS = dict(collection_accounts=1,message_concurrency=3,days=7,comment_days=7,video_list_reset_hours=24,ai_concurrency=5,poll_seconds=300,scroll_limit=80,base_url='',model='',thinking_mode='default',thinking_effort='high',
     filter_prompt='识别评论中是否明确表达了对我提供的产品或服务的购买或咨询需求。产品和目标客户：请填写。不要把普通互动识别为需求。',
     message_prompt='根据客户评论写一条自然、简短的咨询回复。我的产品或服务：请填写。尊重对方，不夸大，不使用虚假承诺。',
     comment_panel='[data-e2e="comment-list"]',message_editor='[contenteditable="true"]')
@@ -59,6 +61,7 @@ class Engine(QThread):
     status = Signal(str,str)
     changed = Signal()
     browser_reset = Signal(str)
+    browser_state = Signal(str,str,str)
 
     def __init__(self, db, data):
         super().__init__()
@@ -72,6 +75,76 @@ class Engine(QThread):
         self.page_operations = {}
         self.lock = threading.Lock()
         self.ready = threading.Event()
+        self.sender_slots = None
+        self.sender_pool_error = None
+        self.browser_requests = {}
+        self.cdp_connect_lock = asyncio.Lock()
+
+    async def change_browser_state(self, ident, operation):
+        """Wait for GUI completion before binding or freeing a worker slot."""
+        loop = asyncio.get_running_loop()
+        request = uuid.uuid4().hex
+        future = loop.create_future()
+        self.browser_requests[request] = (loop,future)
+        try:
+            self.browser_state.emit(ident,operation,request)
+            await asyncio.wait_for(future,timeout=PAGE_CLEANUP_TIMEOUT)
+        finally:
+            self.browser_requests.pop(request,None)
+
+    def complete_browser_request(self, request, error=''):
+        pending = self.browser_requests.get(request)
+        if pending is None:
+            return
+        loop,future = pending
+        def complete():
+            if not future.done():
+                if error:
+                    future.set_exception(RuntimeError(error))
+                else:
+                    future.set_result(None)
+        loop.call_soon_threadsafe(complete)
+
+    @asynccontextmanager
+    async def sender_turn(self, account):
+        slots = self.sender_slots
+        if slots is None:
+            # A standalone worker has no GUI resource coordinator.
+            yield
+            return
+        ident = account['id']
+        self.status.emit(ident,'等待工作位 · 页面休眠')
+        await slots.acquire()
+        try:
+            if self.sender_pool_error:
+                raise AccountNeedsAttention(self.sender_pool_error)
+            yield
+        finally:
+            self.contexts.pop(ident,None)
+            self.page_operations.pop(ident,None)
+            try:
+                await self.change_browser_state(ident,'park')
+            except Exception as exc:
+                # Do not launch more pages if a renderer's release cannot be
+                # confirmed; otherwise the configured bound would be false.
+                self.sender_pool_error = '页面释放未完成，请停止私信任务后重试：'+(str(exc) or '界面响应超时')
+                self.log.emit(account['name']+'：'+self.sender_pool_error)
+                raise AccountNeedsAttention(self.sender_pool_error) from exc
+            finally:
+                slots.release()
+
+    async def open_sender(self, account):
+        if self.sender_slots is None:
+            return await self.open(account)
+        self.status.emit(account['id'],'正在加载账号页面')
+        try:
+            await self.change_browser_state(account['id'],'wake')
+            return await asyncio.wait_for(self.open(account),timeout=BROWSER_OPEN_TIMEOUT)
+        except (AccountNeedsAttention,asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            self.log.emit(account['name']+'：账号页面连接失败，正在自动恢复：'+(str(exc) or '超时'))
+            return await self.rebuild_browser(account)
 
     def command(self, op, account=None):
         if self.loop and self.commands:
@@ -198,8 +271,11 @@ class Engine(QThread):
             if contexts is not None:
                 contexts.pop(ident,None)
             unregister_page(ident)
-            self.browser_reset.emit(ident)
             try:
+                if self.sender_slots is not None:
+                    await self.change_browser_state(ident,'reset')
+                else:
+                    self.browser_reset.emit(ident)
                 browser = await asyncio.wait_for(self.open(account),timeout=BROWSER_OPEN_TIMEOUT)
             except AccountNeedsAttention:
                 raise
@@ -252,6 +328,10 @@ class Engine(QThread):
         return value
 
     async def connect_embedded_browser(self):
+        async with self.cdp_connect_lock:
+            return await self._connect_embedded_browser()
+
+    async def _connect_embedded_browser(self):
         if self.cdp_browser and self.cdp_browser.is_connected():
             return self.cdp_browser
         last_error = None
@@ -345,6 +425,12 @@ class Engine(QThread):
         """Own the mode until every account has stopped, including cancellation."""
         try:
             if mode == 'messages':
+                limit = max(1,min(len(accounts),int(self.db.setting('message_concurrency',3))))
+                self.sender_slots = asyncio.Semaphore(limit)
+                self.sender_pool_error = None
+                for account in accounts:
+                    self.contexts.pop(account['id'],None)
+                self.log.emit(f'私信调度已开启：{len(accounts)} 个账号参与，最多 {limit} 个账号同时加载页面')
                 tasks = []
                 for account in accounts:
                     task = asyncio.create_task(self.work(account,mode))
@@ -364,6 +450,7 @@ class Engine(QThread):
             # is between stages. Await all page work before releasing the mode.
             for ident in list(self.jobs):
                 await self.stop_job(ident)
+            self.sender_slots = None
             with self.lock:
                 self.running_accounts.clear()
                 if not self.cluster_stopping:
@@ -776,23 +863,133 @@ class Engine(QThread):
         await asyncio.sleep(s['poll_seconds'])
         return b
 
-    async def work(self, account, mode='messages'):
+    async def sender_cycle(self, account, b, ai, s, ai_failures):
         ident = account['id']
         customer = None
         message = ''
         clicked = False
+        try:
+            customer = self.db.claim(ident)
+            if not customer:
+                quota = self.db.sender_quota(ident)
+                if quota['limit'] and quota['used']>=quota['limit']:
+                    self.status.emit(ident,f'今日已达上限 {quota["used"]}/{quota["limit"]} · 0 点自动恢复')
+                else:
+                    self.status.emit(ident,'等待客户')
+                return b,ai_failures,5
+            self.changed.emit()
+            self.status.emit(ident,'处理：'+customer['name'])
+            clicked = False
+            message = str(customer.get('message','') or '')
+            skip_cooldown = False
+            if self.sender_slots is not None:
+                try:
+                    b = await self.open_sender(account)
+                    b.s = s
+                except BaseException:
+                    self.db.finish(customer['uid'],ident,'pending',message,'账号页面未就绪，客户已放回队列')
+                    customer = None
+                    self.changed.emit()
+                    raise
+            try:
+                await asyncio.wait_for(b.check_reachable(customer),timeout=45)
+                if message.strip():
+                    self.status.emit(ident,'复用已有文案：'+customer['name'])
+                else:
+                    self.status.emit(ident,'生成文案：'+customer['name'])
+                    try:
+                        message = await ai.message(customer)
+                    except ValueError as exc:
+                        # AI outages/rate limits happen before any page
+                        # side effect: put the customer back in the queue
+                        # and back off instead of stopping the sender.
+                        ai_failures += 1
+                        self.db.finish(customer['uid'],ident,'pending','','AI 文案生成失败，已放回队列：'+str(exc))
+                        customer = None
+                        self.changed.emit()
+                        if ai_failures >= MAX_TRANSIENT_FAILURES:
+                            raise ValueError(f'AI 连续 {ai_failures} 次生成文案失败，已停止：{exc}') from exc
+                        delay = min(120,15*ai_failures)
+                        self.log.emit(f'{account["name"]}：AI 文案生成失败（{ai_failures}/{MAX_TRANSIENT_FAILURES}），客户已放回队列，{delay} 秒后重试：{exc}')
+                        self.status.emit(ident,f'AI 异常，{delay} 秒后重试')
+                        return b,ai_failures,delay
+                    ai_failures = 0
+                self.db.finish(customer['uid'],ident,'processing',message)
+                def before_click():
+                    nonlocal clicked
+                    self.db.start_send(customer['uid'],ident,message)
+                    clicked = True
+                self.status.emit(ident,'打开会话并发送：'+customer['name'])
+                await asyncio.wait_for(b.send(customer,message,before_click),timeout=120)
+                self.db.finish(customer['uid'],ident,'sent',message)
+            except SkippedCustomer as exc:
+                self.db.finish(customer['uid'],ident,'skipped',message,str(exc))
+                self.log.emit(account['name']+'：客户 '+customer['name']+' 已跳过：'+str(exc))
+                skip_cooldown = isinstance(exc,(PrivateAccount,MissingAccount))
+            except UncertainSend as exc:
+                self.db.finish(customer['uid'],ident,'failed',message,str(exc))
+                self.log.emit(account['name']+'：'+str(exc))
+            except AccountNeedsAttention:
+                # Verification/login/rate-limit prompts affect the whole
+                # account and still require an operator before continuing.
+                raise
+            except NeedsAttention as exc:
+                # Profile/chat DOM failures happen before the send click.
+                # Fail only this customer instead of stopping the sender.
+                self.db.finish(customer['uid'],ident,'failed',message,str(exc))
+                self.log.emit(account['name']+'：客户 '+customer['name']+
+                              ' 处理失败，账号将继续运行：'+str(exc))
+            except (PlaywrightError, asyncio.TimeoutError) as exc:
+                # A stalled locator must not end the whole sender job.
+                # Never requeue a customer once submission has started.
+                detail = ('发送结果不明，禁止自动重发' if clicked else
+                          '页面操作超时或失败，尚未提交发送')+'：'+(str(exc) or '超过处理时限')
+                self.db.finish(customer['uid'],ident,'failed',message,detail)
+                self.log.emit(account['name']+'：'+detail)
+                customer = None
+                if self.sender_slots is None:
+                    b = await self.rebuild_browser(account)
+            self.changed.emit()
+            # The customer's outcome is final before maintenance. A
+            # reset failure/cancellation must not overwrite it.
+            customer = None
+            if self.sender_slots is None:
+                b = await self.maintain_browser_memory(account,b)
+            if skip_cooldown:
+                self.status.emit(ident,'客户已跳过，继续处理')
+                return b,ai_failures,0
+            row = self.db.rows('SELECT interval FROM accounts WHERE id=?',(ident,))
+            if not row:
+                raise ValueError('账号已被删除，任务已停止')
+            interval = row[0]['interval']
+            self.status.emit(ident,f'间隔等待 {interval} 秒')
+            return b,ai_failures,interval
+        except asyncio.CancelledError:
+            if customer:
+                self.db.finish(customer['uid'],ident,'failed' if clicked else 'pending',message,
+                    '任务已停止；发送结果不明，请勿重复联系' if clicked else '任务已停止')
+            raise
+        except Exception as exc:
+            if customer:
+                self.db.finish(customer['uid'],ident,'failed',message,str(exc))
+            raise
+
+    async def work(self, account, mode='messages'):
+        ident = account['id']
         monitor_failures = 0
         ai_failures = 0
         try:
             s = self.settings()
-            ai = AI(s, log=lambda text: self.log.emit(account["name"]+"："+text))
+            ai = AI(s, log=lambda text:self.log.emit(account['name']+'：'+text))
             if not s['base_url'] or not s['model'] or not get_key():
                 raise ValueError('请先配置 AI 接口、模型及 API Key')
-            b = await self.open(account)
-            b.s = s
+            b = None
+            if mode == 'comments' or self.sender_slots is None:
+                b = await self.open(account)
+                b.s = s
             self.status.emit(ident,'运行中')
             while True:
-                if mode=='comments':
+                if mode == 'comments':
                     try:
                         b = await self.monitor_round(account,b,ai,s)
                         monitor_failures = 0
@@ -814,99 +1011,15 @@ class Engine(QThread):
                             b.s = s
                         await asyncio.sleep(delay)
                 else:
-                    customer = self.db.claim(ident)
-                    if not customer:
-                        quota = self.db.sender_quota(ident)
-                        if quota['limit'] and quota['used']>=quota['limit']:
-                            self.status.emit(ident,f'今日已达上限 {quota["used"]}/{quota["limit"]} · 0 点自动恢复')
-                        else:
-                            self.status.emit(ident,'等待客户')
-                        await asyncio.sleep(5)
-                        continue
-                    self.changed.emit()
-                    self.status.emit(ident,'处理：'+customer['name'])
-                    clicked = False
-                    message = str(customer.get('message','') or '')
-                    skip_cooldown = False
-                    try:
-                        await asyncio.wait_for(b.check_reachable(customer),timeout=45)
-                        if message.strip():
-                            self.status.emit(ident,'复用已有文案：'+customer['name'])
-                        else:
-                            self.status.emit(ident,'生成文案：'+customer['name'])
-                            try:
-                                message = await ai.message(customer)
-                            except ValueError as exc:
-                                # AI outages/rate limits happen before any page
-                                # side effect: put the customer back in the queue
-                                # and back off instead of stopping the sender.
-                                ai_failures += 1
-                                self.db.finish(customer['uid'],ident,'pending','','AI 文案生成失败，已放回队列：'+str(exc))
-                                customer = None
-                                self.changed.emit()
-                                if ai_failures >= MAX_TRANSIENT_FAILURES:
-                                    raise ValueError(f'AI 连续 {ai_failures} 次生成文案失败，已停止：{exc}') from exc
-                                delay = min(120,15*ai_failures)
-                                self.log.emit(f'{account["name"]}：AI 文案生成失败（{ai_failures}/{MAX_TRANSIENT_FAILURES}），客户已放回队列，{delay} 秒后重试：{exc}')
-                                self.status.emit(ident,f'AI 异常，{delay} 秒后重试')
-                                await asyncio.sleep(delay)
-                                continue
-                            ai_failures = 0
-                        self.db.finish(customer['uid'],ident,'processing',message)
-                        def before_click():
-                            nonlocal clicked
-                            self.db.start_send(customer['uid'],ident,message)
-                            clicked = True
-                        self.status.emit(ident,'打开会话并发送：'+customer['name'])
-                        await asyncio.wait_for(b.send(customer,message,before_click),timeout=120)
-                        self.db.finish(customer['uid'],ident,'sent',message)
-                    except SkippedCustomer as exc:
-                        self.db.finish(customer['uid'],ident,'skipped',message,str(exc))
-                        self.log.emit(account['name']+'：客户 '+customer['name']+' 已跳过：'+str(exc))
-                        skip_cooldown = isinstance(exc,(PrivateAccount,MissingAccount))
-                    except UncertainSend as exc:
-                        self.db.finish(customer['uid'],ident,'failed',message,str(exc))
-                        self.log.emit(account['name']+'：'+str(exc))
-                    except AccountNeedsAttention:
-                        # Verification/login/rate-limit prompts affect the whole
-                        # account and still require an operator before continuing.
-                        raise
-                    except NeedsAttention as exc:
-                        # Profile/chat DOM failures happen before the send click.
-                        # Fail only this customer instead of stopping the sender.
-                        self.db.finish(customer['uid'],ident,'failed',message,str(exc))
-                        self.log.emit(account['name']+'：客户 '+customer['name']+
-                                      ' 处理失败，账号将继续运行：'+str(exc))
-                    except (PlaywrightError, asyncio.TimeoutError) as exc:
-                        # A stalled locator must not end the whole sender job.
-                        # Never requeue a customer once submission has started.
-                        detail = ('发送结果不明，禁止自动重发' if clicked else
-                                  '页面操作超时或失败，尚未提交发送')+'：'+(str(exc) or '超过处理时限')
-                        self.db.finish(customer['uid'],ident,'failed',message,detail)
-                        self.log.emit(account['name']+'：'+detail)
-                        customer = None
-                        b = await self.rebuild_browser(account)
-                    self.changed.emit()
-                    # The customer's outcome is final before maintenance. A
-                    # reset failure/cancellation must not overwrite it.
-                    customer = None
-                    b = await self.maintain_browser_memory(account,b)
-                    if skip_cooldown:
-                        self.status.emit(ident,'客户已跳过，继续处理')
-                        continue
-                    row = self.db.rows('SELECT interval FROM accounts WHERE id=?',(ident,))
-                    if not row:
-                        raise ValueError('账号已被删除，任务已停止')
-                    interval = row[0]['interval']
-                    self.status.emit(ident,f'间隔等待 {interval} 秒')
-                    await asyncio.sleep(interval)
+                    async with self.sender_turn(account):
+                        b,ai_failures,delay = await self.sender_cycle(account,b,ai,s,ai_failures)
+                    if self.sender_slots is not None:
+                        b = None
+                    if delay or self.sender_slots is not None:
+                        await asyncio.sleep(delay)
         except asyncio.CancelledError:
-            if customer:
-                self.db.finish(customer['uid'],ident,'failed' if clicked else 'pending',message,'任务已停止；发送结果不明，请勿重复联系' if clicked else '任务已停止')
             raise
         except Exception as exc:
-            if customer:
-                self.db.finish(customer['uid'],ident,'failed',message,str(exc))
             self.status.emit(ident,'需处理：'+str(exc))
             self.log.emit(account['name']+'：'+str(exc))
         finally:

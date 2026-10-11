@@ -143,6 +143,7 @@ class Window(QMainWindow):
         self.refresh_timer.timeout.connect(self.refresh_runtime_views)
         self.engine.changed.connect(self.schedule_runtime_refresh)
         self.engine.browser_reset.connect(self.reset_browser_page)
+        self.engine.browser_state.connect(self.change_browser_state)
         root = QWidget(); self.setCentralWidget(root)
         layout = QHBoxLayout(root); layout.setContentsMargins(8,8,8,4); layout.setSpacing(8)
         self.sidebar = QScrollArea(); self.sidebar.setObjectName('sidebar'); self.sidebar.setFixedWidth(236)
@@ -246,7 +247,7 @@ class Window(QMainWindow):
         hint.setWordWrap(True); l.addWidget(hint)
         controls = QHBoxLayout(); l.addLayout(controls)
         self.mode_switches = {}
-        for mode,title,description in [('comments','找评论模式','分配视频来源和评论扫描，AI 筛选目标客户'),('messages','私信模式','使用全部账号或选中账号，按各自间隔和每日上限发送')]:
+        for mode,title,description in [('comments','找评论模式','分配视频来源和评论扫描，AI 筛选目标客户'),('messages','私信模式','使用全部账号或选中账号，按各自间隔和每日上限轮流发送，等待时释放页面')]:
             group = QGroupBox(title); box = QVBoxLayout(group)
             box.addWidget(QLabel(description))
             switch = QPushButton('开启'); switch.setCheckable(True); switch.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -272,7 +273,7 @@ class Window(QMainWindow):
         self.browser_tabs.setDocumentMode(False)
         self.browser_tabs.tabBar().setDrawBase(False)
         self.browser_tabs.tabBar().setExpanding(False)
-        self.browser_tabs.setToolTip('每个账号保持独立页面；任务运行时可切换查看，请勿手动操作正在执行任务的账号。')
+        self.browser_tabs.setToolTip('账号登录资料独立；私信按需加载页面，等待时休眠。可切换查看，请勿手动操作正在执行任务的账号。')
         layout.addWidget(self.browser_tabs,1)
         empty = QLabel('尚未打开账号页面。请在“账号集群”中选中账号，点击“登录 / 查看内嵌浏览器”。')
         empty.setAlignment(Qt.AlignmentFlag.AlignCenter); empty.setObjectName('muted')
@@ -280,7 +281,7 @@ class Window(QMainWindow):
         self.tabs.addTab(page,'内嵌浏览器')
         self.browser_page = page
 
-    def ensure_browser(self, account, focus=True):
+    def ensure_browser(self, account, focus=True, activate=True):
         ident = account['id']
         widget = self.browser_widgets.get(ident)
         if widget is None:
@@ -288,7 +289,7 @@ class Window(QMainWindow):
                 index = self.browser_tabs.indexOf(self.browser_empty)
                 if index >= 0: self.browser_tabs.removeTab(index)
                 self.browser_empty = None
-            widget = EmbeddedBrowser(self.data/'embedded_profiles'/ident,ident,self)
+            widget = EmbeddedBrowser(self.data/'embedded_profiles'/ident,ident,self,activate=activate)
             widget.restart_requested.connect(self.restart_account_browser)
             widget.set_task_status(self.states.get(ident,'等待操作'))
             self.browser_widgets[ident] = widget
@@ -296,6 +297,8 @@ class Window(QMainWindow):
         else:
             index = self.browser_tabs.indexOf(widget)
             if index >= 0: self.browser_tabs.setTabText(index,account['name'])
+            if activate:
+                widget.resume_page()
         if focus:
             self.tabs.setCurrentWidget(self.browser_page)
             self.browser_tabs.setCurrentWidget(widget)
@@ -313,6 +316,28 @@ class Window(QMainWindow):
         widget = self.browser_widgets.get(ident)
         if widget is not None:
             widget.reset_page()
+
+    def change_browser_state(self, ident, operation, request):
+        error = ''
+        try:
+            widget = self.browser_widgets.get(ident)
+            if operation == 'park':
+                if widget is not None:
+                    widget.suspend_page()
+            elif operation in ('wake','reset'):
+                rows = self.db.rows('SELECT * FROM accounts WHERE id=?',(ident,))
+                if not rows:
+                    raise ValueError('账号不存在')
+                widget = self.ensure_browser(rows[0],False,activate=False)
+                if operation == 'reset':
+                    widget.reset_page()
+                else:
+                    widget.resume_page()
+            else:
+                raise ValueError('不支持的浏览器操作')
+        except Exception as exc:
+            error = str(exc)
+        self.engine.complete_browser_request(request,error)
 
     def restart_account_browser(self, ident=None):
         def action():
@@ -368,7 +393,11 @@ class Window(QMainWindow):
                     account = self.selected(self.accounts,self.account_rows)
                     payload['account_ids'] = [account['id']]
                 accounts = self.engine.cluster_accounts(mode,payload.get('account_ids'))
-                for account in accounts: self.ensure_browser(account,False)
+                for account in accounts:
+                    widget = self.ensure_browser(account,False,activate=mode!='messages')
+                    if mode == 'messages':
+                        widget.suspend_page()
+                        widget.set_task_status('等待工作位 · 页面休眠')
             self.engine.command('start_cluster' if enabled else 'stop_cluster',payload)
             if enabled:
                 self.tabs.setCurrentWidget(self.browser_page)
@@ -535,7 +564,7 @@ class Window(QMainWindow):
             form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
             forms[name] = form; l.addWidget(group)
         self.fields = {}
-        labels = dict(collection_accounts='同时采集账号数（不超过账号总数）',thinking_mode='DeepSeek 思考模式',thinking_effort='DeepSeek 思考强度',ai_concurrency='每个账号评论 AI 并发数（1–20）',days='博主近期视频：最近 N 天',comment_days='近期评论：最近 N 天',video_list_reset_hours='视频列表清空重建周期（小时）',poll_seconds='监控轮询间隔（秒）',scroll_limit='每页最大滚动次数',base_url='AI 接口根地址（含 /v1）',model='模型名称',filter_prompt='目标客户筛选提示词',message_prompt='个性化私信提示词',comment_panel='评论滚动区域 CSS（需实页校准）',message_editor='私信输入框 CSS（需实页校准）')
+        labels = dict(collection_accounts='同时采集账号数（不超过账号总数）',message_concurrency='私信同时工作账号数（默认 3）',thinking_mode='DeepSeek 思考模式',thinking_effort='DeepSeek 思考强度',ai_concurrency='每个账号评论 AI 并发数（1–20）',days='博主近期视频：最近 N 天',comment_days='近期评论：最近 N 天',video_list_reset_hours='视频列表清空重建周期（小时）',poll_seconds='监控轮询间隔（秒）',scroll_limit='每页最大滚动次数',base_url='AI 接口根地址（含 /v1）',model='模型名称',filter_prompt='目标客户筛选提示词',message_prompt='个性化私信提示词',comment_panel='评论滚动区域 CSS（需实页校准）',message_editor='私信输入框 CSS（需实页校准）')
         for k,v in DEFAULTS.items():
             val = self.db.setting(k,v)
             if k in ('thinking_mode','thinking_effort'):
@@ -544,7 +573,7 @@ class Window(QMainWindow):
                 for label,value in options: field.addItem(label,value)
                 field.setCurrentIndex(max(0,field.findData(val)))
             elif isinstance(v,int):
-                field = NoWheelSpinBox(); field.setRange(1,max(1,len(self.db.rows('SELECT id FROM accounts'))) if k=='collection_accounts' else 20 if k=='ai_concurrency' else 86400 if k=='poll_seconds' else 1000); field.setValue(val)
+                field = NoWheelSpinBox(); field.setRange(1,max(1,len(self.db.rows('SELECT id FROM accounts'))) if k=='collection_accounts' else 20 if k in ('ai_concurrency','message_concurrency') else 86400 if k=='poll_seconds' else 1000); field.setValue(val)
             elif k.endswith('prompt'):
                 field = QPlainTextEdit(val); field.setMinimumHeight(300)
             else: field = QLineEdit(val)
@@ -556,6 +585,7 @@ class Window(QMainWindow):
             else:
                 forms[section].addRow(labels[k],field)
         self.fields['collection_accounts'].setToolTip('按账号列表顺序使用前 N 个账号；设置保存后，下次开启找评论模式生效。私信可使用全部账号或仅选中账号。')
+        self.fields['message_concurrency'].setToolTip('全部启用账号按各自间隔轮流工作；最多同时加载此数量的账号页面，等待时释放页面。下次启动私信时生效。')
         self.fields['thinking_mode'].currentIndexChanged.connect(self.update_thinking_controls)
         self.update_thinking_controls()
         self.api_key = QLineEdit(); self.api_key.setEchoMode(QLineEdit.EchoMode.Password); self.api_key.setPlaceholderText('留空保留已有密钥；保存到系统钥匙串，不导出')

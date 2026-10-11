@@ -53,7 +53,7 @@ class EmbeddedBrowser(QWidget):
     title_changed = Signal(str)
     restart_requested = Signal(str)
 
-    def __init__(self, profile_dir, marker, parent=None):
+    def __init__(self, profile_dir, marker, parent=None, activate=True):
         super().__init__(parent)
         self.setObjectName('embeddedBrowser')
         self.marker = marker
@@ -79,23 +79,26 @@ class EmbeddedBrowser(QWidget):
         self.profile.settings().setUnknownUrlSchemePolicy(
             QWebEngineSettings.UnknownUrlSchemePolicy.DisallowUnknownUrlSchemes)
 
-        self.view = BrowserView(self)
+        self.view = None
         self.activity_timer = QTimer(self)
         self.activity_timer.timeout.connect(self.keep_page_active)
-        self.activity_timer.start(1000)
         self.address = QLineEdit()
         self.address.setPlaceholderText('输入网址后回车')
         self.address.returnPressed.connect(self.navigate_address)
 
         root = QVBoxLayout(self)
+        self.root = root
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(4)
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
         root.addLayout(toolbar)
+        self.page_controls = []
         for label, callback, tip in (
-                ('←', self.view.back, '后退'), ('→', self.view.forward, '前进'),
-                ('↻', self.view.reload, '刷新'), ('首页', self.home, '打开抖音首页'),
+                ('←', lambda:self.view.back() if self.view else None, '后退'),
+                ('→', lambda:self.view.forward() if self.view else None, '前进'),
+                ('↻', lambda:self.view.reload() if self.view else None, '刷新'),
+                ('首页', self.home, '打开抖音首页'),
                 ('重启浏览器', lambda:self.restart_requested.emit(self.marker),
                  '页面无响应时重建当前账号的浏览器')):
             control = QPushButton(label)
@@ -103,21 +106,57 @@ class EmbeddedBrowser(QWidget):
             control.setCursor(Qt.CursorShape.PointingHandCursor)
             control.clicked.connect(callback)
             toolbar.addWidget(control)
+            if label != '重启浏览器':
+                self.page_controls.append(control)
         toolbar.addWidget(self.address, 1)
         self.task_status = QLabel('账号任务状态：等待操作')
         self.task_status.setWordWrap(True)
-        self.task_status.setToolTip('about:blank 可能是处理完成后释放内存的空白页，请结合任务状态判断运行情况。')
+        self.task_status.setToolTip('私信等待时页面会休眠并释放内存；采集任务清理后可能显示 about:blank。请结合任务状态判断。')
         root.addWidget(self.task_status)
-        root.addWidget(self.view, 1)
+        self.sleep_hint = QLabel('账号页面已休眠，轮到此账号时自动加载。登录资料保留。')
+        self.sleep_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(self.sleep_hint,1)
+        self.set_navigation_enabled(False)
+        if activate:
+            self.reset_page()
 
-        self.view.urlChanged.connect(lambda url: self.address.setText(url.toString()))
-        self.view.titleChanged.connect(self.title_changed)
-        self.reset_page()
+    def suspend_page(self):
+        """Destroy the renderer instead of retaining an active blank page."""
+        self.activity_timer.stop()
+        unregister_page(self.marker)
+        if self.view is not None:
+            view,self.view = self.view,None
+            view.stop()
+            page = view.page()
+            self.root.removeWidget(view)
+            delete_qt_object(view)
+            if isValid(page):
+                delete_qt_object(page)
+        self.address.clear()
+        self.set_navigation_enabled(False)
+        self.sleep_hint.show()
+
+    def set_navigation_enabled(self, enabled):
+        self.address.setEnabled(enabled)
+        for control in self.page_controls:
+            control.setEnabled(enabled)
+
+    def resume_page(self):
+        if self.view is None:
+            self.reset_page()
 
     def reset_page(self):
         """重建当前 WebEngine 页面，保留 profile 中的登录数据。"""
         if self.closed:
             return
+        if self.view is None:
+            self.view = BrowserView(self)
+            self.root.addWidget(self.view,1)
+            self.view.urlChanged.connect(lambda url: self.address.setText(url.toString()))
+            self.view.titleChanged.connect(self.title_changed)
+        self.sleep_hint.hide()
+        self.set_navigation_enabled(True)
+        self.activity_timer.start(1000)
         old_page = self.view.page()
         unregister_page(self.marker)
         page = QWebEnginePage(self.profile, self.view)
@@ -150,19 +189,22 @@ class EmbeddedBrowser(QWidget):
                 delete_qt_object(old_page)
 
     def home(self):
-        self.view.setUrl(QUrl('https://www.douyin.com/'))
+        if self.view is not None:
+            self.view.setUrl(QUrl('https://www.douyin.com/'))
 
     def set_task_status(self, status):
         self.task_status.setText('账号任务状态：'+status)
 
     def navigate_address(self):
-        self.view.setUrl(QUrl.fromUserInput(self.address.text().strip()))
+        if self.view is not None:
+            self.view.setUrl(QUrl.fromUserInput(self.address.text().strip()))
 
     def navigate(self, url):
+        self.resume_page()
         self.view.setUrl(QUrl.fromUserInput(str(url)))
 
     def keep_page_active(self, *_):
-        if self.closed:
+        if self.closed or self.view is None:
             return
         page = self.view.page()
         if page.lifecycleState()!=QWebEnginePage.LifecycleState.Active:
@@ -174,11 +216,5 @@ class EmbeddedBrowser(QWidget):
         if self.closed:
             return
         self.closed = True
-        self.activity_timer.stop()
-        unregister_page(self.marker)
-        self.view.stop()
-        old_page = self.view.page()
-        self.view.setPage(QWebEnginePage(QWebEngineProfile.defaultProfile(),self.view))
-        if isValid(old_page):
-            delete_qt_object(old_page)
+        self.suspend_page()
         QTimer.singleShot(0,self.profile.deleteLater)

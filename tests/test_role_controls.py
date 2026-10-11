@@ -3,6 +3,8 @@ os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 from PySide6.QtWidgets import QApplication
 from app.db import DB
 from app.ui import Window
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 
 def test_cluster_controls_limit_collection_and_exclude_other_mode(tmp_path):
@@ -12,7 +14,7 @@ def test_cluster_controls_limit_collection_and_exclude_other_mode(tmp_path):
     db.save_settings({'base_url':'https://example.com/v1','model':'test','collection_accounts':2})
     w=Window(db,tmp_path,start_engine=False); w.engine.ready.set()
     calls=[]; opened=[]; errors=[]
-    w.ensure_browser=lambda account,focus=False:opened.append(account['id'])
+    w.ensure_browser=lambda account,focus=False,activate=True:(opened.append(account['id']) or SimpleNamespace(suspend_page=Mock(),set_task_status=Mock()))
     def command(op,payload):
         calls.append((op,payload['mode']))
         if op=='start_cluster':
@@ -65,7 +67,7 @@ def test_selected_account_can_start_messages_without_other_accounts(tmp_path):
     db.save_settings({'base_url':'https://example.com/v1','model':'test'})
     w=Window(db,tmp_path,start_engine=False); w.engine.ready.set()
     opened=[]; calls=[]
-    w.ensure_browser=lambda account,focus=False:opened.append(account['id'])
+    w.ensure_browser=lambda account,focus=False,activate=True:(opened.append(account['id']) or SimpleNamespace(suspend_page=Mock(),set_task_status=Mock()))
     def command(op,payload):
         calls.append((op,payload))
         w.engine.cluster_mode=payload['mode']
@@ -104,3 +106,29 @@ def test_single_account_start_requires_selection(tmp_path,monkeypatch):
     assert not w.browser_widgets
     assert warnings and '请先选择' in warnings[0]
     w.close(); app.processEvents()
+
+
+def test_starting_all_senders_creates_sleeping_tabs_and_suspends_existing_page(tmp_path):
+    from app.embedded_browser import page_id
+    from shiboken6 import isValid
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'db.sqlite3')
+    ids=[db.account(str(i)) for i in range(10)]
+    db.save_settings({'base_url':'https://example.com/v1','model':'test'})
+    w=Window(db,tmp_path,start_engine=False); w.timer.stop();w.engine.ready.set()
+    account=w.account_rows[0]
+    existing=w.ensure_browser(account,False); old_page=existing.view.page()
+    w.engine.command=Mock()
+    try:
+        w.toggle_cluster('messages',True)
+        assert set(w.browser_widgets)==set(ids)
+        assert all(widget.view is None for widget in w.browser_widgets.values())
+        assert all(page_id(ident) is None for ident in ids)
+        assert not isValid(old_page)
+        w.engine.command.assert_called_once_with('start_cluster',{'mode':'messages'})
+        assert w.fields['message_concurrency'].value()==3
+        w.fields['message_concurrency'].setValue(2)
+        w.save_settings()
+        assert db.setting('message_concurrency')==2
+    finally:
+        w.close();app.processEvents()

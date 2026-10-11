@@ -95,3 +95,26 @@ def test_embedded_browser_can_rebuild_one_page_and_keep_profile(tmp_path):
     assert page_id('account')==browser.view.page().devToolsId()
     assert page_id('account')!=old_target
     browser.shutdown();app.processEvents()
+
+
+def test_sleeping_account_has_no_view_and_resume_keeps_profile(tmp_path):
+    from shiboken6 import isValid
+    app=QApplication.instance() or QApplication([])
+    browser=EmbeddedBrowser(tmp_path/'profile','sleep-test',activate=False)
+    profile=browser.profile
+    assert browser.view is None and page_id('sleep-test') is None
+    assert not browser.activity_timer.isActive()
+    browser.resume_page()
+    view=browser.view; page=view.page(); first_target=page_id('sleep-test')
+    browser.suspend_page()
+    assert browser.view is None and page_id('sleep-test') is None
+    assert not isValid(view) and not isValid(page)
+    browser.keep_page_active()
+    assert browser.view is None and not browser.activity_timer.isActive()
+    browser.resume_page()
+    assert browser.profile is profile
+    assert page_id('sleep-test') != first_target
+    browser.show();app.processEvents()
+    browser.keep_page_active()
+    assert browser.view.page().isVisible()
+    browser.shutdown();app.processEvents()
