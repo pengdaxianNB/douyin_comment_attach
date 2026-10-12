@@ -52,6 +52,7 @@ class BrowserView(QWebEngineView):
 class EmbeddedBrowser(QWidget):
     title_changed = Signal(str)
     restart_requested = Signal(str)
+    renderer_failed = Signal(str,str)
 
     def __init__(self, profile_dir, marker, parent=None, activate=True):
         super().__init__(parent)
@@ -111,7 +112,7 @@ class EmbeddedBrowser(QWidget):
         toolbar.addWidget(self.address, 1)
         self.task_status = QLabel('账号任务状态：等待操作')
         self.task_status.setWordWrap(True)
-        self.task_status.setToolTip('私信等待时页面会休眠并释放内存；采集任务清理后可能显示 about:blank。请结合任务状态判断。')
+        self.task_status.setToolTip('搜索后暂停和私信等待时页面会休眠并释放内存；采集任务清理后可能显示 about:blank。请结合任务状态判断。')
         root.addWidget(self.task_status)
         self.sleep_hint = QLabel('账号页面已休眠，轮到此账号时自动加载。登录资料保留。')
         self.sleep_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -168,6 +169,7 @@ class EmbeddedBrowser(QWidget):
         page.lifecycleStateChanged.connect(self.keep_page_active)
         page.recommendedStateChanged.connect(self.keep_page_active)
         page.visibleChanged.connect(self.keep_page_active)
+        page.renderProcessTerminated.connect(self.renderer_terminated)
         self.keep_page_active()
         # Qt exposes the underlying CDP target id. Registering that immutable id
         # avoids relying on the page title/URL, both of which change as users
@@ -191,6 +193,13 @@ class EmbeddedBrowser(QWidget):
     def home(self):
         if self.view is not None:
             self.view.setUrl(QUrl('https://www.douyin.com/'))
+
+    def renderer_terminated(self, status, exit_code):
+        if self.closed or status == QWebEnginePage.RenderProcessTerminationStatus.NormalTerminationStatus:
+            return
+        reason = f'浏览器渲染进程退出（{status.name}，退出码 {exit_code}）'
+        self.set_task_status(reason+'；运行任务将按异常流程处理，空闲时可点击重启浏览器')
+        self.renderer_failed.emit(self.marker,reason)
 
     def set_task_status(self, status):
         self.task_status.setText('账号任务状态：'+status)
@@ -217,4 +226,4 @@ class EmbeddedBrowser(QWidget):
             return
         self.closed = True
         self.suspend_page()
-        QTimer.singleShot(0,self.profile.deleteLater)
+        self.profile.deleteLater()

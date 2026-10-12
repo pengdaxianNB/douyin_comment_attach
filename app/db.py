@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 import json
+import logging
 import re
 import sqlite3
 import time
@@ -80,6 +81,9 @@ class DB:
             CREATE TABLE IF NOT EXISTS customers(uid TEXT PRIMARY KEY,name TEXT,text TEXT,comment_time TEXT,video_title TEXT,blogger TEXT,url TEXT,status TEXT NOT NULL DEFAULT 'pending',message TEXT DEFAULT '',account_id TEXT,error TEXT DEFAULT '',sent_at TEXT DEFAULT '',updated REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,at TEXT DEFAULT CURRENT_TIMESTAMP,account_id TEXT,uid TEXT,kind TEXT,detail TEXT);
             ''')
+            # executescript commits existing transactions. All upgrades below
+            # use execute so a failed copy cannot publish a half-upgraded DB.
+            c.execute('BEGIN IMMEDIATE')
             account_columns = {row['name'] for row in c.execute('PRAGMA table_info(accounts)')}
             if 'daily_limit' not in account_columns:
                 c.execute('ALTER TABLE accounts ADD COLUMN daily_limit INTEGER NOT NULL DEFAULT 0')
@@ -87,7 +91,6 @@ class DB:
                 # Preserve UUIDs: browser profiles and sending history use them.
                 # SQLite's Python driver does not begin a transaction for DDL.
                 # Keep the rename/copy/drop atomic if migration is interrupted.
-                c.execute('BEGIN IMMEDIATE')
                 c.execute('DROP INDEX IF EXISTS one_main')
                 c.execute('ALTER TABLE accounts RENAME TO accounts_before_cluster')
                 c.execute('''CREATE TABLE accounts(id TEXT PRIMARY KEY,name TEXT NOT NULL,
@@ -97,19 +100,20 @@ class DB:
                 c.execute('DROP TABLE accounts_before_cluster')
             video_schema = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='videos'").fetchone()['sql']
             if "'manual'" not in video_schema or "'search'" not in video_schema:
-                c.executescript('''
-                ALTER TABLE videos RENAME TO videos_before_source_change;
-                CREATE TABLE videos(
+                c.execute('ALTER TABLE videos RENAME TO videos_before_source_change')
+                c.execute('''CREATE TABLE videos(
                     id TEXT PRIMARY KEY,title TEXT NOT NULL DEFAULT '',author TEXT NOT NULL DEFAULT '',
                     source_type TEXT NOT NULL CHECK(source_type IN ('blogger','keyword','manual','search')),
                     source_name TEXT NOT NULL DEFAULT '',source_ref TEXT NOT NULL DEFAULT '',
                     create_time INTEGER NOT NULL DEFAULT 0,url TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','scanning','done','failed')),
                     error TEXT NOT NULL DEFAULT '',discovered_at REAL NOT NULL,scanned_at REAL
-                );
-                INSERT INTO videos SELECT * FROM videos_before_source_change;
-                DROP TABLE videos_before_source_change;
-                ''')
+                )''')
+                c.execute('INSERT INTO videos SELECT * FROM videos_before_source_change')
+                c.execute('DROP TABLE videos_before_source_change')
+            c.execute('CREATE INDEX IF NOT EXISTS customers_status_updated ON customers(status,updated)')
+            c.execute('CREATE INDEX IF NOT EXISTS customers_updated ON customers(updated)')
+            c.execute('CREATE INDEX IF NOT EXISTS events_account_kind_at_uid ON events(account_id,kind,at,uid)')
             c.execute("UPDATE customers SET status='failed',error=CASE WHEN error='' THEN '历史待核验记录，发送结果不明，请勿重复联系' ELSE error END WHERE status='uncertain'")
             # An interrupted comment scan is safe to retry: comments are
             # deduplicated by cid and no outbound message is sent here.
@@ -135,7 +139,16 @@ class DB:
 
     def setting(self, key, default=None):
         r = self.rows('SELECT value FROM settings WHERE key=?', (key,))
-        return json.loads(r[0]['value']) if r else default
+        if not r:
+            return default
+        try:
+            value = json.loads(r[0]['value'])
+            if default is not None and type(value) is not type(default):
+                raise ValueError('设置类型错误')
+            return value
+        except (TypeError, ValueError, RecursionError):
+            logging.getLogger('panda').warning('设置 %s 无法解析，使用默认值',key)
+            return default
 
     def save_settings(self, values):
         with self.connect() as c:

@@ -291,6 +291,7 @@ class Window(QMainWindow):
                 self.browser_empty = None
             widget = EmbeddedBrowser(self.data/'embedded_profiles'/ident,ident,self,activate=activate)
             widget.restart_requested.connect(self.restart_account_browser)
+            widget.renderer_failed.connect(lambda ident,reason:self.add_log(ident+'：'+reason))
             widget.set_task_status(self.states.get(ident,'等待操作'))
             self.browser_widgets[ident] = widget
             self.browser_tabs.addTab(widget,account['name'])
@@ -564,16 +565,17 @@ class Window(QMainWindow):
             form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
             forms[name] = form; l.addWidget(group)
         self.fields = {}
-        labels = dict(collection_accounts='同时采集账号数（不超过账号总数）',message_concurrency='私信同时工作账号数（默认 3）',thinking_mode='DeepSeek 思考模式',thinking_effort='DeepSeek 思考强度',ai_concurrency='每个账号评论 AI 并发数（1–20）',days='博主近期视频：最近 N 天',comment_days='近期评论：最近 N 天',video_list_reset_hours='视频列表清空重建周期（小时）',poll_seconds='监控轮询间隔（秒）',scroll_limit='每页最大滚动次数',base_url='AI 接口根地址（含 /v1）',model='模型名称',filter_prompt='目标客户筛选提示词',message_prompt='个性化私信提示词',comment_panel='评论滚动区域 CSS（需实页校准）',message_editor='私信输入框 CSS（需实页校准）')
+        settings = self.engine.settings()
+        labels = dict(collection_accounts='同时采集账号数（不超过账号总数）',keyword_pause_seconds='每个账号搜索后暂停（秒，0 关闭）',message_concurrency='私信同时工作账号数（默认 3）',thinking_mode='DeepSeek 思考模式',thinking_effort='DeepSeek 思考强度',ai_concurrency='每个账号评论 AI 并发数（1–20）',days='博主近期视频：最近 N 天',comment_days='近期评论：最近 N 天',video_list_reset_hours='视频列表清空重建周期（小时）',poll_seconds='监控轮询间隔（秒）',scroll_limit='每页最大滚动次数',base_url='AI 接口根地址（含 /v1）',model='模型名称',filter_prompt='目标客户筛选提示词',message_prompt='个性化私信提示词',comment_panel='评论滚动区域 CSS（需实页校准）',message_editor='私信输入框 CSS（需实页校准）')
         for k,v in DEFAULTS.items():
-            val = self.db.setting(k,v)
+            val = settings[k]
             if k in ('thinking_mode','thinking_effort'):
                 field = NoWheelComboBox()
                 options = [('跟随服务默认','default'),('开启','enabled'),('关闭','disabled')] if k=='thinking_mode' else [('低（low）','low'),('高（high）','high'),('最高（max）','max')]
                 for label,value in options: field.addItem(label,value)
                 field.setCurrentIndex(max(0,field.findData(val)))
             elif isinstance(v,int):
-                field = NoWheelSpinBox(); field.setRange(1,max(1,len(self.db.rows('SELECT id FROM accounts'))) if k=='collection_accounts' else 20 if k in ('ai_concurrency','message_concurrency') else 86400 if k=='poll_seconds' else 1000); field.setValue(val)
+                field = NoWheelSpinBox(); field.setRange(0 if k=='keyword_pause_seconds' else 1,max(1,len(self.db.rows('SELECT id FROM accounts'))) if k=='collection_accounts' else 20 if k in ('ai_concurrency','message_concurrency') else 86400 if k in ('poll_seconds','keyword_pause_seconds') else 1000); field.setValue(val)
             elif k.endswith('prompt'):
                 field = QPlainTextEdit(val); field.setMinimumHeight(300)
             else: field = QLineEdit(val)
@@ -585,6 +587,7 @@ class Window(QMainWindow):
             else:
                 forms[section].addRow(labels[k],field)
         self.fields['collection_accounts'].setToolTip('按账号列表顺序使用前 N 个账号；设置保存后，下次开启找评论模式生效。私信可使用全部账号或仅选中账号。')
+        self.fields['keyword_pause_seconds'].setToolTip('默认 60 秒，范围 0–86400 秒。每个账号处理完一个抖音指数关键词或抖音搜索词后暂停；等待期间释放页面内存，保留登录资料，其他账号继续工作。0 表示关闭；下次开启找评论模式生效。')
         self.fields['message_concurrency'].setToolTip('全部启用账号按各自间隔轮流工作；最多同时加载此数量的账号页面，等待时释放页面。下次启动私信时生效。')
         self.fields['thinking_mode'].currentIndexChanged.connect(self.update_thinking_controls)
         self.update_thinking_controls()
@@ -726,6 +729,8 @@ class Window(QMainWindow):
         self.refresh_accounts()
 
     def schedule_runtime_refresh(self):
+        if getattr(self,'_closing',False):
+            return
         if not self.refresh_timer.isActive():
             self.refresh_timer.start()
 
@@ -780,7 +785,7 @@ class Window(QMainWindow):
         view = [['',VIDEO_STATUS.get(r['status'],r['status']),
             ({'blogger':'博主：','keyword':'关键词：','search':'抖音搜索：','manual':''}.get(r['source_type'],'')+r['source_name']),
             r['title'],r['author'],
-            (datetime.fromtimestamp(r['create_time'],BEIJING_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S') if r['create_time'] else ''),
+            self.video_time(r['create_time']),
             r['id'],r['error']] for r in rows]
         # This runs every few seconds; rebuilding thousands of unchanged cells
         # wastes GUI time and resets scrolling/selection for no reason.
@@ -811,6 +816,13 @@ class Window(QMainWindow):
         for i,row in enumerate(rows if changed else ()):
             self.videos.item(i,1).setForeground(QColor(colors.get(row['status'],'#dbe5f3')))
         self.update_manual_video_action()
+
+    @staticmethod
+    def video_time(value):
+        try:
+            return datetime.fromtimestamp(value,BEIJING_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S') if value else ''
+        except (TypeError,ValueError,OverflowError,OSError):
+            return ''
 
     def refresh_customers(self):
         counts = {r['status']:r['n'] for r in self.db.rows('SELECT status,count(*) n FROM customers GROUP BY status')}
@@ -1101,25 +1113,29 @@ class Window(QMainWindow):
         self.report(action)
 
     def force_shutdown(self):
-        # The worker did not stop in time (for example a hung page call).
-        # Never leave the operator with an unclosable window.
+        # Killing a Python QThread can interrupt SQLite/GIL ownership and
+        # crash the whole process. Keep pumping GUI acknowledgements instead.
         if self.engine.isRunning():
-            self.add_log('后台任务未能及时停止，已强制退出')
-            self.engine.terminate()
-            self.engine.wait(3000)
-        self.close()
+            self.add_log('后台清理超过 20 秒，继续等待安全退出；未强制终止线程')
+            self.statusBar().showMessage('后台仍在清理，正在等待安全退出…')
+        else:
+            self.close()
 
     def closeEvent(self,event):
         if self.engine.isRunning():
-            self.engine.command('shutdown')
             self.setEnabled(False)
             if not getattr(self,'_closing',False):
                 self._closing = True
+                self.timer.stop()
+                self.refresh_timer.stop()
                 self.engine.finished.connect(self.close)
                 QTimer.singleShot(20000,self.force_shutdown)
+            self.engine.command('shutdown')
             self.statusBar().showMessage('正在停止任务并关闭内嵌浏览器…')
             event.ignore()
         else:
+            self.timer.stop()
+            self.refresh_timer.stop()
             for widget in self.browser_widgets.values():
                 widget.shutdown()
             event.accept()

@@ -78,6 +78,24 @@ def test_comment_time_is_displayed_in_beijing_time():
     assert format_beijing_time('') == ''
 
 
+def test_search_pause_setting_default_range_and_persistence(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    db = DB(tmp_path/'settings.sqlite3')
+    w = Window(db,tmp_path,start_engine=False)
+    field = w.fields['keyword_pause_seconds']
+    assert field.value() == 60
+    assert (field.minimum(),field.maximum()) == (0,86400)
+    for seconds in (0,120,86400):
+        field.setValue(seconds)
+        w.save_settings()
+        assert db.setting('keyword_pause_seconds') == seconds
+        assert w.engine.settings()['keyword_pause_seconds'] == seconds
+    w.close(); app.processEvents()
+    w = Window(db,tmp_path,start_engine=False)
+    assert w.fields['keyword_pause_seconds'].value() == 86400
+    w.close(); app.processEvents()
+
+
 def test_window():
     app=QApplication.instance() or QApplication([])
     app.setStyleSheet(STYLE)
@@ -383,4 +401,36 @@ def test_account_table_shows_today_sent_count_and_limit(tmp_path):
     db.execute("UPDATE events SET at=datetime('now','-1 day') WHERE account_id=?",(account_id,))
     w.refresh_accounts()
     assert w.accounts.item(0,2).text()=='0 / 10'
+    w.close();app.processEvents()
+
+
+def test_shutdown_timeout_never_terminates_python_thread(tmp_path,monkeypatch):
+    from unittest.mock import Mock
+    app=QApplication.instance() or QApplication([])
+    w=Window(DB(tmp_path/'shutdown.sqlite3'),tmp_path,start_engine=False)
+    monkeypatch.setattr(w.engine,'isRunning',lambda:True)
+    terminate=Mock()
+    monkeypatch.setattr(w.engine,'terminate',terminate)
+    monkeypatch.setattr(w.engine,'command',Mock())
+    w.close()
+    assert w._closing and not w.timer.isActive() and not w.refresh_timer.isActive()
+    w.schedule_runtime_refresh()
+    assert not w.refresh_timer.isActive()
+    w.force_shutdown()
+    terminate.assert_not_called()
+    assert '等待安全退出' in w.statusBar().currentMessage()
+    monkeypatch.setattr(w.engine,'isRunning',lambda:False)
+    w.close();app.processEvents()
+
+
+def test_invalid_timestamp_and_large_setting_do_not_break_window(tmp_path):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'invalid.sqlite3')
+    db.save_settings({'days':10**100,'model':None})
+    db.add_video({'aweme_id':'1234567890123456789'},'keyword','测试词')
+    db.execute('UPDATE videos SET create_time=?',(2**63-1,))
+    w=Window(db,tmp_path,start_engine=False)
+    assert w.fields['days'].value()==1000
+    assert w.fields['model'].text()==''
+    assert w.videos.rowCount()==1 and w.videos.item(0,5).text()==''
     w.close();app.processEvents()

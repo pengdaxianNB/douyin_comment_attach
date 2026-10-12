@@ -118,3 +118,18 @@ def test_sleeping_account_has_no_view_and_resume_keeps_profile(tmp_path):
     browser.keep_page_active()
     assert browser.view.page().isVisible()
     browser.shutdown();app.processEvents()
+
+
+def test_renderer_crash_reports_account_and_preserves_profile(tmp_path):
+    from PySide6.QtTest import QSignalSpy
+    app=QApplication.instance() or QApplication([])
+    browser=EmbeddedBrowser(tmp_path/'profile','crash-test',activate=False)
+    profile=browser.profile
+    spy=QSignalSpy(browser.renderer_failed)
+    browser.renderer_terminated(QWebEnginePage.RenderProcessTerminationStatus.NormalTerminationStatus,0)
+    assert spy.count()==0
+    browser.renderer_terminated(QWebEnginePage.RenderProcessTerminationStatus.CrashedTerminationStatus,11)
+    assert spy.count()==1 and spy.at(0)[0]=='crash-test'
+    assert '退出码 11' in spy.at(0)[1]
+    assert browser.profile is profile and not browser.closed
+    browser.shutdown();app.processEvents()

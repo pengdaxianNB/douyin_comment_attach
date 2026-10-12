@@ -68,7 +68,7 @@ def test_cluster_restart_skips_completed_source_and_waits_before_comments(tmp_pa
     for i in range(5):
         db.account(f'账号{i}')
     db.import_keywords(['完成词','中断词'])
-    db.save_settings({'base_url':'https://example.com','model':'test','collection_accounts':5})
+    db.save_settings({'base_url':'https://example.com','model':'test','collection_accounts':5,'keyword_pause_seconds':0})
     engine = Engine(db,tmp_path)
     engine.jobs = {}; engine.contexts = {}
     sources = engine.collection_sources()

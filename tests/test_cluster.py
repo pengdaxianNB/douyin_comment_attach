@@ -11,7 +11,7 @@ from app.browser import AccountNeedsAttention
 def cluster(tmp_path,count=3):
     db=DB(tmp_path/'test.sqlite3')
     for i in range(count): db.account(f'账号{i}')
-    db.save_settings({'base_url':'https://example.com/v1','model':'test','collection_accounts':count})
+    db.save_settings({'base_url':'https://example.com/v1','model':'test','collection_accounts':count,'keyword_pause_seconds':0})
     engine=Engine(db,tmp_path)
     engine.jobs={}; engine.contexts={}
     accounts=engine.cluster_accounts('comments')

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import threading
 import uuid
@@ -14,7 +15,7 @@ from .browser import Browser, AccountNeedsAttention, SearchPageUnavailable, Comm
 from .classifier import classify_comments
 from .embedded_browser import MARKER_PREFIX, page_id, unregister_page
 
-DEFAULTS = dict(collection_accounts=1,message_concurrency=3,days=7,comment_days=7,video_list_reset_hours=24,ai_concurrency=5,poll_seconds=300,scroll_limit=80,base_url='',model='',thinking_mode='default',thinking_effort='high',
+DEFAULTS = dict(collection_accounts=1,keyword_pause_seconds=60,message_concurrency=3,days=7,comment_days=7,video_list_reset_hours=24,ai_concurrency=5,poll_seconds=300,scroll_limit=80,base_url='',model='',thinking_mode='default',thinking_effort='high',
     filter_prompt='识别评论中是否明确表达了对我提供的产品或服务的购买或咨询需求。产品和目标客户：请填写。不要把普通互动识别为需求。',
     message_prompt='根据客户评论写一条自然、简短的咨询回复。我的产品或服务：请填写。尊重对方，不夸大，不使用虚假承诺。',
     comment_panel='[data-e2e="comment-list"]',message_editor='[contenteditable="true"]')
@@ -75,6 +76,8 @@ class Engine(QThread):
         self.page_operations = {}
         self.lock = threading.Lock()
         self.ready = threading.Event()
+        self.shutdown_requested = threading.Event()
+        self.main_task = None
         self.sender_slots = None
         self.sender_pool_error = None
         self.browser_requests = {}
@@ -103,7 +106,12 @@ class Engine(QThread):
                     future.set_exception(RuntimeError(error))
                 else:
                     future.set_result(None)
-        loop.call_soon_threadsafe(complete)
+        try:
+            loop.call_soon_threadsafe(complete)
+        except RuntimeError:
+            # A queued GUI acknowledgement may arrive after asyncio.run exits.
+            if not loop.is_closed():
+                raise
 
     @asynccontextmanager
     async def sender_turn(self, account):
@@ -146,8 +154,43 @@ class Engine(QThread):
             self.log.emit(account['name']+'：账号页面连接失败，正在自动恢复：'+(str(exc) or '超时'))
             return await self.rebuild_browser(account)
 
+    async def pause_search_account(self, account, settings):
+        """Release the renderer for the entire per-account search interval."""
+        seconds = max(0,int(settings.get('keyword_pause_seconds',0)))
+        ident = account['id']
+        self.contexts.pop(ident,None)
+        self.page_operations.pop(ident,None)
+        self.status.emit(ident,'搜索结束，正在释放账号页面')
+        try:
+            await self.change_browser_state(ident,'park')
+        except Exception as exc:
+            raise AccountNeedsAttention('搜索暂停时页面释放失败，请停止账号后重试：'+
+                                        (str(exc) or '界面响应超时')) from exc
+        self.status.emit(ident,f'搜索后暂停 {seconds} 秒 · 页面休眠')
+        self.log.emit(account['name']+f'：搜索结束，页面已释放，暂停 {seconds} 秒后继续')
+        await asyncio.sleep(seconds)
+
+    async def wake_collector(self, account, settings):
+        """Only recreate a parked page when the collector has more work."""
+        self.status.emit(account['id'],'搜索暂停结束，正在加载账号页面')
+        try:
+            await self.change_browser_state(account['id'],'wake')
+            browser = await asyncio.wait_for(self.open(account),timeout=BROWSER_OPEN_TIMEOUT)
+        except (AccountNeedsAttention,asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            self.log.emit(account['name']+'：账号页面连接失败，正在自动恢复：'+(str(exc) or '超时'))
+            browser = await self.rebuild_browser(account)
+        browser.s = settings
+        return browser
+
     def command(self, op, account=None):
-        if self.loop and self.commands:
+        if op == 'shutdown':
+            self.request_shutdown()
+            return
+        if self.shutdown_requested.is_set():
+            raise ValueError('后台正在关闭，请等待退出')
+        if self.loop and not self.loop.is_closed() and self.commands is not None:
             if op == 'start_cluster':
                 mode = account['mode']
                 accounts = self.cluster_accounts(mode,account.get('account_ids'))
@@ -157,7 +200,32 @@ class Engine(QThread):
                     self.cluster_mode = mode
                     self.running_accounts.update(row['id'] for row in accounts)
                 account = dict(mode=mode,accounts=accounts)
-            self.loop.call_soon_threadsafe(self.commands.put_nowait,(op,account))
+            try:
+                self.loop.call_soon_threadsafe(self.commands.put_nowait,(op,account))
+            except RuntimeError as exc:
+                with self.lock:
+                    self.running_accounts.clear()
+                    self.cluster_mode = None
+                raise ValueError('后台已退出，请重启应用') from exc
+        else:
+            raise ValueError('后台尚未就绪或已退出，请稍后重试或重启应用')
+
+    def request_shutdown(self):
+        """Cancel in-flight commands too, and remember close during startup."""
+        if self.shutdown_requested.is_set():
+            return
+        self.shutdown_requested.set()
+        loop = self.loop
+        if loop is None:
+            return
+        def cancel_main():
+            if self.main_task is not None and not self.main_task.done():
+                self.main_task.cancel()
+        try:
+            loop.call_soon_threadsafe(cancel_main)
+        except RuntimeError:
+            if not loop.is_closed():
+                raise
 
     def cluster_accounts(self, mode, account_ids=None):
         if mode not in ('comments','messages'):
@@ -185,11 +253,20 @@ class Engine(QThread):
     def run(self):
         try:
             asyncio.run(self.main())
+        except asyncio.CancelledError:
+            if not self.shutdown_requested.is_set():
+                self.log.emit('后台引擎意外取消，请重启应用')
         except Exception as exc:
             # Without this the worker thread would die silently and every later
             # button press would be dropped by command().
-            self.loop = None
+            logging.getLogger('panda').exception('后台引擎异常退出')
             self.log.emit('后台引擎异常退出，请重启应用：'+type(exc).__name__+'：'+str(exc))
+        finally:
+            self.ready.clear()
+            self.loop = None
+            self.commands = None
+            self.main_task = None
+            self.browser_requests.clear()
             with self.lock:
                 self.running_accounts.clear()
                 self.cluster_mode = None
@@ -198,12 +275,25 @@ class Engine(QThread):
 
     async def main(self):
         self.loop = asyncio.get_running_loop()
+        self.main_task = asyncio.current_task()
         self.commands = asyncio.Queue()
         self.contexts,self.jobs = {},{}
         self.cdp_browser = None
         async with async_playwright() as pw:
             self.pw = pw
             self.ready.set()
+            try:
+                await self.process_commands()
+            finally:
+                # Keep Playwright and the GUI alive until workers finish their
+                # cancellation handlers and persist customer outcomes.
+                await self.stop_cluster()
+                self.contexts.clear()
+
+    async def process_commands(self):
+        if self.shutdown_requested.is_set():
+            return
+        try:
             while True:
                 op,account = await self.commands.get()
                 try:
@@ -227,20 +317,32 @@ class Engine(QThread):
                             raise ValueError('请先停止该账号任务，再采集发送诊断')
                         if ident not in self.contexts:
                             raise ValueError('请先打开该账号的私信窗口')
-                        path = await self.contexts[ident].diagnose_sender()
+                        path = await asyncio.wait_for(self.contexts[ident].diagnose_sender(),timeout=PAGE_CLEANUP_TIMEOUT)
                         self.log.emit(account['name']+'：发送区域诊断已保存：'+path)
                     elif op == 'login':
-                        b = await self.open(account)
-                        await b.page.bring_to_front()
+                        b = await asyncio.wait_for(self.open(account),timeout=BROWSER_OPEN_TIMEOUT)
+                        await asyncio.wait_for(b.page.bring_to_front(),timeout=PAGE_CLEANUP_TIMEOUT)
                         self.status.emit(ident,'内嵌浏览器已打开 · 请本人登录')
                 except Exception as exc:
+                    logging.getLogger('panda').exception('账号操作失败：%s',op)
                     self.log.emit('账号操作失败：'+str(exc))
-            await self.stop_cluster()
-            self.contexts.clear()
-        self.loop = None
+        finally:
+            self.ready.clear()
 
     def settings(self):
-        return {k:self.db.setting(k,v) for k,v in DEFAULTS.items()}
+        settings = {k:self.db.setting(k,v) for k,v in DEFAULTS.items()}
+        for key,default in DEFAULTS.items():
+            if type(default) is not int:
+                continue
+            lower = 0 if key=='keyword_pause_seconds' else 1
+            upper = (20 if key in ('ai_concurrency','message_concurrency') else
+                     86400 if key in ('poll_seconds','keyword_pause_seconds') else
+                     2**31-1 if key=='collection_accounts' else 1000)
+            value = settings[key]
+            settings[key] = max(lower,min(upper,value))
+            if settings[key] != value:
+                logging.getLogger('panda').warning('设置 %s 超出范围，使用 %s',key,settings[key])
+        return settings
 
     async def open(self, account):
         ident = account['id']
@@ -425,7 +527,7 @@ class Engine(QThread):
         """Own the mode until every account has stopped, including cancellation."""
         try:
             if mode == 'messages':
-                limit = max(1,min(len(accounts),int(self.db.setting('message_concurrency',3))))
+                limit = min(len(accounts),self.settings()['message_concurrency'])
                 self.sender_slots = asyncio.Semaphore(limit)
                 self.sender_pool_error = None
                 for account in accounts:
@@ -543,6 +645,8 @@ class Engine(QThread):
                 while queue:
                     item = queue.popleft()
                     try:
+                        if browser is None:
+                            browser = await self.wake_collector(account,settings)
                         if discovery:
                             result = await self.discover_source(account,browser,settings,item)
                             complete[0] = complete[0] and result
@@ -571,6 +675,14 @@ class Engine(QThread):
                             browser.s = settings
                             session[1] = browser
                         await asyncio.sleep(delay)
+                        continue
+                    if (discovery and item[0] in ('keyword','search')
+                            and int(settings.get('keyword_pause_seconds',0)) > 0):
+                        # The source checkpoint and warnings are saved before
+                        # sleeping. Stopping here must not return a done source
+                        # to another worker, or retain a live page in sessions.
+                        session[1] = browser = None
+                        await self.pause_search_account(account,settings)
             except asyncio.CancelledError:
                 sessions.pop(ident,None)
                 raise
@@ -738,7 +850,8 @@ class Engine(QThread):
             except NeedsAttention as exc:
                 complete = False
                 self.log.emit(account['name']+f'：关键词“{keyword}”视频获取失败，已跳过并继续其他来源：{exc}')
-                browser = await self.maintain_browser_memory(account,browser)
+                if int(settings.get('keyword_pause_seconds',0)) <= 0:
+                    browser = await self.maintain_browser_memory(account,browser)
                 browser.s = settings
                 continue
             except (PlaywrightError, asyncio.TimeoutError) as exc:
@@ -751,7 +864,8 @@ class Engine(QThread):
                 self.db.add_video(video,'keyword',keyword,keyword)
             self.log.emit('关键词“'+keyword+'”：近 7 天已加入待分析视频 '+str(len(videos))+' 个')
             self.changed.emit()
-            browser = await self.maintain_browser_memory(account,browser)
+            if int(settings.get('keyword_pause_seconds',0)) <= 0:
+                browser = await self.maintain_browser_memory(account,browser)
             browser.s = settings
         for row in searches:
             keyword = row['keyword']
@@ -788,7 +902,8 @@ class Engine(QThread):
                 self.changed.emit()
             # Each query is a full SPA workflow. Counting only the whole batch
             # allowed hundreds of searches to bypass the renderer recycle.
-            browser = await self.maintain_browser_memory(account,browser)
+            if int(settings.get('keyword_pause_seconds',0)) <= 0:
+                browser = await self.maintain_browser_memory(account,browser)
             browser.s = settings
         for blogger in bloggers:
             self.status.emit(account['id'],'整理视频：'+blogger['name'])
@@ -833,8 +948,16 @@ class Engine(QThread):
             pending_sources = self.db.pending_discovery_sources(sources)
             self.status.emit(ident,f'断点续跑找视频：剩余 {len(pending_sources)} 个来源')
             for source in pending_sources:
+                if b is None:
+                    b = await self.wake_collector(account,s)
                 await self.discover_source(account,b,s,source)
                 b = getattr(self,'contexts',{}).get(ident,b)
+                if source[0] in ('keyword','search') and int(s.get('keyword_pause_seconds',0)) > 0:
+                    for warning in b.warnings:
+                        self.log.emit(account['name']+'：'+warning)
+                    b.warnings.clear()
+                    b = None
+                    await self.pause_search_account(account,s)
             if not self.db.finish_video_discovery():
                 self.log.emit(account['name']+'：找视频未完成，已保存来源断点，下轮继续后再分析评论')
                 await asyncio.sleep(s['poll_seconds'])
@@ -851,6 +974,8 @@ class Engine(QThread):
             self.status.emit(ident,'本轮没有找到待分析视频')
             await asyncio.sleep(s['poll_seconds'])
             return b
+        if b is None:
+            b = await self.wake_collector(account,s)
         b = await self.scan_videos(account,b,ai,videos,s)
         for warning in b.warnings:
             self.log.emit(warning)

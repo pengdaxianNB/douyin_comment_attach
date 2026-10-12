@@ -61,6 +61,15 @@ async def detach_cdp_session(session):
         pass
 
 
+async def cancel_response_tasks(tasks):
+    """A stopped page must not wait for unfinished HTTP response bodies."""
+    pending = list(tasks)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending,return_exceptions=True)
+
+
 def customer_skip(reason):
     if reason.startswith('私密账号'):
         error = PrivateAccount
@@ -1068,7 +1077,7 @@ class Browser:
             if not is_douyin_host(parsed.hostname) or parsed.path != path:
                 return
             try:
-                p = await response.json()
+                p = await asyncio.wait_for(response.json(),timeout=SEARCH_RESPONSE_TIMEOUT)
                 if p.get('status_code',0) != 0:
                     errors.append('接口状态异常 '+str(p.get('status_code')))
                 elif key in p:
@@ -1080,6 +1089,9 @@ class Browser:
             except Exception:
                 errors.append('页面响应无法解析')
         def receive(response):
+            parsed = urlparse(response.url)
+            if not is_douyin_host(parsed.hostname) or parsed.path != path:
+                return
             task = asyncio.create_task(consume(response))
             tasks.add(task)
             task.add_done_callback(tasks.discard)
@@ -1173,8 +1185,7 @@ class Browser:
             return packets
         finally:
             self.page.remove_listener('response',receive)
-            if tasks:
-                await asyncio.gather(*list(tasks),return_exceptions=True)
+            await cancel_response_tasks(tasks)
 
     async def videos(self, uid, days):
         cutoff = time.time()-days*86400
@@ -1217,7 +1228,7 @@ class Browser:
                         and 'search' not in (parsed.path+'?'+parsed.query).lower())):
                 return
             try:
-                payload = await response.json()
+                payload = await asyncio.wait_for(response.json(),timeout=SEARCH_RESPONSE_TIMEOUT)
             except Exception:
                 return
             for video in creator_search_videos(payload):
@@ -1317,8 +1328,7 @@ class Browser:
                 await asyncio.gather(*list(tasks))
         finally:
             self.page.remove_listener('response',receive)
-            if tasks:
-                await asyncio.gather(*list(tasks),return_exceptions=True)
+            await cancel_response_tasks(tasks)
 
         cutoff = time.time()-max(1,int(days))*86400
         # The site-side “近7天” filter is authoritative when a response omits
