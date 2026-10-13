@@ -208,6 +208,39 @@ def test_requeue_all_failed_from_customer_toolbar(tmp_path,monkeypatch):
     w.close(); app.processEvents()
 
 
+def test_customer_toolbar_cannot_requeue_sent_customer(tmp_path,monkeypatch):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    uid='MS4wLjABAAAAsent_customer_1234567'
+    db.import_customers([dict(uid=uid,name='已私信客户',status='sent')])
+    w=Window(db,tmp_path,start_engine=False)
+    w.customers.selectRow(0)
+    warnings=[]
+    monkeypatch.setattr(QMessageBox,'question',lambda *args:QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(QMessageBox,'warning',lambda *args:warnings.append(args[2]))
+    w.mark('pending')
+    assert db.rows('SELECT status FROM customers')==[dict(status='sent')]
+    assert not db.rows("SELECT * FROM events WHERE kind='pending'")
+    assert warnings and '成功私信记录' in warnings[0]
+    w.close();app.processEvents()
+
+
+def test_bulk_requeue_toolbar_counts_only_eligible_failures(tmp_path,monkeypatch):
+    app=QApplication.instance() or QApplication([])
+    db=DB(tmp_path/'test.sqlite3')
+    protected='MS4wLjABAAAAprotected_customer_12345'
+    retry='MS4wLjABAAAAretry_customer_1234567'
+    db.import_customers([dict(uid=protected,status='failed'),dict(uid=retry,status='failed')])
+    db.execute("INSERT INTO events(uid,kind) VALUES (?,'sent')",(protected,))
+    w=Window(db,tmp_path,start_engine=False)
+    questions=[]
+    monkeypatch.setattr(QMessageBox,'question',lambda *args:(questions.append(args[2]) or QMessageBox.StandardButton.Yes))
+    w.requeue_failed()
+    assert questions and '全部 1 位失败客户' in questions[0] and '自动排除' in questions[0]
+    assert {r['uid']:r['status'] for r in db.rows('SELECT uid,status FROM customers')}=={protected:'sent',retry:'pending'}
+    w.close();app.processEvents()
+
+
 def test_clear_video_list_button_forces_source_rebuild(tmp_path,monkeypatch):
     app=QApplication.instance() or QApplication([])
     db=DB(tmp_path/'test.sqlite3')

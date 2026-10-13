@@ -130,7 +130,7 @@ class CoreTests(unittest.TestCase):
             dict(uid=second,status='failed',message='另一条文案'),
             dict(uid=third,status='sent'),
         ])
-        self.db.execute("UPDATE customers SET error='发送失败',sent_at='2026-09-01' WHERE status='failed'")
+        self.db.execute("UPDATE customers SET error='发送失败' WHERE status='failed'")
         self.assertEqual(self.db.requeue_failed(),2)
         rows={r['uid']:r for r in self.db.rows('SELECT uid,status,message,error,sent_at FROM customers')}
         self.assertEqual(rows[UID],dict(uid=UID,status='pending',message='已生成文案',error='',sent_at=''))

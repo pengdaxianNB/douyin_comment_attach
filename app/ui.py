@@ -744,7 +744,7 @@ class Window(QMainWindow):
                 description = f'清空“{self.data_kind.currentText()}”的全部记录（不受搜索条件限制）'
             note = '账号、博主和 AI 配置保留。'
             if kind=='comments': note += '客户和发送状态保留；已删除评论下轮可能重新分析。'
-            elif kind=='customers': note += '评论去重记录保留；旧评论不会自动重新分析，新评论仍可能使客户再次入队。'
+            elif kind=='customers': note += '评论和成功私信历史保留；旧评论不会自动重新分析。新评论可能使未发送客户再次入队，有成功私信历史的客户仍不会重新排队。'
             elif kind=='events': note += '评论、客户和发送状态保留。'
             else: note += '再次监控可能重新发现并联系这些客户。'
             if QMessageBox.question(self,'确认删除',description+'？\n\n'+note+'\n\n操作前自动备份数据库。')!=QMessageBox.StandardButton.Yes:return
@@ -1118,19 +1118,19 @@ class Window(QMainWindow):
             r=self.selected(self.customers,self.customer_rows)
             if r['status']=='processing':raise ValueError('客户正在处理中')
             if QMessageBox.question(self,'确认状态','确认将该客户标记为'+STATUS[status]+'？')!=QMessageBox.StandardButton.Yes:return
-            self.db.execute("UPDATE customers SET status=?,error='',sent_at=CASE WHEN ?='sent' THEN datetime('now') ELSE '' END WHERE uid=?",(status,status,r['uid']))
-            self.db.execute('INSERT INTO events(uid,kind,detail) VALUES (?,?,?)',(r['uid'],status,'人工核验调整状态')); self.refresh_customers()
+            self.db.mark_customer(r['uid'],status)
+            self.refresh_customers()
         self.report(action)
 
     def requeue_failed(self):
         def action():
             if self.engine.busy(): raise ValueError('批量重新排队前请先停止任务')
-            count = self.db.rows("SELECT count(*) n FROM customers WHERE status='failed'")[0]['n']
+            count = self.db.failed_requeue_count()
             if not count:
-                self.statusBar().showMessage('当前没有失败客户',5000)
+                self.statusBar().showMessage('当前没有可重新排队的失败客户；已有成功私信记录的客户不会重新排队',5000)
                 return
             warning = (f'确认将全部 {count} 位失败客户重新排队？\n\n'
-                       '其中可能包含发送结果不明的客户。请先在对应账号的聊天记录中核对，避免重复私信。')
+                       '已有成功私信记录的客户自动排除。其余客户可能包含发送结果不明的情况，请先在对应账号的聊天记录中核对，避免重复私信。')
             if QMessageBox.question(self,'批量重新排队',warning)!=QMessageBox.StandardButton.Yes:return
             queued = self.db.requeue_failed()
             self.refresh_customers()

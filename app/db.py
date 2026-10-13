@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import re
@@ -22,6 +23,19 @@ def user_id(value):
 
 
 WORK_KINDS = ('video','note')
+SENT_EVIDENCE = """(customers.status='sent' OR COALESCE(customers.sent_at,'')<>''
+    OR EXISTS (SELECT 1 FROM events WHERE events.uid=customers.uid AND events.kind='sent'))"""
+
+
+def comment_timestamp(value):
+    """Compare instants; imported times without a zone are Beijing local time."""
+    try:
+        parsed = datetime.fromisoformat(str(value or '').strip().replace('Z','+00:00'))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone(timedelta(hours=8)))
+        return parsed.timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
 
 
 def work_url(ident, kind='video'):
@@ -114,7 +128,11 @@ class DB:
             c.execute('CREATE INDEX IF NOT EXISTS customers_status_updated ON customers(status,updated)')
             c.execute('CREATE INDEX IF NOT EXISTS customers_updated ON customers(updated)')
             c.execute('CREATE INDEX IF NOT EXISTS events_account_kind_at_uid ON events(account_id,kind,at,uid)')
+            c.execute('CREATE INDEX IF NOT EXISTS events_uid_kind ON events(uid,kind)')
+            c.execute('CREATE INDEX IF NOT EXISTS comments_uid_target ON comments(uid,target)')
             c.execute("UPDATE customers SET status='failed',error=CASE WHEN error='' THEN '历史待核验记录，发送结果不明，请勿重复联系' ELSE error END WHERE status='uncertain'")
+            self._restore_sent_customers(c)
+            self._restore_latest_comments(c)
             # An interrupted comment scan is safe to retry: comments are
             # deduplicated by cid and no outbound message is sent here.
             c.execute("UPDATE videos SET status='pending',error='' WHERE status='scanning'")
@@ -123,6 +141,7 @@ class DB:
     def connect(self):
         c = sqlite3.connect(self.path, timeout=20)
         c.row_factory = sqlite3.Row
+        c.create_function('comment_timestamp',1,comment_timestamp,deterministic=True)
         try:
             with c:
                 yield c
@@ -367,8 +386,42 @@ class DB:
             inserted = c.execute('INSERT OR IGNORE INTO comments VALUES (?,?,?,?,?,?,?,?,?,?)', (comment['id'],uid,comment['name'],comment['text'],comment['comment_time'],comment['video_id'],comment['video_title'],comment['blogger'],int(target),reason)).rowcount
             if target and inserted:
                 c.execute('''INSERT INTO customers(uid,name,text,comment_time,video_title,blogger,url,updated) VALUES (?,?,?,?,?,?,?,?)
-                ON CONFLICT(uid) DO UPDATE SET name=excluded.name,text=excluded.text,comment_time=excluded.comment_time,video_title=excluded.video_title,blogger=excluded.blogger,updated=excluded.updated WHERE customers.status='pending' ''', (uid,comment['name'],comment['text'],comment['comment_time'],comment['video_title'],comment['blogger'],'https://www.douyin.com/user/'+uid,time.time()))
+                ON CONFLICT(uid) DO UPDATE SET name=excluded.name,text=excluded.text,comment_time=excluded.comment_time,video_title=excluded.video_title,blogger=excluded.blogger,updated=excluded.updated
+                WHERE customers.status='pending'
+                  AND comment_timestamp(excluded.comment_time) IS NOT NULL
+                  AND (comment_timestamp(customers.comment_time) IS NULL
+                       OR comment_timestamp(excluded.comment_time)>comment_timestamp(customers.comment_time))
+                ''', (uid,comment['name'],comment['text'],comment['comment_time'],comment['video_title'],comment['blogger'],'https://www.douyin.com/user/'+uid,time.time()))
+                self._restore_sent_customers(c,uid)
         return bool(inserted)
+
+    @staticmethod
+    def _restore_sent_customers(c, uid=None):
+        """Repair legacy downgraded rows using durable success evidence."""
+        scope = ' AND uid=?' if uid is not None else ''
+        c.execute(f"""UPDATE customers SET status='sent',error='',
+            sent_at=CASE WHEN COALESCE(sent_at,'')<>'' THEN sent_at ELSE
+                COALESCE((SELECT max(at) FROM events WHERE events.uid=customers.uid
+                          AND kind='sent'),'') END
+            WHERE status<>'sent' AND {SENT_EVIDENCE}{scope}""",
+            (uid,) if uid is not None else ())
+
+    @staticmethod
+    def _restore_latest_comments(c):
+        """Repair pending material already overwritten by an older AI result."""
+        newer = c.execute('''WITH ranked AS (
+            SELECT co.*,row_number() OVER (
+                PARTITION BY co.uid ORDER BY comment_timestamp(co.comment_time) DESC,co.rowid) AS rank
+            FROM comments co JOIN customers cu ON cu.uid=co.uid
+            WHERE cu.status='pending' AND co.target=1
+              AND comment_timestamp(co.comment_time) IS NOT NULL
+              AND (comment_timestamp(cu.comment_time) IS NULL
+                   OR comment_timestamp(co.comment_time)>comment_timestamp(cu.comment_time))
+        ) SELECT * FROM ranked WHERE rank=1''').fetchall()
+        # Retain queue position and saved drafts; only repair the source material.
+        c.executemany('''UPDATE customers SET name=?,text=?,comment_time=?,video_title=?,blogger=?
+            WHERE uid=? AND status='pending' ''',
+            [(r['name'],r['text'],r['comment_time'],r['video_title'],r['blogger'],r['uid']) for r in newer])
 
     def claim(self, account):
         with self.connect() as c:
@@ -380,7 +433,7 @@ class DB:
                       AND date(at,'+8 hours')=date('now','+8 hours')''',(account,)).fetchone()[0]
                 if used>=int(sender['daily_limit']):
                     return None
-            r = c.execute("SELECT * FROM customers WHERE status='pending' ORDER BY updated LIMIT 1").fetchone()
+            r = c.execute(f"SELECT * FROM customers WHERE status='pending' AND NOT {SENT_EVIDENCE} ORDER BY updated LIMIT 1").fetchone()
             if r is None:
                 return None
             c.execute("UPDATE customers SET status='processing',account_id=?,updated=? WHERE uid=?", (account,time.time(),r['uid']))
@@ -388,8 +441,14 @@ class DB:
 
     def finish(self, uid, account, status, message='', error=''):
         with self.connect() as c:
-            c.execute("UPDATE customers SET status=?,message=?,error=?,sent_at=CASE WHEN ?='sent' THEN datetime('now') ELSE sent_at END,updated=? WHERE uid=? AND account_id=?", (status,message,error,status,time.time(),uid,account))
+            changed = c.execute(f"""UPDATE customers SET status=?,message=?,error=?,
+                sent_at=CASE WHEN ?='sent' THEN datetime('now') ELSE sent_at END,updated=?
+                WHERE uid=? AND account_id=? AND status='processing' AND NOT {SENT_EVIDENCE}""",
+                (status,message,error,status,time.time(),uid,account)).rowcount
+            if not changed:
+                return False
             c.execute('INSERT INTO events(account_id,uid,kind,detail) VALUES (?,?,?,?)',(account,uid,status,error or message))
+            return True
 
     def start_send(self, uid, account, message):
         """在点击发送前原子记录一次可能消耗当日额度的提交。"""
@@ -401,18 +460,46 @@ class DB:
             # processing until the send call reports its final outcome.
             # recover() turns any processing row left by an application crash
             # into a failure before work can resume.
-            c.execute("UPDATE customers SET status='processing',message=?,error='',updated=? WHERE uid=? AND account_id=?",
-                      (message,time.time(),uid,account))
+            changed = c.execute(f"""UPDATE customers SET message=?,error='',updated=?
+                WHERE uid=? AND account_id=? AND status='processing' AND NOT {SENT_EVIDENCE}""",
+                (message,time.time(),uid,account)).rowcount
+            if not changed:
+                raise ValueError('客户已私信或不再由该账号处理，已阻止提交发送')
             c.execute("INSERT INTO events(account_id,uid,kind,detail) VALUES (?,?,'send_attempt',?)",
                       (account,uid,detail))
 
     def recover(self):
-        self.execute("UPDATE customers SET status='failed',error='应用退出前任务未完成，发送结果不明，请勿重复联系' WHERE status='processing'")
-
-    def requeue_failed(self):
-        """将当前所有失败客户原子性地放回等待队列。"""
         with self.connect() as c:
             c.execute('BEGIN IMMEDIATE')
+            self._restore_sent_customers(c)
+            c.execute("UPDATE customers SET status='failed',error='应用退出前任务未完成，发送结果不明，请勿重复联系' WHERE status='processing'")
+
+    def mark_customer(self, uid, status):
+        """Apply manual status changes atomically without undoing a success."""
+        if status not in ('pending','sent','skipped'):
+            raise ValueError('不支持的人工客户状态')
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute(f'SELECT status,{SENT_EVIDENCE} AS sent FROM customers WHERE uid=?',(uid,)).fetchone()
+            if not row:
+                raise ValueError('客户记录不存在')
+            if row['status']=='processing':
+                raise ValueError('客户正在处理中')
+            if row['sent'] and status!='sent':
+                raise ValueError('该客户已有成功私信记录，不能重新排队或改为其他状态')
+            c.execute("""UPDATE customers SET status=?,error='',updated=?,
+                sent_at=CASE WHEN ?='sent' AND COALESCE(sent_at,'')='' THEN datetime('now') ELSE sent_at END
+                WHERE uid=?""",(status,time.time(),status,uid))
+            c.execute('INSERT INTO events(uid,kind,detail) VALUES (?,?,?)',(uid,status,'人工核验调整状态'))
+
+    def failed_requeue_count(self):
+        return self.rows(f"SELECT count(*) n FROM customers WHERE status='failed' AND NOT {SENT_EVIDENCE}")[0]['n']
+
+    def requeue_failed(self):
+        """将没有成功发送记录的失败客户原子性地放回等待队列。"""
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            self._restore_sent_customers(c)
             failed = c.execute("SELECT uid FROM customers WHERE status='failed'").fetchall()
             if not failed:
                 return 0
@@ -445,11 +532,13 @@ class DB:
             status = r.get('status','pending')
             if status not in ('pending','sent','failed','skipped'):
                 status = 'failed'
-            checked.append((uid,*[str(r.get(k,'') or '') for k in ('name','text','comment_time','video_title','blogger')],'https://www.douyin.com/user/'+uid,status,str(r.get('message','')),str(r.get('sent_at','')),time.time()))
+            checked.append((uid,*[str(r.get(k,'') or '') for k in ('name','text','comment_time','video_title','blogger')],'https://www.douyin.com/user/'+uid,status,str(r.get('message','') or ''),str(r.get('sent_at','') or ''),time.time()))
         with self.connect() as c:
             before = c.total_changes
             c.executemany('INSERT OR IGNORE INTO customers(uid,name,text,comment_time,video_title,blogger,url,status,message,sent_at,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?)', checked)
-            return c.total_changes-before
+            added = c.total_changes-before
+            self._restore_sent_customers(c)
+            return added
 
     def backup(self, path):
         dst = sqlite3.connect(path)
