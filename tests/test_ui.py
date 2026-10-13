@@ -397,10 +397,10 @@ def test_account_table_shows_today_sent_count_and_limit(tmp_path):
                (account_id,'MS4wLjABAAAAtoday_customer_1234567'))
     w=Window(db,tmp_path,start_engine=False)
 
-    assert w.accounts.item(0,2).text()=='1 / 10'
+    assert w.accounts.item(0,3).text()=='1 / 10'
     db.execute("UPDATE events SET at=datetime('now','-1 day') WHERE account_id=?",(account_id,))
     w.refresh_accounts()
-    assert w.accounts.item(0,2).text()=='0 / 10'
+    assert w.accounts.item(0,3).text()=='0 / 10'
     w.close();app.processEvents()
 
 

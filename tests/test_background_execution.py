@@ -37,19 +37,17 @@ def test_cdp_background_lifecycle_and_focus_are_enabled():
     session.detach.assert_awaited_once()
 
 
-def test_completed_page_is_unloaded_and_chromium_heap_is_collected():
-    session=Mock(send=AsyncMock(),detach=AsyncMock())
-    page=Mock(goto=AsyncMock())
-    context=Mock(new_cdp_session=AsyncMock(return_value=session))
+def test_completed_page_stays_on_personal_page_without_heap_collection():
+    from app.constants import IDLE_URL
+    page=Mock(url='https://www.douyin.com/video/123',goto=AsyncMock())
+    context=Mock(new_cdp_session=AsyncMock())
     browser=Browser(context,{},page=page)
-
-    asyncio.run(browser.release_page_memory())
-
-    page.goto.assert_awaited_once_with(
-        'about:blank',wait_until='commit',timeout=10000)
-    assert [call.args[0] for call in session.send.await_args_list]==[
-        'Page.resetNavigationHistory','HeapProfiler.collectGarbage']
-    session.detach.assert_awaited_once()
+    asyncio.run(browser.go_idle())
+    page.goto.assert_awaited_once_with(IDLE_URL,wait_until='commit',timeout=10000)
+    context.new_cdp_session.assert_not_awaited()
+    page.url=IDLE_URL
+    asyncio.run(browser.go_idle())
+    assert page.goto.await_count==1
 
 
 def test_unselected_account_stays_mounted_behind_other_app_tabs(tmp_path):

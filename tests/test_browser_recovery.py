@@ -7,7 +7,7 @@ import pytest
 
 from app.browser import AccountNeedsAttention, Browser, SearchPageUnavailable
 from app.db import DB
-from app.engine import Engine, BROWSER_REBUILD_ATTEMPTS, PAGE_RECYCLE_OPERATIONS
+from app.engine import Engine, BROWSER_REBUILD_ATTEMPTS
 from playwright.async_api import Error as PlaywrightError
 
 
@@ -21,7 +21,7 @@ def test_search_rebuild_retries_current_keyword_before_next(tmp_path,error):
     good={'aweme_id':'1234567890123456789','desc':'结果','author':{}}
     frozen=SimpleNamespace(search_videos=AsyncMock(side_effect=error),warnings=[])
     fresh=SimpleNamespace(search_videos=AsyncMock(side_effect=[[good],[]]),
-                          release_page_memory=AsyncMock(),warnings=[],s=None)
+                          go_idle=AsyncMock(),warnings=[],s=None)
     engine=Engine(db,tmp_path)
     engine.rebuild_browser=AsyncMock(return_value=fresh)
     logs=[];engine.log.connect(logs.append)
@@ -31,7 +31,7 @@ def test_search_rebuild_retries_current_keyword_before_next(tmp_path,error):
     engine.rebuild_browser.assert_awaited_once_with(account)
     assert [call.args for call in fresh.search_videos.await_args_list] == [('当前词',),('下一个词',)]
     assert fresh.s is settings
-    assert fresh.release_page_memory.await_count == 2
+    assert fresh.go_idle.await_count == 2
     assert [row['id'] for row in db.video_tasks()] == [good['aweme_id']]
     assert any('重试当前词' in line for line in logs)
 
@@ -42,7 +42,7 @@ def test_repeated_search_loading_failure_is_bounded_and_next_source_runs(tmp_pat
     frozen=SimpleNamespace(search_videos=AsyncMock(side_effect=SearchPageUnavailable('卡住')))
     good={'aweme_id':'1234567890123456789','desc':'结果','author':{}}
     fresh=SimpleNamespace(search_videos=AsyncMock(side_effect=[SearchPageUnavailable('仍卡住'),[good]]),
-                          release_page_memory=AsyncMock(),s=None,warnings=[])
+                          go_idle=AsyncMock(),s=None,warnings=[])
     engine=Engine(db,tmp_path)
     engine.rebuild_browser=AsyncMock(return_value=fresh)
 
@@ -52,14 +52,14 @@ def test_repeated_search_loading_failure_is_bounded_and_next_source_runs(tmp_pat
     assert frozen.search_videos.await_count == 1
     assert [call.args[0] for call in fresh.search_videos.await_args_list] == ['坏词','好词']
     assert [row['id'] for row in db.video_tasks()] == [good['aweme_id']]
-    assert fresh.release_page_memory.await_count == 2
+    assert fresh.go_idle.await_count == 2
 
 
 @pytest.mark.parametrize('error',[AccountNeedsAttention('请完成安全验证'),asyncio.CancelledError()])
 def test_search_discovery_does_not_rebuild_on_account_prompt_or_user_stop(tmp_path,error):
     db=DB(tmp_path/'test.sqlite3')
     db.execute("INSERT INTO search_keywords(keyword) VALUES ('测试词')")
-    browser=SimpleNamespace(search_videos=AsyncMock(side_effect=error),release_page_memory=AsyncMock())
+    browser=SimpleNamespace(search_videos=AsyncMock(side_effect=error),go_idle=AsyncMock())
     engine=Engine(db,tmp_path)
     engine.rebuild_browser=AsyncMock()
 
@@ -67,41 +67,31 @@ def test_search_discovery_does_not_rebuild_on_account_prompt_or_user_stop(tmp_pa
         asyncio.run(engine.rebuild_video_list({'id':'main','name':'主号'},browser,{'days':7}))
 
     engine.rebuild_browser.assert_not_awaited()
-    browser.release_page_memory.assert_not_awaited()
+    browser.go_idle.assert_not_awaited()
 
 
-def test_search_batch_recycles_before_next_keyword_and_uses_new_browser(tmp_path):
+def test_search_batch_retains_browser_beyond_former_recycle_period(tmp_path):
     db=DB(tmp_path/'test.sqlite3')
-    keywords=[f'词{i}' for i in range(PAGE_RECYCLE_OPERATIONS+2)]
+    keywords=[f'词{i}' for i in range(25)]
     for keyword in keywords:
         db.execute('INSERT INTO search_keywords(keyword) VALUES (?)',(keyword,))
-    frozen=SimpleNamespace(search_videos=AsyncMock(return_value=[]),
-                           release_page_memory=AsyncMock(),warnings=[])
-    fresh=SimpleNamespace(search_videos=AsyncMock(return_value=[]),
-                          release_page_memory=AsyncMock(),warnings=[],s=None)
+    browser=SimpleNamespace(search_videos=AsyncMock(return_value=[]),
+                            go_idle=AsyncMock(),warnings=[])
     engine=Engine(db,tmp_path)
-    engine.contexts={'main':frozen}
-    boundaries=[]
-    async def rebuild(account,memory_cleanup=False):
-        boundaries.append((frozen.search_videos.await_count,memory_cleanup))
-        engine.page_operations[account['id']]=0
-        engine.contexts[account['id']]=fresh
-        return fresh
-    engine.rebuild_browser=AsyncMock(side_effect=rebuild)
-
-    assert asyncio.run(engine.rebuild_video_list({'id':'main','name':'主号'},frozen,{'days':7})) is True
-
-    assert boundaries == [(PAGE_RECYCLE_OPERATIONS,True)]
-    assert frozen.release_page_memory.await_count == PAGE_RECYCLE_OPERATIONS-1
-    assert [call.args[0] for call in fresh.search_videos.await_args_list] == keywords[-2:]
-    assert engine.contexts['main'] is fresh
+    engine.contexts={'main':browser}
+    engine.rebuild_browser=AsyncMock()
+    assert asyncio.run(engine.rebuild_video_list({'id':'main','name':'主号'},browser,{'days':7}))
+    assert [call.args[0] for call in browser.search_videos.await_args_list]==keywords
+    assert browser.go_idle.await_count==25
+    assert engine.contexts['main'] is browser
+    engine.rebuild_browser.assert_not_awaited()
 
 
 def test_partial_search_results_remain_usable_but_list_requires_retry(tmp_path):
     db=DB(tmp_path/'test.sqlite3')
     db.execute("INSERT INTO search_keywords(keyword) VALUES ('测试词')")
     good={'aweme_id':'1234567890123456789','desc':'结果','author':{}}
-    browser=SimpleNamespace(warnings=[],release_page_memory=AsyncMock())
+    browser=SimpleNamespace(warnings=[],go_idle=AsyncMock())
     async def search(keyword):
         browser.warnings.append('搜索未完成，本轮覆盖可能不完整')
         return [good]
@@ -112,7 +102,7 @@ def test_partial_search_results_remain_usable_but_list_requires_retry(tmp_path):
     assert [row['id'] for row in db.video_tasks()] == [good['aweme_id']]
 
 
-def test_hung_cleanup_is_cancelled_and_browser_rebuilt(tmp_path,monkeypatch):
+def test_hung_idle_navigation_is_cancelled_without_rebuilding(tmp_path,monkeypatch):
     engine = Engine(SimpleNamespace(),tmp_path)
     cancelled = []
 
@@ -122,41 +112,30 @@ def test_hung_cleanup_is_cancelled_and_browser_rebuilt(tmp_path,monkeypatch):
         finally:
             cancelled.append(True)
 
-    browser = SimpleNamespace(release_page_memory=hang)
+    browser = SimpleNamespace(go_idle=hang)
     fresh = SimpleNamespace()
     engine.rebuild_browser = AsyncMock(return_value=fresh)
     monkeypatch.setattr('app.engine.PAGE_CLEANUP_TIMEOUT',0.01)
     account = {'id':'sender','name':'从号'}
 
-    result = asyncio.run(engine.maintain_browser_memory(account,browser))
+    result = asyncio.run(engine.idle_browser(account,browser))
 
     assert cancelled == [True]
-    assert result is fresh
-    engine.rebuild_browser.assert_awaited_once_with(account)
+    assert result is browser
+    engine.rebuild_browser.assert_not_awaited()
 
 
-def test_hung_heap_collection_and_session_detach_cannot_block_recovery(tmp_path,monkeypatch):
+def test_idle_navigation_does_not_open_memory_collection_session(tmp_path):
+    from app.constants import IDLE_URL
     engine = Engine(SimpleNamespace(),tmp_path)
-    page = SimpleNamespace(goto=AsyncMock())
-
-    async def hang(*args):
-        await asyncio.Event().wait()
-
-    session = SimpleNamespace(send=AsyncMock(side_effect=hang),detach=AsyncMock(side_effect=hang))
-    context = SimpleNamespace(new_cdp_session=AsyncMock(return_value=session))
+    page = SimpleNamespace(url='https://www.douyin.com/video/123',goto=AsyncMock())
+    context = SimpleNamespace(new_cdp_session=AsyncMock())
     browser = Browser(context,{},page=page)
-    fresh = object()
-    engine.rebuild_browser = AsyncMock(return_value=fresh)
-    monkeypatch.setattr('app.engine.PAGE_CLEANUP_TIMEOUT',0.01)
-
-    async def run():
-        return await asyncio.wait_for(engine.maintain_browser_memory(
-            {'id':'sender','name':'从号'},browser),timeout=2)
-
-    assert asyncio.run(run()) is fresh
-    page.goto.assert_awaited_once_with('about:blank',wait_until='commit',timeout=10000)
-    session.detach.assert_awaited_once()
-    engine.rebuild_browser.assert_awaited_once()
+    engine.rebuild_browser = AsyncMock()
+    assert asyncio.run(engine.idle_browser({'id':'sender','name':'从号'},browser)) is browser
+    page.goto.assert_awaited_once_with(IDLE_URL,wait_until='commit',timeout=10000)
+    context.new_cdp_session.assert_not_awaited()
+    engine.rebuild_browser.assert_not_awaited()
 
 
 def test_user_stop_during_cleanup_does_not_trigger_rebuild(tmp_path):
@@ -170,8 +149,8 @@ def test_user_stop_during_cleanup_does_not_trigger_rebuild(tmp_path):
     engine.rebuild_browser = AsyncMock()
 
     async def run():
-        task = asyncio.create_task(engine.maintain_browser_memory(
-            {'id':'sender','name':'从号'},SimpleNamespace(release_page_memory=hang)))
+        task = asyncio.create_task(engine.idle_browser(
+            {'id':'sender','name':'从号'},SimpleNamespace(go_idle=hang)))
         await started.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -254,7 +233,7 @@ def test_page_binding_waits_for_gui_to_register_new_target(tmp_path):
 
 
 @pytest.mark.parametrize('recovery_error',[AccountNeedsAttention('重建失败'),asyncio.CancelledError()])
-def test_completed_send_is_preserved_when_periodic_rebuild_fails(tmp_path,recovery_error):
+def test_completed_send_is_preserved_when_idle_navigation_fails(tmp_path,recovery_error):
     db = DB(tmp_path/'test.sqlite3')
     ident = db.account('从号')
     uid = 'MS4wLjABAAAArecovery_customer_123456'
@@ -262,7 +241,6 @@ def test_completed_send_is_preserved_when_periodic_rebuild_fails(tmp_path,recove
     db.import_customers([{'uid':uid,'name':'客户'}])
     engine = Engine(db,tmp_path)
     engine.jobs = {}
-    engine.page_operations[ident] = PAGE_RECYCLE_OPERATIONS-1
     browser = AsyncMock()
 
     async def send(customer,message,before_click):
@@ -270,13 +248,12 @@ def test_completed_send_is_preserved_when_periodic_rebuild_fails(tmp_path,recove
 
     browser.send.side_effect = send
     engine.open = AsyncMock(return_value=browser)
-    engine.rebuild_browser = AsyncMock(side_effect=recovery_error)
-    with patch('app.engine.get_key',return_value='key'),patch('app.engine.AI') as ai:
+    browser.go_idle.side_effect = recovery_error
+    engine.rebuild_browser = AsyncMock()
+    with patch('app.engine.get_key',return_value='key'),patch('app.engine.AI') as ai, \
+         patch('app.engine.asyncio.sleep',side_effect=asyncio.CancelledError):
         ai.return_value.message = AsyncMock(return_value='你好')
-        if isinstance(recovery_error,asyncio.CancelledError):
-            with pytest.raises(asyncio.CancelledError):
-                asyncio.run(engine.work({'id':ident,'role':'sender','name':'从号'}))
-        else:
+        with pytest.raises(asyncio.CancelledError):
             asyncio.run(engine.work({'id':ident,'role':'sender','name':'从号'}))
 
     assert db.rows('SELECT status,message,error FROM customers')[0] == {
@@ -285,7 +262,7 @@ def test_completed_send_is_preserved_when_periodic_rebuild_fails(tmp_path,recove
     browser.send.assert_awaited_once()
 
 
-def test_sender_processes_next_customer_after_cleanup_recovery(tmp_path,monkeypatch):
+def test_sender_processes_next_customer_after_failed_idle_navigation(tmp_path,monkeypatch):
     db = DB(tmp_path/'test.sqlite3')
     ident = db.account('从号')
     uids = ['MS4wLjABAAAArecovery_customer_123456','MS4wLjABAAAAnext_customer_1234567890']
@@ -304,7 +281,7 @@ def test_sender_processes_next_customer_after_cleanup_recovery(tmp_path,monkeypa
     async def send(customer,message,before_click):
         before_click()
 
-    frozen.release_page_memory.side_effect = hang
+    frozen.go_idle.side_effect = hang
     frozen.send.side_effect = send
     fresh.send.side_effect = send
     engine.open = AsyncMock(return_value=frozen)
@@ -318,7 +295,7 @@ def test_sender_processes_next_customer_after_cleanup_recovery(tmp_path,monkeypa
 
     assert {row['uid']:row['status'] for row in db.rows('SELECT uid,status FROM customers')} == {
         uid:'sent' for uid in uids}
-    assert frozen.send.await_args.args[0]['uid'] == uids[0]
-    assert fresh.send.await_args.args[0]['uid'] == uids[1]
+    assert [call.args[0]['uid'] for call in frozen.send.await_args_list] == uids
+    fresh.send.assert_not_awaited()
     assert len(db.rows("SELECT 1 FROM events WHERE kind='send_attempt'")) == 2
-    engine.rebuild_browser.assert_awaited_once()
+    engine.rebuild_browser.assert_not_awaited()

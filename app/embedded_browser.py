@@ -10,6 +10,9 @@ from PySide6.QtWidgets import (QHBoxLayout, QLabel, QLineEdit, QPushButton, QSta
 from shiboken6 import delete as delete_qt_object, isValid
 
 
+from .constants import IDLE_URL
+
+
 MARKER_PREFIX = 'panda-embedded-account:'
 _PAGE_IDS = {}
 _PAGE_IDS_LOCK = threading.Lock()
@@ -112,7 +115,7 @@ class EmbeddedBrowser(QWidget):
         toolbar.addWidget(self.address, 1)
         self.task_status = QLabel('账号任务状态：等待操作')
         self.task_status.setWordWrap(True)
-        self.task_status.setToolTip('搜索后暂停和私信等待时页面会休眠并释放内存；采集任务清理后可能显示 about:blank。请结合任务状态判断。')
+        self.task_status.setToolTip('搜索、评论采集和私信任务空闲时保留账号页面并停留个人页。请结合任务状态判断。')
         root.addWidget(self.task_status)
         self.sleep_hint = QLabel('账号页面已休眠，轮到此账号时自动加载。登录资料保留。')
         self.sleep_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -120,6 +123,12 @@ class EmbeddedBrowser(QWidget):
         self.set_navigation_enabled(False)
         if activate:
             self.reset_page()
+
+    def park_page(self):
+        """Retain the renderer and login profile while waiting for work."""
+        self.resume_page()
+        if self.view is not None and self.view.url().toString() != IDLE_URL:
+            self.navigate(IDLE_URL)
 
     def suspend_page(self):
         """Destroy the renderer instead of retaining an active blank page."""

@@ -25,42 +25,47 @@ def pool(tmp_path, count=10, customers=20):
     return db,engine,accounts
 
 
-def test_ten_accounts_share_three_slots_and_release_before_cooldown(tmp_path):
+def test_ten_accounts_share_three_slots_and_keep_pages_during_cooldown(tmp_path):
     db,engine,accounts = pool(tmp_path)
-    live = set(); peak = 0; sent = []; turns = Counter()
-    real_sleep = asyncio.sleep
-    async def control(ident,operation):
-        nonlocal peak
-        if operation in ('wake','reset'):
-            live.add(ident); peak = max(peak,len(live))
-        else:
-            live.discard(ident)
-        await real_sleep(0)
+    active=set(); peak=0; sent=[]; turns=Counter(); browsers={}
+    real_sleep=asyncio.sleep
     async def opened(account):
+        ident=account['id']
+        if ident in browsers:
+            return browsers[ident]
+        async def check(customer):
+            nonlocal peak
+            active.add(ident); peak=max(peak,len(active))
+            await real_sleep(0)
         async def send(customer,message,before_click):
             before_click(); await real_sleep(0)
-            sent.append(customer['uid']); turns[account['id']] += 1
-        return SimpleNamespace(s=None,check_reachable=AsyncMock(),send=send)
+            sent.append(customer['uid']); turns[ident]+=1
+        async def idle():
+            active.discard(ident)
+            await real_sleep(0)
+        browser=SimpleNamespace(s=None,check_reachable=check,send=send,go_idle=AsyncMock(side_effect=idle))
+        browsers[ident]=engine.contexts[ident]=browser
+        return browser
     async def cooldown(seconds):
-        # Awaited by the worker only after its page is released.
-        if seconds == 120:
-            current = asyncio.current_task()
-            ident = next(i for i,t in engine.jobs.items() if t is current)
-            assert ident not in live and ident not in engine.contexts
-            if turns[ident] >= 2:
+        if seconds==120:
+            ident=next(i for i,t in engine.jobs.items() if t is asyncio.current_task())
+            assert ident not in active and engine.contexts[ident] is browsers[ident]
+            if turns[ident]>=2:
                 raise asyncio.CancelledError
         await real_sleep(0)
-    engine.change_browser_state = control; engine.open = opened
+    engine.change_browser_state=AsyncMock(); engine.open=opened
+    engine.rebuild_browser=AsyncMock()
     with patch('app.engine.get_key',return_value='key'),patch('app.engine.AI') as ai, \
          patch('app.engine.asyncio.sleep',side_effect=cooldown):
-        ai.return_value.message = AsyncMock(return_value='本地测试')
+        ai.return_value.message=AsyncMock(return_value='本地测试')
         asyncio.run(asyncio.wait_for(engine.run_cluster(accounts,'messages'),timeout=3))
-    assert peak == 3 and not live
-    assert set(turns) == {a['id'] for a in accounts}
-    assert set(turns.values()) == {2}
-    assert len(sent) == len(set(sent)) == 20
-    assert not engine.contexts and not engine.jobs and not engine.running_accounts
+    assert peak==3 and not active
+    assert set(turns)=={a['id'] for a in accounts} and set(turns.values())=={2}
+    assert len(sent)==len(set(sent))==20
+    assert len(engine.contexts)==10 and not engine.jobs and not engine.running_accounts
+    assert all(b.go_idle.await_count==2 for b in browsers.values())
     assert all(r['status']=='sent' for r in db.rows('SELECT status FROM customers'))
+    engine.rebuild_browser.assert_not_awaited()
 
 
 @pytest.mark.parametrize('limited',[False,True])
@@ -76,12 +81,12 @@ def test_waiting_for_customers_or_quota_never_opens_page(tmp_path,limited):
          patch('app.engine.asyncio.sleep',side_effect=asyncio.CancelledError):
         asyncio.run(engine.run_cluster(accounts,'messages'))
     engine.open.assert_not_awaited()
-    assert all(c.args[1]=='park' for c in engine.change_browser_state.await_args_list)
+    engine.change_browser_state.assert_not_awaited()
     assert not engine.jobs
 
 
 @pytest.mark.parametrize('submitted',[False,True])
-def test_cancel_active_and_queued_accounts_releases_pages_and_preserves_send_state(tmp_path,submitted):
+def test_cancel_active_and_queued_accounts_preserves_pages_and_send_state(tmp_path,submitted):
     db,engine,accounts = pool(tmp_path,count=4,customers=4)
     db.save_settings({'message_concurrency':1})
     live = set(); entered = asyncio.Event()
@@ -92,7 +97,11 @@ def test_cancel_active_and_queued_accounts_releases_pages_and_preserves_send_sta
         if submitted: before_click()
         entered.set(); await asyncio.Future()
     engine.change_browser_state = control
-    engine.open = AsyncMock(return_value=SimpleNamespace(s=None,check_reachable=AsyncMock(),send=send))
+    browser=SimpleNamespace(s=None,check_reachable=AsyncMock(),send=send,go_idle=AsyncMock())
+    async def opened(account):
+        engine.contexts[account['id']]=browser
+        return browser
+    engine.open=AsyncMock(side_effect=opened)
     async def run():
         engine.cluster_mode = 'messages'
         engine.cluster_task = asyncio.create_task(engine.run_cluster(accounts,'messages'))
@@ -105,7 +114,9 @@ def test_cancel_active_and_queued_accounts_releases_pages_and_preserves_send_sta
         asyncio.run(asyncio.wait_for(run(),timeout=3))
     states = Counter(r['status'] for r in db.rows('SELECT status FROM customers'))
     assert states == ({'failed':1,'pending':3} if submitted else {'pending':4})
-    assert not live and not engine.jobs and not engine.busy()
+    assert len(live)==1 and not engine.jobs and not engine.busy()
+    assert len(engine.contexts)==1
+    browser.go_idle.assert_awaited_once()
     engine.open.assert_awaited_once()
 
 
@@ -118,7 +129,7 @@ def test_failed_initial_connection_rebuilds_and_saves_completed_send(tmp_path):
          patch('app.engine.asyncio.sleep',side_effect=asyncio.CancelledError):
         ai.return_value.message = AsyncMock(return_value='本地测试')
         asyncio.run(engine.run_cluster(accounts,'messages'))
-    assert [c.args[1] for c in engine.change_browser_state.await_args_list]==['wake','reset','park']
+    assert [c.args[1] for c in engine.change_browser_state.await_args_list]==['wake','reset']
     assert db.rows('SELECT status FROM customers')==[{'status':'sent'}]
 
 
@@ -135,22 +146,40 @@ def test_unrecoverable_open_returns_customer_without_sending(tmp_path):
     assert not db.rows("SELECT 1 FROM events WHERE kind='send_attempt'")
 
 
-def test_unconfirmed_release_blocks_new_page_launches(tmp_path):
-    db,engine,accounts = pool(tmp_path,count=2,customers=2)
+def test_failed_idle_navigation_does_not_block_other_senders(tmp_path):
+    db,engine,accounts=pool(tmp_path,count=2,customers=2)
     db.save_settings({'message_concurrency':1})
-    live = set()
-    async def control(ident,operation):
-        if operation=='wake': live.add(ident)
-        else: raise RuntimeError('GUI 未完成释放')
-    engine.change_browser_state = control
-    engine.open = AsyncMock(return_value=SimpleNamespace(s=None,check_reachable=AsyncMock(),send=AsyncMock()))
+    browsers={}
+    async def opened(account):
+        browser=SimpleNamespace(s=None,check_reachable=AsyncMock(),send=AsyncMock(),
+                                go_idle=AsyncMock(side_effect=RuntimeError('个人页暂时不可用')))
+        browsers[account['id']]=engine.contexts[account['id']]=browser
+        return browser
+    engine.change_browser_state=AsyncMock(); engine.open=AsyncMock(side_effect=opened)
+    engine.rebuild_browser=AsyncMock()
     with patch('app.engine.get_key',return_value='key'),patch('app.engine.AI') as ai, \
-         patch('app.engine.asyncio.sleep',new=AsyncMock()):
-        ai.return_value.message = AsyncMock(return_value='本地测试')
+         patch('app.engine.asyncio.sleep',side_effect=asyncio.CancelledError):
+        ai.return_value.message=AsyncMock(return_value='本地测试')
         asyncio.run(asyncio.wait_for(engine.run_cluster(accounts,'messages'),timeout=3))
-    assert len(live)==1
-    engine.open.assert_awaited_once()
-    assert Counter(r['status'] for r in db.rows('SELECT status FROM customers'))=={'sent':1,'pending':1}
+    assert engine.open.await_count==2 and len(engine.contexts)==2
+    assert all(b.go_idle.await_count==1 for b in browsers.values())
+    assert Counter(r['status'] for r in db.rows('SELECT status FROM customers'))=={'sent':2}
+    engine.rebuild_browser.assert_not_awaited()
+
+
+def test_account_verification_is_preserved_instead_of_returning_to_idle(tmp_path):
+    _,engine,accounts=pool(tmp_path,count=1,customers=0)
+    engine.sender_slots=asyncio.Semaphore(1)
+    browser=SimpleNamespace(go_idle=AsyncMock())
+    engine.contexts[accounts[0]['id']]=browser
+    async def run():
+        async with engine.sender_turn(accounts[0]):
+            raise AccountNeedsAttention('请完成验证')
+    with pytest.raises(AccountNeedsAttention):
+        asyncio.run(run())
+    assert engine.contexts[accounts[0]['id']] is browser
+    browser.go_idle.assert_not_awaited()
+    assert not engine.sender_slots.locked()
 
 
 def test_gui_acknowledgement_times_out_and_ignores_late_result(tmp_path,monkeypatch):

@@ -10,7 +10,7 @@ from playwright.async_api import Error as PlaywrightError
 from app.browser import (Browser, CommentPageUnavailable, VideoUnavailable, NeedsAttention, click_visible_control_at_center,
                          smallest_visible_text_control, unique_visible, visible_in_page_frames)
 from app.db import DB
-from app.engine import Engine, PAGE_RECYCLE_OPERATIONS, recent_comments
+from app.engine import Engine, recent_comments
 
 
 def test_recent_comments_uses_rolling_day_window_and_rejects_unknown_times():
@@ -26,25 +26,22 @@ def test_recent_comments_uses_rolling_day_window_and_rejects_unknown_times():
     assert [item['id'] for item in recent_comments(comments,3,now)] == ['boundary','recent']
 
 
-def test_browser_memory_is_soft_released_then_periodically_rebuilt(tmp_path):
+def test_repeated_idle_operations_retain_same_browser(tmp_path):
     engine=Engine(SimpleNamespace(),tmp_path)
-    browser=SimpleNamespace(release_page_memory=AsyncMock(),warnings=[])
-    rebuilt=SimpleNamespace(warnings=[])
-    engine.rebuild_browser=AsyncMock(return_value=rebuilt)
+    browser=SimpleNamespace(go_idle=AsyncMock(),warnings=['保留提示'])
+    engine.rebuild_browser=AsyncMock()
     account={'id':'sender','name':'从号'}
 
     async def exercise():
         current=browser
-        for _ in range(PAGE_RECYCLE_OPERATIONS):
-            current=await engine.maintain_browser_memory(account,current)
+        for _ in range(25):
+            current=await engine.idle_browser(account,current)
         return current
 
-    result=asyncio.run(exercise())
-
-    assert browser.release_page_memory.await_count==PAGE_RECYCLE_OPERATIONS-1
-    engine.rebuild_browser.assert_awaited_once_with(account,memory_cleanup=True)
-    assert result is rebuilt
-    assert engine.page_operations['sender']==PAGE_RECYCLE_OPERATIONS
+    assert asyncio.run(exercise()) is browser
+    assert browser.go_idle.await_count==25
+    assert browser.warnings==['保留提示']
+    engine.rebuild_browser.assert_not_awaited()
 
 
 def test_wait_for_comment_ready_allows_slow_panel(monkeypatch):

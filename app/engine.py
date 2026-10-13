@@ -20,10 +20,7 @@ DEFAULTS = dict(collection_accounts=1,keyword_pause_seconds=60,message_concurren
     message_prompt='根据客户评论写一条自然、简短的咨询回复。我的产品或服务：请填写。尊重对方，不夸大，不使用虚假承诺。',
     comment_panel='[data-e2e="comment-list"]',message_editor='[contenteditable="true"]')
 
-# A soft unload happens after every completed page workflow. Replacing the
-# whole QWebEnginePage periodically also releases renderer/process state that a
-# normal navigation cannot reach, while preserving the account profile/login.
-PAGE_RECYCLE_OPERATIONS = 20
+# Bound GUI acknowledgements and idle navigation without recycling healthy pages.
 PAGE_CLEANUP_TIMEOUT = 15
 BROWSER_OPEN_TIMEOUT = 45
 BROWSER_REBUILD_ATTEMPTS = 3
@@ -73,13 +70,11 @@ class Engine(QThread):
         self.cluster_mode = None
         self.cluster_task = None
         self.cluster_stopping = False
-        self.page_operations = {}
         self.lock = threading.Lock()
         self.ready = threading.Event()
         self.shutdown_requested = threading.Event()
         self.main_task = None
         self.sender_slots = None
-        self.sender_pool_error = None
         self.browser_requests = {}
         self.cdp_connect_lock = asyncio.Lock()
 
@@ -117,32 +112,29 @@ class Engine(QThread):
     async def sender_turn(self, account):
         slots = self.sender_slots
         if slots is None:
-            # A standalone worker has no GUI resource coordinator.
             yield
             return
         ident = account['id']
-        self.status.emit(ident,'等待工作位 · 页面休眠')
+        self.status.emit(ident,'等待工作位 · 停留个人页')
         await slots.acquire()
+        needs_attention = False
         try:
-            if self.sender_pool_error:
-                raise AccountNeedsAttention(self.sender_pool_error)
             yield
+        except AccountNeedsAttention:
+            # Leave login/verification prompts available for the operator.
+            needs_attention = True
+            raise
         finally:
-            self.contexts.pop(ident,None)
-            self.page_operations.pop(ident,None)
             try:
-                await self.change_browser_state(ident,'park')
-            except Exception as exc:
-                # Do not launch more pages if a renderer's release cannot be
-                # confirmed; otherwise the configured bound would be false.
-                self.sender_pool_error = '页面释放未完成，请停止私信任务后重试：'+(str(exc) or '界面响应超时')
-                self.log.emit(account['name']+'：'+self.sender_pool_error)
-                raise AccountNeedsAttention(self.sender_pool_error) from exc
+                if not needs_attention:
+                    browser = self.contexts.get(ident)
+                    if browser is not None:
+                        await self.idle_browser(account,browser)
             finally:
                 slots.release()
 
     async def open_sender(self, account):
-        if self.sender_slots is None:
+        if self.sender_slots is None or account['id'] in self.contexts:
             return await self.open(account)
         self.status.emit(account['id'],'正在加载账号页面')
         try:
@@ -155,23 +147,18 @@ class Engine(QThread):
             return await self.rebuild_browser(account)
 
     async def pause_search_account(self, account, settings):
-        """Release the renderer for the entire per-account search interval."""
+        """Keep the account page alive during its search interval."""
         seconds = max(0,int(settings.get('keyword_pause_seconds',0)))
         ident = account['id']
-        self.contexts.pop(ident,None)
-        self.page_operations.pop(ident,None)
-        self.status.emit(ident,'搜索结束，正在释放账号页面')
-        try:
-            await self.change_browser_state(ident,'park')
-        except Exception as exc:
-            raise AccountNeedsAttention('搜索暂停时页面释放失败，请停止账号后重试：'+
-                                        (str(exc) or '界面响应超时')) from exc
-        self.status.emit(ident,f'搜索后暂停 {seconds} 秒 · 页面休眠')
-        self.log.emit(account['name']+f'：搜索结束，页面已释放，暂停 {seconds} 秒后继续')
+        browser = self.contexts.get(ident)
+        if browser is not None:
+            await self.idle_browser(account,browser)
+        self.status.emit(ident,f'搜索后暂停 {seconds} 秒 · 停留个人页')
+        self.log.emit(account['name']+f'：搜索结束，停留个人页，暂停 {seconds} 秒后继续')
         await asyncio.sleep(seconds)
 
     async def wake_collector(self, account, settings):
-        """Only recreate a parked page when the collector has more work."""
+        """Bind a collector page when no browser is attached yet."""
         self.status.emit(account['id'],'搜索暂停结束，正在加载账号页面')
         try:
             await self.change_browser_state(account['id'],'wake')
@@ -234,14 +221,13 @@ class Engine(QThread):
         if not accounts:
             raise ValueError('请先添加账号')
         if account_ids is not None:
-            if mode != 'messages':
-                raise ValueError('仅私信模式支持指定账号')
             ids = set(account_ids)
             known = {row['id'] for row in accounts}
             if not ids or not ids.issubset(known):
-                raise ValueError('请选择有效的私信账号')
+                name = '找评论' if mode=='comments' else '私信'
+                raise ValueError(f'请选择有效的{name}账号')
             accounts = [row for row in accounts if row['id'] in ids]
-        if mode == 'comments':
+        elif mode == 'comments':
             count = max(1,min(len(accounts),int(self.db.setting('collection_accounts',1))))
             accounts = accounts[:count]
         return accounts
@@ -358,17 +344,12 @@ class Engine(QThread):
                 raise
         return self.contexts[ident]
 
-    async def rebuild_browser(self, account, memory_cleanup=False):
+    async def rebuild_browser(self, account):
         """让 GUI 重建单个账号页面，然后重新绑定 Playwright。"""
         ident = account['id']
-        self.page_operations[ident] = 0
         contexts = getattr(self,'contexts',None)
-        if memory_cleanup:
-            self.status.emit(ident,'正在定期释放浏览器内存')
-            self.log.emit(account['name']+'：达到页面操作回收周期，正在重建该账号浏览器')
-        else:
-            self.status.emit(ident,'浏览器无响应，正在自动重建')
-            self.log.emit(account['name']+'：检测到页面超时或内核异常，正在重建该账号浏览器')
+        self.status.emit(ident,'浏览器无响应，正在自动重建')
+        self.log.emit(account['name']+'：检测到页面超时或内核异常，正在重建该账号浏览器')
         for attempt in range(1,BROWSER_REBUILD_ATTEMPTS+1):
             if contexts is not None:
                 contexts.pop(ident,None)
@@ -394,31 +375,19 @@ class Engine(QThread):
             self.log.emit(account['name']+'：浏览器已重建，将继续处理队列')
             return browser
 
-    async def maintain_browser_memory(self, account, browser):
-        """Bound per-account Chromium growth between completed operations."""
-        ident = account.get('id',account['name'])
-        operations = self.page_operations.get(ident,0) + 1
-        self.page_operations[ident] = operations
-        if operations >= PAGE_RECYCLE_OPERATIONS:
-            self.log.emit(account['name']+'：已完成多轮页面操作，正在释放浏览器内存')
-            warnings = list(getattr(browser,'warnings',[]))
-            rebuilt = await self.rebuild_browser(account,memory_cleanup=True)
-            if warnings and hasattr(rebuilt,'warnings'):
-                rebuilt.warnings[:0] = warnings
-            return rebuilt
-        release = getattr(browser,'release_page_memory',None)
-        if release is not None:
-            self.status.emit(ident,f'正在释放页面内存（最多 {PAGE_CLEANUP_TIMEOUT} 秒）')
-            try:
-                await asyncio.wait_for(release(),timeout=PAGE_CLEANUP_TIMEOUT)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # CDP heap collection has no built-in timeout. If it hangs
-                # after unloading to about:blank, rebuild instead of leaving
-                # the sender stuck between two customers indefinitely.
-                self.log.emit(account['name']+'：页面内存清理超时或失败，正在自动重建：'+(str(exc) or '超过处理时限'))
-                return await self.rebuild_browser(account)
+    async def idle_browser(self, account, browser):
+        """Navigate idle accounts without heap collection or page replacement."""
+        if browser is None:
+            return browser
+        try:
+            await asyncio.wait_for(browser.go_idle(),timeout=PAGE_CLEANUP_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A failed idle navigation must not disrupt completed task results
+            # or rebuild an otherwise healthy account page.
+            self.log.emit(account['name']+'：返回个人页失败，保留当前页面，下次任务继续：'+
+                          (str(exc) or '超过处理时限'))
         return browser
 
     def cdp_endpoint(self):
@@ -529,10 +498,7 @@ class Engine(QThread):
             if mode == 'messages':
                 limit = min(len(accounts),self.settings()['message_concurrency'])
                 self.sender_slots = asyncio.Semaphore(limit)
-                self.sender_pool_error = None
-                for account in accounts:
-                    self.contexts.pop(account['id'],None)
-                self.log.emit(f'私信调度已开启：{len(accounts)} 个账号参与，最多 {limit} 个账号同时加载页面')
+                self.log.emit(f'私信调度已开启：{len(accounts)} 个账号参与，最多 {limit} 个账号同时执行私信任务，等待时停留个人页')
                 tasks = []
                 for account in accounts:
                     task = asyncio.create_task(self.work(account,mode))
@@ -620,8 +586,9 @@ class Engine(QThread):
             self.log.emit(f'集群：本轮待分析视频 {len(videos)} 个，采集账号 {len(sessions)} 个')
             await self.collection_stage(sessions,videos,s,False,[True])
             self.changed.emit()
-            for ident in sessions:
-                self.status.emit(ident,'等待下一轮集群采集')
+            for ident,session in sessions.items():
+                await self.idle_browser(session[0],session[1])
+                self.status.emit(ident,'等待下一轮集群采集 · 停留个人页')
             if not sessions:
                 break
             await asyncio.sleep(s['poll_seconds'])
@@ -678,10 +645,7 @@ class Engine(QThread):
                         continue
                     if (discovery and item[0] in ('keyword','search')
                             and int(settings.get('keyword_pause_seconds',0)) > 0):
-                        # The source checkpoint and warnings are saved before
-                        # sleeping. Stopping here must not return a done source
-                        # to another worker, or retain a live page in sessions.
-                        session[1] = browser = None
+                        # Save checkpoints before waiting and retain this page.
                         await self.pause_search_account(account,settings)
             except asyncio.CancelledError:
                 sessions.pop(ident,None)
@@ -819,7 +783,7 @@ class Engine(QThread):
                 if tracking:
                     self.db.set_video_status(video_id,'done')
                     self.changed.emit()
-            browser = await self.maintain_browser_memory(account,browser)
+            browser = await self.idle_browser(account,browser)
         if expired_comments:
             days = settings.get('comment_days',DEFAULTS['comment_days'])
             self.log.emit(f'{account["name"]}：本轮已过滤 {expired_comments} 条超过最近 {days} 天的评论，未提交 AI 分析')
@@ -851,7 +815,7 @@ class Engine(QThread):
                 complete = False
                 self.log.emit(account['name']+f'：关键词“{keyword}”视频获取失败，已跳过并继续其他来源：{exc}')
                 if int(settings.get('keyword_pause_seconds',0)) <= 0:
-                    browser = await self.maintain_browser_memory(account,browser)
+                    browser = await self.idle_browser(account,browser)
                 browser.s = settings
                 continue
             except (PlaywrightError, asyncio.TimeoutError) as exc:
@@ -865,7 +829,7 @@ class Engine(QThread):
             self.log.emit('关键词“'+keyword+'”：近 7 天已加入待分析视频 '+str(len(videos))+' 个')
             self.changed.emit()
             if int(settings.get('keyword_pause_seconds',0)) <= 0:
-                browser = await self.maintain_browser_memory(account,browser)
+                browser = await self.idle_browser(account,browser)
             browser.s = settings
         for row in searches:
             keyword = row['keyword']
@@ -900,10 +864,9 @@ class Engine(QThread):
                     self.db.add_video(video,'search',keyword,keyword)
                 self.log.emit('抖音搜索“'+keyword+'”：已加入待分析视频 '+str(len(videos))+' 个')
                 self.changed.emit()
-            # Each query is a full SPA workflow. Counting only the whole batch
-            # allowed hundreds of searches to bypass the renderer recycle.
+            # Return to the personal page after each completed search.
             if int(settings.get('keyword_pause_seconds',0)) <= 0:
-                browser = await self.maintain_browser_memory(account,browser)
+                browser = await self.idle_browser(account,browser)
             browser.s = settings
         for blogger in bloggers:
             self.status.emit(account['id'],'整理视频：'+blogger['name'])
@@ -914,7 +877,7 @@ class Engine(QThread):
             except NeedsAttention as exc:
                 complete = False
                 self.log.emit(account['name']+f'：博主“{blogger["name"]}”视频获取失败，已跳过并继续其他来源：{exc}')
-                browser = await self.maintain_browser_memory(account,browser)
+                browser = await self.idle_browser(account,browser)
                 browser.s = settings
                 continue
             except (PlaywrightError, asyncio.TimeoutError) as exc:
@@ -927,7 +890,7 @@ class Engine(QThread):
                 self.db.add_video(video,'blogger',blogger['name'],blogger['id'])
             self.log.emit(blogger['name']+'：已加入待分析视频 '+str(len(videos))+' 个')
             self.changed.emit()
-            browser = await self.maintain_browser_memory(account,browser)
+            browser = await self.idle_browser(account,browser)
             browser.s = settings
         for item in manual_videos:
             video = {'aweme_id':item['id'],'desc':item['title'],'author':{},'create_time':0,'url':item['url']}
@@ -956,7 +919,6 @@ class Engine(QThread):
                     for warning in b.warnings:
                         self.log.emit(account['name']+'：'+warning)
                     b.warnings.clear()
-                    b = None
                     await self.pause_search_account(account,s)
             if not self.db.finish_video_discovery():
                 self.log.emit(account['name']+'：找视频未完成，已保存来源断点，下轮继续后再分析评论')
@@ -971,7 +933,8 @@ class Engine(QThread):
         videos = self.db.video_tasks('pending')
         self.log.emit(account['name']+'：本轮待分析视频共 '+str(len(videos))+' 个')
         if not videos:
-            self.status.emit(ident,'本轮没有找到待分析视频')
+            b = await self.idle_browser(account,b)
+            self.status.emit(ident,'本轮没有找到待分析视频 · 停留个人页')
             await asyncio.sleep(s['poll_seconds'])
             return b
         if b is None:
@@ -1000,7 +963,9 @@ class Engine(QThread):
                 if quota['limit'] and quota['used']>=quota['limit']:
                     self.status.emit(ident,f'今日已达上限 {quota["used"]}/{quota["limit"]} · 0 点自动恢复')
                 else:
-                    self.status.emit(ident,'等待客户')
+                    self.status.emit(ident,'等待客户 · 停留个人页')
+                if self.sender_slots is None:
+                    b = await self.idle_browser(account,b)
                 return b,ai_failures,5
             self.changed.emit()
             self.status.emit(ident,'处理：'+customer['name'])
@@ -1037,6 +1002,8 @@ class Engine(QThread):
                         delay = min(120,15*ai_failures)
                         self.log.emit(f'{account["name"]}：AI 文案生成失败（{ai_failures}/{MAX_TRANSIENT_FAILURES}），客户已放回队列，{delay} 秒后重试：{exc}')
                         self.status.emit(ident,f'AI 异常，{delay} 秒后重试')
+                        if self.sender_slots is None:
+                            b = await self.idle_browser(account,b)
                         return b,ai_failures,delay
                     ai_failures = 0
                 self.db.finish(customer['uid'],ident,'processing',message)
@@ -1072,14 +1039,13 @@ class Engine(QThread):
                 self.db.finish(customer['uid'],ident,'failed',message,detail)
                 self.log.emit(account['name']+'：'+detail)
                 customer = None
-                if self.sender_slots is None:
-                    b = await self.rebuild_browser(account)
+                b = await self.rebuild_browser(account)
+                b.s = s
             self.changed.emit()
-            # The customer's outcome is final before maintenance. A
-            # reset failure/cancellation must not overwrite it.
+            # Finalize the outcome before returning to the idle page.
             customer = None
             if self.sender_slots is None:
-                b = await self.maintain_browser_memory(account,b)
+                b = await self.idle_browser(account,b)
             if skip_cooldown:
                 self.status.emit(ident,'客户已跳过，继续处理')
                 return b,ai_failures,0
@@ -1138,8 +1104,6 @@ class Engine(QThread):
                 else:
                     async with self.sender_turn(account):
                         b,ai_failures,delay = await self.sender_cycle(account,b,ai,s,ai_failures)
-                    if self.sender_slots is not None:
-                        b = None
                     if delay or self.sender_slots is not None:
                         await asyncio.sleep(delay)
         except asyncio.CancelledError:

@@ -243,22 +243,31 @@ class Window(QMainWindow):
 
     def build_accounts(self):
         l = self.page('账号集群')
-        hint = QLabel('所有账号使用独立浏览器和登录目录。集群同时只能运行一种模式；采集账号数量在设置中调整，私信可开启全部账号或仅开启选中账号。')
+        hint = QLabel('所有账号使用独立浏览器和登录目录。集群同时只能运行一种模式；找评论和私信均可通过账号前的多选框勾选一个或多个账号开启。按设置开启找评论时，使用列表前 N 个账号。')
         hint.setWordWrap(True); l.addWidget(hint)
         controls = QHBoxLayout(); l.addLayout(controls)
         self.mode_switches = {}
-        for mode,title,description in [('comments','找评论模式','分配视频来源和评论扫描，AI 筛选目标客户'),('messages','私信模式','使用全部账号或选中账号，按各自间隔和每日上限轮流发送，等待时释放页面')]:
+        self.selected_mode_buttons = {}
+        for mode,title,description in [('comments','找评论模式','使用设置数量或勾选账号，分配视频来源和评论扫描，AI 筛选目标客户'),('messages','私信模式','使用全部账号或勾选账号，按各自间隔和每日上限轮流发送，等待时停留个人页')]:
             group = QGroupBox(title); box = QVBoxLayout(group)
-            box.addWidget(QLabel(description))
+            detail = QLabel(description); detail.setWordWrap(True); box.addWidget(detail)
             switch = QPushButton('开启'); switch.setCheckable(True); switch.setCursor(Qt.CursorShape.PointingHandCursor)
             switch.clicked.connect(lambda checked,mode=mode:self.toggle_cluster(mode,checked))
             box.addWidget(switch); controls.addWidget(group)
             self.mode_switches[mode] = switch
-            if mode=='messages':
-                self.single_message_button = button('开启选中账号私信',self.start_selected_messages)
-                box.addWidget(self.single_message_button)
-        self.accounts = table(['备注名','发送间隔（秒）','今日已私信 / 上限','当前状态'])
-        self.accounts.setColumnWidth(0,220); self.accounts.setColumnWidth(1,170); self.accounts.setColumnWidth(2,180); l.addWidget(self.accounts)
+            name = '找评论' if mode=='comments' else '私信'
+            selected_button = button('开启选中账号'+name,lambda checked=False,mode=mode:self.toggle_cluster(mode,True,selected_only=True))
+            box.addWidget(selected_button)
+            self.selected_mode_buttons[mode] = selected_button
+        self.single_message_button = self.selected_mode_buttons['messages']
+        self._checked_account_ids = set()
+        self.account_select_all = QCheckBox('全选账号')
+        self.account_select_all.stateChanged.connect(self.toggle_all_accounts)
+        l.addWidget(self.account_select_all)
+        self.accounts = table(['选择','备注名','发送间隔（秒）','今日已私信 / 上限','当前状态'])
+        for col,width in enumerate([64,220,170,180]): self.accounts.setColumnWidth(col,width)
+        self.accounts.itemChanged.connect(self.account_checkbox_changed)
+        l.addWidget(self.accounts)
         bar = QHBoxLayout(); l.addLayout(bar)
         for label,fn in [('新增账号',self.add_account),('修改备注 / 间隔 / 上限',self.edit_account),('登录 / 查看内嵌浏览器',lambda:self.account_command('login')),('重启选中浏览器',self.restart_account_browser),('停止选中账号',lambda:self.account_command('stop')),('采集发送诊断',lambda:self.account_command('diagnose')),('删除账号',self.delete_account)]: bar.addWidget(button(label,fn))
         l.addWidget(QLabel('切换模式前请先关闭当前模式。遇到登录或验证提示时，该账号停止，其余账号继续；请本人处理验证。'))
@@ -273,7 +282,7 @@ class Window(QMainWindow):
         self.browser_tabs.setDocumentMode(False)
         self.browser_tabs.tabBar().setDrawBase(False)
         self.browser_tabs.tabBar().setExpanding(False)
-        self.browser_tabs.setToolTip('账号登录资料独立；私信按需加载页面，等待时休眠。可切换查看，请勿手动操作正在执行任务的账号。')
+        self.browser_tabs.setToolTip('账号登录资料独立；私信按工作位执行，等待时停留个人页。可切换查看，请勿手动操作正在执行任务的账号。')
         layout.addWidget(self.browser_tabs,1)
         empty = QLabel('尚未打开账号页面。请在“账号集群”中选中账号，点击“登录 / 查看内嵌浏览器”。')
         empty.setAlignment(Qt.AlignmentFlag.AlignCenter); empty.setObjectName('muted')
@@ -324,7 +333,7 @@ class Window(QMainWindow):
             widget = self.browser_widgets.get(ident)
             if operation == 'park':
                 if widget is not None:
-                    widget.suspend_page()
+                    widget.park_page()
             elif operation in ('wake','reset'):
                 rows = self.db.rows('SELECT * FROM accounts WHERE id=?',(ident,))
                 if not rows:
@@ -376,8 +385,47 @@ class Window(QMainWindow):
             switch.setChecked(active)
             switch.setEnabled(not stopping and (current is None or active))
             name = '找评论' if mode=='comments' else '私信'
-            switch.setText(f'关闭{name}模式（{running} 个账号运行中）' if active else '开启全部账号私信' if mode=='messages' else f'开启{name}模式')
-        self.single_message_button.setEnabled(not self.engine.busy() and bool(self.account_rows))
+            switch.setText(f'关闭{name}模式（{running} 个账号运行中）' if active else '开启全部账号私信' if mode=='messages' else '按设置数量开启找评论')
+        checked = len(self.checked_account_rows())
+        for mode,selected_button in self.selected_mode_buttons.items():
+            name = '找评论' if mode=='comments' else '私信'
+            selected_button.setText('开启选中账号'+name+(f'（{checked}）' if checked else ''))
+            selected_button.setEnabled(not self.engine.busy() and bool(self.account_rows))
+        total = len(self.account_rows)
+        state = (Qt.CheckState.Checked if total and checked==total else
+                 Qt.CheckState.PartiallyChecked if checked else Qt.CheckState.Unchecked)
+        self.account_select_all.blockSignals(True)
+        self.account_select_all.setTristate(state==Qt.CheckState.PartiallyChecked)
+        self.account_select_all.setCheckState(state)
+        self.account_select_all.setEnabled(bool(total))
+        self.account_select_all.blockSignals(False)
+
+    def checked_account_rows(self):
+        return [row for row in getattr(self,'account_rows',[]) if row['id'] in self._checked_account_ids]
+
+    def account_checkbox_changed(self, item):
+        if item.column()!=0:
+            return
+        ident = item.data(Qt.ItemDataRole.UserRole)
+        if not ident:
+            return
+        if item.checkState()==Qt.CheckState.Checked:
+            self._checked_account_ids.add(ident)
+        else:
+            self._checked_account_ids.discard(ident)
+        self.sync_cluster_switches()
+
+    def toggle_all_accounts(self, state):
+        checked = state==Qt.CheckState.Checked.value
+        self.accounts.blockSignals(True)
+        for i,row in enumerate(getattr(self,'account_rows',[])):
+            if checked:
+                self._checked_account_ids.add(row['id'])
+            else:
+                self._checked_account_ids.discard(row['id'])
+            self.accounts.item(i,0).setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self.accounts.blockSignals(False)
+        self.sync_cluster_switches()
 
     def start_selected_messages(self):
         self.toggle_cluster('messages',True,selected_only=True)
@@ -391,14 +439,15 @@ class Window(QMainWindow):
                 if not self.db.setting('base_url','') or not self.db.setting('model',''):
                     raise ValueError('请先保存 AI 设置')
                 if selected_only:
-                    account = self.selected(self.accounts,self.account_rows)
-                    payload['account_ids'] = [account['id']]
+                    selected = self.checked_account_rows()
+                    if not selected: raise ValueError('请先勾选需要开启的账号')
+                    payload['account_ids'] = [account['id'] for account in selected]
                 accounts = self.engine.cluster_accounts(mode,payload.get('account_ids'))
                 for account in accounts:
-                    widget = self.ensure_browser(account,False,activate=mode!='messages')
+                    widget = self.ensure_browser(account,False,activate=True)
                     if mode == 'messages':
-                        widget.suspend_page()
-                        widget.set_task_status('等待工作位 · 页面休眠')
+                        widget.park_page()
+                        widget.set_task_status('等待工作位 · 停留个人页')
             self.engine.command('start_cluster' if enabled else 'stop_cluster',payload)
             if enabled:
                 self.tabs.setCurrentWidget(self.browser_page)
@@ -586,9 +635,9 @@ class Window(QMainWindow):
                 forms[section].addRow(field)
             else:
                 forms[section].addRow(labels[k],field)
-        self.fields['collection_accounts'].setToolTip('按账号列表顺序使用前 N 个账号；设置保存后，下次开启找评论模式生效。私信可使用全部账号或仅选中账号。')
-        self.fields['keyword_pause_seconds'].setToolTip('默认 60 秒，范围 0–86400 秒。每个账号处理完一个抖音指数关键词或抖音搜索词后暂停；等待期间释放页面内存，保留登录资料，其他账号继续工作。0 表示关闭；下次开启找评论模式生效。')
-        self.fields['message_concurrency'].setToolTip('全部启用账号按各自间隔轮流工作；最多同时加载此数量的账号页面，等待时释放页面。下次启动私信时生效。')
+        self.fields['collection_accounts'].setToolTip('“按设置数量开启找评论”使用列表前 N 个账号；“开启选中账号找评论”使用全部勾选账号，不受此数量限制。设置保存后，下次按设置数量开启时生效。')
+        self.fields['keyword_pause_seconds'].setToolTip('默认 60 秒，范围 0–86400 秒。每个账号处理完一个抖音指数关键词或抖音搜索词后暂停；等待期间保留账号页面并停留个人页，其他账号继续工作。0 表示关闭；下次开启找评论模式生效。')
+        self.fields['message_concurrency'].setToolTip('全部启用账号按各自间隔轮流工作；最多同时执行此数量的账号私信任务，等待时停留个人页。下次启动私信时生效。')
         self.fields['thinking_mode'].currentIndexChanged.connect(self.update_thinking_controls)
         self.update_thinking_controls()
         self.api_key = QLineEdit(); self.api_key.setEchoMode(QLineEdit.EchoMode.Password); self.api_key.setPlaceholderText('留空保留已有密钥；保存到系统钥匙串，不导出')
@@ -740,14 +789,26 @@ class Window(QMainWindow):
         self.refresh_videos()
 
     def refresh_accounts(self):
-        self.account_rows = self.db.rows('SELECT * FROM accounts ORDER BY rowid')
+        old_rows = getattr(self,'account_rows',[])
         selected = self.accounts.currentRow()
+        selected_id = old_rows[selected]['id'] if 0<=selected<len(old_rows) else None
+        self.account_rows = self.db.rows('SELECT * FROM accounts ORDER BY rowid')
+        self._checked_account_ids.intersection_update(r['id'] for r in self.account_rows)
         def quota_text(account):
             quota = self.db.sender_quota(account['id'])
             limit = quota['limit'] if quota['limit'] else '不限'
             return f'{quota["used"]} / {limit}'
-        populate(self.accounts,[[r['name'],r['interval'],quota_text(r),self.states.get(r['id'],'未启动')] for r in self.account_rows])
-        if 0<=selected<len(self.account_rows): self.accounts.selectRow(selected)
+        self.accounts.blockSignals(True)
+        self.accounts.clearSelection()
+        self.accounts.setCurrentCell(-1,-1)
+        populate(self.accounts,[['',r['name'],r['interval'],quota_text(r),self.states.get(r['id'],'未启动')] for r in self.account_rows])
+        for i,row in enumerate(self.account_rows):
+            checkbox = self.accounts.item(i,0)
+            checkbox.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+            checkbox.setData(Qt.ItemDataRole.UserRole,row['id'])
+            checkbox.setCheckState(Qt.CheckState.Checked if row['id'] in self._checked_account_ids else Qt.CheckState.Unchecked)
+            if row['id']==selected_id: self.accounts.selectRow(i)
+        self.accounts.blockSignals(False)
         names = {r['id']:r['name'] for r in self.account_rows}
         for ident,widget in self.browser_widgets.items():
             index = self.browser_tabs.indexOf(widget)

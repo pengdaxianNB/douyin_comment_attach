@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 from playwright.async_api import Error as PlaywrightError
 from .db import parse_work_url, work_url
+from .constants import IDLE_URL
 
 
 class NeedsAttention(RuntimeError):
@@ -931,29 +932,11 @@ class Browser:
                 self.log('后台页面已保持活跃，无需切换到当前账号标签')
             self.background_prepared = True
 
-    async def release_page_memory(self):
-        """Unload the completed site page and ask Chromium to reclaim its heap.
-
-        Douyin is a long-lived SPA. Repeated profile/video/chat navigations can
-        otherwise leave detached DOM trees and back-forward entries resident in
-        the renderer for a long time. Cookies and local storage live in the
-        profile, so unloading the document does not log the account out.
-        """
-        if self.page is None:
+    async def go_idle(self):
+        """Keep the same account page on its personal page between tasks."""
+        if self.page is None or self.page.url == IDLE_URL:
             return
-        await self.page.goto('about:blank',wait_until='commit',timeout=10000)
-        session = await self.context.new_cdp_session(self.page)
-        try:
-            # QtWebEngine versions differ in which memory-related CDP domains
-            # they expose. Navigation is the essential cleanup; these commands
-            # are best-effort additions.
-            for method in ('Page.resetNavigationHistory','HeapProfiler.collectGarbage'):
-                try:
-                    await session.send(method)
-                except Exception:
-                    pass
-        finally:
-            await detach_cdp_session(session)
+        await self.page.goto(IDLE_URL,wait_until='commit',timeout=10000)
 
     async def diagnose_sender(self):
         if self.diagnostics_dir is None:

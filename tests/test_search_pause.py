@@ -1,4 +1,4 @@
-"""Per-account search pacing, renderer release and discovery checkpoints."""
+"""Per-account search pacing, retained pages and discovery checkpoints."""
 import asyncio
 from collections import deque
 from types import SimpleNamespace
@@ -23,7 +23,7 @@ def collector(tmp_path, count=1, seconds=12):
     for account in accounts:
         browser = SimpleNamespace(warnings=[],s=None,
             search_videos=AsyncMock(return_value=[]),keyword_videos=AsyncMock(return_value=[]),
-            release_page_memory=AsyncMock())
+            go_idle=AsyncMock())
         engine.contexts[account['id']] = browser
         sessions[account['id']] = [account,browser,None]
     settings = dict(engine.settings(),keyword_pause_seconds=seconds)
@@ -31,35 +31,27 @@ def collector(tmp_path, count=1, seconds=12):
 
 
 @pytest.mark.parametrize('kind',['keyword','search'])
-def test_search_releases_before_wait_and_wakes_only_for_more_work(tmp_path,kind):
+def test_search_returns_to_personal_page_before_wait_and_reuses_browser(tmp_path,kind):
     db,engine,accounts,sessions,settings = collector(tmp_path)
-    ident = accounts[0]['id']; original = sessions[ident][1]
+    ident = accounts[0]['id']; browser = sessions[ident][1]
     sources = [(kind,{'keyword':word}) for word in ('一','二')]
     db.prepare_video_scan(24,sources=sources)
     events = []
-    async def control(account_id,operation):
-        events.append(operation)
-        if operation == 'park':
-            assert account_id not in engine.contexts
-            assert sessions[account_id][1] is None
-    async def open_page(account):
-        events.append('open')
-        browser = SimpleNamespace(warnings=[],s=None,
-            search_videos=AsyncMock(return_value=[]),keyword_videos=AsyncMock(return_value=[]))
-        engine.contexts[account['id']] = browser
-        return browser
+    async def idle():
+        assert engine.contexts[ident] is browser and sessions[ident][1] is browser
+        events.append('idle')
     async def sleep(seconds):
-        assert seconds == 12
-        assert events[-1] == 'park'
-        assert db.rows("SELECT count(*) n FROM discovery_sources WHERE status='done'")[0]['n'] == events.count('park')
+        assert seconds == 12 and events[-1] == 'idle'
+        assert db.rows("SELECT count(*) n FROM discovery_sources WHERE status='done'")[0]['n'] == events.count('idle')
         events.append('sleep')
-    engine.change_browser_state = control; engine.open = AsyncMock(side_effect=open_page)
+    browser.go_idle.side_effect=idle
+    engine.change_browser_state=AsyncMock(); engine.open=AsyncMock()
     with patch('app.engine.asyncio.sleep',side_effect=sleep):
         asyncio.run(engine.collection_stage(sessions,deque(sources),settings,True,[True]))
-    assert events == ['park','sleep','wake','open','park','sleep']
-    assert sessions[ident][1] is None and ident not in engine.contexts
-    original.release_page_memory.assert_not_awaited()
-    assert db.pending_discovery_sources(sources) == []
+    assert events==['idle','sleep','idle','sleep']
+    assert sessions[ident][1] is browser and engine.contexts[ident] is browser
+    engine.change_browser_state.assert_not_awaited(); engine.open.assert_not_awaited()
+    assert db.pending_discovery_sources(sources)==[]
 
 
 def test_paused_account_does_not_block_other_account(tmp_path):
@@ -74,7 +66,7 @@ def test_paused_account_does_not_block_other_account(tmp_path):
         return True
     async def sleep(seconds):
         ident = next(i for i,t in engine.jobs.items() if t is asyncio.current_task())
-        assert sessions[ident][1] is None and ident not in engine.contexts
+        assert sessions[ident][1] is engine.contexts[ident]
         if ident == first:
             paused.set()
             while len(completed) < 3:
@@ -98,6 +90,7 @@ def test_stop_during_pause_keeps_done_source_and_does_not_wake(tmp_path):
     sources = [('search',{'keyword':'完成词'}),('search',{'keyword':'未开始'})]
     db.prepare_video_scan(24,sources=sources)
     queue = deque(sources); paused = asyncio.Event()
+    sessions_browser = sessions[ident][1]
     async def sleep(seconds):
         paused.set()
         await asyncio.Future()
@@ -112,7 +105,8 @@ def test_stop_during_pause_keeps_done_source_and_does_not_wake(tmp_path):
     assert db.pending_discovery_sources(sources) == sources[1:]
     assert list(queue) == sources[1:]
     engine.open.assert_not_awaited()
-    engine.change_browser_state.assert_awaited_once_with(ident,'park')
+    engine.change_browser_state.assert_not_awaited()
+    sessions_browser.go_idle.assert_awaited_once()
 
 
 @pytest.mark.parametrize('error',[NeedsAttention('没有作品'),None])
@@ -132,13 +126,13 @@ def test_empty_or_failed_search_also_pauses(tmp_path,error):
     assert db.pending_discovery_sources([source]) == ([source] if error else [])
 
 
-def test_zero_keeps_existing_cleanup_and_never_parks(tmp_path):
+def test_zero_returns_to_personal_page_without_search_pause(tmp_path):
     db,engine,accounts,sessions,settings = collector(tmp_path,seconds=0)
     browser = sessions[accounts[0]['id']][1]
     engine.change_browser_state = AsyncMock()
     with patch('app.engine.asyncio.sleep',new=AsyncMock()) as sleep:
         asyncio.run(engine.collection_stage(sessions,deque([('search',{'keyword':'测试'})]),settings,True,[True]))
-    browser.release_page_memory.assert_awaited_once()
+    browser.go_idle.assert_awaited_once()
     engine.change_browser_state.assert_not_awaited(); sleep.assert_not_awaited()
 
 
@@ -155,17 +149,20 @@ def test_verification_stops_account_without_pause_or_rebuild(tmp_path):
     sleep.assert_not_awaited()
 
 
-def test_release_failure_stops_account_without_repeating_completed_word(tmp_path):
+def test_failed_idle_navigation_keeps_account_and_completed_checkpoints(tmp_path):
     db,engine,accounts,sessions,settings = collector(tmp_path)
-    sources = [('search',{'keyword':'完成词'}),('search',{'keyword':'下个词'})]
+    ident=accounts[0]['id']; browser=sessions[ident][1]
+    sources=[('search',{'keyword':'完成词'}),('search',{'keyword':'下个词'})]
     db.prepare_video_scan(24,sources=sources)
-    engine.change_browser_state = AsyncMock(side_effect=RuntimeError('释放未确认'))
-    queue = deque(sources)
+    browser.go_idle.side_effect=RuntimeError('个人页导航失败')
+    engine.rebuild_browser=AsyncMock()
+    queue=deque(sources)
     with patch('app.engine.asyncio.sleep',new=AsyncMock()) as sleep:
         asyncio.run(engine.collection_stage(sessions,queue,settings,True,[True]))
-    assert not sessions and list(queue) == sources[1:]
-    assert db.pending_discovery_sources(sources) == sources[1:]
-    sleep.assert_not_awaited()
+    assert sessions[ident][1] is browser and engine.contexts[ident] is browser
+    assert not queue and db.pending_discovery_sources(sources)==[]
+    assert sleep.await_count==2
+    engine.rebuild_browser.assert_not_awaited()
 
 
 def test_comment_stage_wakes_parked_account_with_task_settings(tmp_path):
@@ -181,14 +178,14 @@ def test_comment_stage_wakes_parked_account_with_task_settings(tmp_path):
     assert browser.s is settings
 
 
-def test_standalone_monitor_pauses_and_keeps_page_parked_when_no_videos(tmp_path):
+def test_standalone_monitor_keeps_page_when_no_videos(tmp_path):
     db,engine,accounts,sessions,settings = collector(tmp_path)
     db.import_keywords(['测试'])
     ident = accounts[0]['id']; browser = sessions[ident][1]
     engine.change_browser_state = AsyncMock(); engine.open = AsyncMock()
     with patch('app.engine.asyncio.sleep',new=AsyncMock()) as sleep:
         result = asyncio.run(engine.monitor_round(accounts[0],browser,None,settings))
-    assert result is None and ident not in engine.contexts
+    assert result is browser and engine.contexts[ident] is browser
     assert [call.args[0] for call in sleep.await_args_list] == [12,settings['poll_seconds']]
     engine.open.assert_not_awaited()
     assert db.pending_discovery_sources(engine.collection_sources()) == []
